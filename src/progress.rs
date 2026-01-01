@@ -238,6 +238,7 @@ impl Progress {
         self.update_embed_message(source);
     }
 
+    #[allow(dead_code)]
     pub fn sub_embed_pending(&self, source: SourceKind, count: u64) {
         self.embed_pending[source.idx()].fetch_sub(count, Ordering::Relaxed);
         self.update_embed_message(source);

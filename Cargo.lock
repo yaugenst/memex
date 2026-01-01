@@ -198,6 +198,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "once_cell",
+ "ort",
  "rayon",
  "regex",
  "serde",

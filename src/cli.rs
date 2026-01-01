@@ -288,6 +288,8 @@ fn run_index(
 }
 
 fn run_embed(root: Option<PathBuf>) -> Result<()> {
+    const BATCH_SIZE: usize = 256;
+
     let paths = Paths::new(root)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut embedder = EmbedderHandle::new()?;
@@ -298,6 +300,29 @@ fn run_embed(root: Option<PathBuf>) -> Result<()> {
 
     let mut embedded_counts = [0u64; 3];
     let mut embedded_total = 0u64;
+    let mut batch: Vec<(u64, String, crate::types::SourceKind)> = Vec::with_capacity(BATCH_SIZE);
+
+    let flush_batch = |batch: &mut Vec<(u64, String, crate::types::SourceKind)>,
+                       embedder: &mut EmbedderHandle,
+                       vector: &mut VectorIndex,
+                       progress: &crate::progress::Progress,
+                       embedded_counts: &mut [u64; 3],
+                       embedded_total: &mut u64| {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let texts: Vec<&str> = batch.iter().map(|(_, text, _)| text.as_str()).collect();
+        let embeddings = embedder.embed_texts(&texts)?;
+
+        for ((doc_id, _, source), vec) in batch.iter().zip(embeddings.iter()) {
+            vector.add(*doc_id, vec)?;
+            progress.add_embedded(*source, 1);
+            embedded_counts[source.idx()] += 1;
+            *embedded_total += 1;
+        }
+        batch.clear();
+        Ok::<_, anyhow::Error>(())
+    };
 
     index.for_each_record(|record| {
         if record.text.is_empty() || !is_embedding_role(&record.role) {
@@ -306,19 +331,34 @@ fn run_embed(root: Option<PathBuf>) -> Result<()> {
         if vector.contains(record.doc_id) {
             return Ok(());
         }
-        progress.add_embed_total(record.source, 1);
-        progress.add_embed_pending(record.source, 1);
         let text = truncate_for_embedding(record.text);
-        let embeddings = embedder.embed_texts(&[text.as_str()])?;
-        if let Some(vec) = embeddings.first() {
-            vector.add(record.doc_id, vec)?;
-            progress.add_embedded(record.source, 1);
-            embedded_counts[record.source.idx()] += 1;
-            embedded_total += 1;
+        if !text.is_empty() {
+            progress.add_embed_total(record.source, 1);
+            batch.push((record.doc_id, text, record.source));
+
+            if batch.len() >= BATCH_SIZE {
+                flush_batch(
+                    &mut batch,
+                    &mut embedder,
+                    &mut vector,
+                    &progress,
+                    &mut embedded_counts,
+                    &mut embedded_total,
+                )?;
+            }
         }
-        progress.sub_embed_pending(record.source, 1);
         Ok(())
     })?;
+
+    // Flush remaining
+    flush_batch(
+        &mut batch,
+        &mut embedder,
+        &mut vector,
+        &progress,
+        &mut embedded_counts,
+        &mut embedded_total,
+    )?;
 
     vector.save()?;
     progress.finish();

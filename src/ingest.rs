@@ -1054,18 +1054,28 @@ fn flush_embeddings(
     if buffer.is_empty() {
         return Ok(0);
     }
+
+    // Prepare texts for batch embedding
+    let items: Vec<(u64, String, SourceKind)> = buffer
+        .drain(..)
+        .map(|(doc_id, text, source)| (doc_id, truncate_for_embedding(text), source))
+        .filter(|(_, text, _)| !text.is_empty())
+        .collect();
+
+    if items.is_empty() {
+        return Ok(0);
+    }
+
+    // Batch embed all texts at once
+    let texts: Vec<&str> = items.iter().map(|(_, text, _)| text.as_str()).collect();
+    let embeddings = embedder.embed_texts(&texts)?;
+
+    // Add embeddings to index
     let mut count = 0;
-    for (doc_id, text, source) in buffer.drain(..) {
-        let text = truncate_for_embedding(text);
-        if text.is_empty() {
-            continue;
-        }
-        let embeddings = embedder.embed_texts(&[text.as_str()])?;
-        if let Some(vec) = embeddings.get(0) {
-            vindex.add(doc_id, vec)?;
-            progress.add_embedded(source, 1);
-            count += 1;
-        }
+    for ((doc_id, _, source), vec) in items.iter().zip(embeddings.iter()) {
+        vindex.add(*doc_id, vec)?;
+        progress.add_embedded(*source, 1);
+        count += 1;
     }
     Ok(count)
 }
