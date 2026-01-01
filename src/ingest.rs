@@ -325,15 +325,15 @@ fn writer_loop(
                 progress.add_embed_pending(record.source, 1);
                 embed_buffer.push((record.doc_id, text, record.source));
             }
-            if let Some(emb) = embedder.as_mut() {
-                if embed_buffer.len() >= EMBED_BATCH_SIZE {
-                    embedded_count += flush_embeddings(
-                        &mut embed_buffer,
-                        emb,
-                        vector_index.as_mut().unwrap(),
-                        &progress,
-                    )?;
-                }
+            if let Some(emb) = embedder.as_mut()
+                && embed_buffer.len() >= EMBED_BATCH_SIZE
+            {
+                embedded_count += flush_embeddings(
+                    &mut embed_buffer,
+                    emb,
+                    vector_index.as_mut().unwrap(),
+                    &progress,
+                )?;
             }
         }
         count += 1;
