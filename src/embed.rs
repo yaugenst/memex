@@ -8,9 +8,17 @@ pub struct EmbedderHandle {
 
 impl EmbedderHandle {
     pub fn new() -> Result<Self> {
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::EmbeddingGemma300M).with_show_download_progress(true),
-        )?;
+        let mut opts = InitOptions::new(EmbeddingModel::EmbeddingGemma300M)
+            .with_show_download_progress(false);
+
+        // Use CoreML on macOS for hardware acceleration
+        #[cfg(target_os = "macos")]
+        {
+            use ort::execution_providers::CoreMLExecutionProvider;
+            opts = opts.with_execution_providers(vec![CoreMLExecutionProvider::default().build()]);
+        }
+
+        let model = TextEmbedding::try_new(opts)?;
         // EmbeddingGemma outputs 768-dim embeddings
         let dims = 768;
         Ok(Self { model, dims })
