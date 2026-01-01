@@ -9,8 +9,7 @@ pub struct EmbedderHandle {
 impl EmbedderHandle {
     pub fn new() -> Result<Self> {
         let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::EmbeddingGemma300M)
-                .with_show_download_progress(true),
+            InitOptions::new(EmbeddingModel::EmbeddingGemma300M).with_show_download_progress(true),
         )?;
         // EmbeddingGemma outputs 768-dim embeddings
         let dims = 768;
@@ -21,7 +20,7 @@ impl EmbedderHandle {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let embeddings = self.model.embed(texts.to_vec(), None)?;
+        let embeddings = self.model.embed(texts, None)?;
         Ok(embeddings)
     }
 }

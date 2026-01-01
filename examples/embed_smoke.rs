@@ -3,8 +3,7 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 fn main() -> Result<()> {
     let mut model = TextEmbedding::try_new(
-        InitOptions::new(EmbeddingModel::EmbeddingGemma300M)
-            .with_show_download_progress(true),
+        InitOptions::new(EmbeddingModel::EmbeddingGemma300M).with_show_download_progress(true),
     )?;
     let input = vec!["hello world", "small embedding smoke test"];
     let embeddings = model.embed(input, None)?;
