@@ -465,18 +465,18 @@ fn run_semantic_search(
     let mut results = Vec::new();
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
     for (doc_id, distance) in vector.search(embedding, limit)? {
-        if let Some(record) = index.get_by_doc_id(doc_id)? {
-            if matches_filters(&record, options) {
-                let base = score_from_distance(distance);
-                let score = apply_recency(
-                    base,
-                    record.ts,
-                    now_ms,
-                    recency_weight,
-                    recency_half_life_days,
-                );
-                results.push((score, record));
-            }
+        if let Some(record) = index.get_by_doc_id(doc_id)?
+            && matches_filters(&record, options)
+        {
+            let base = score_from_distance(distance);
+            let score = apply_recency(
+                base,
+                record.ts,
+                now_ms,
+                recency_weight,
+                recency_half_life_days,
+            );
+            results.push((score, record));
         }
     }
     let results = apply_post_processing(results, render);
@@ -572,40 +572,40 @@ fn apply_recency(score: f32, ts: u64, now_ms: u64, weight: f32, half_life_days: 
 }
 
 fn matches_filters(record: &crate::types::Record, options: &QueryOptions) -> bool {
-    if let Some(project) = &options.project {
-        if &record.project != project {
-            return false;
-        }
+    if let Some(project) = &options.project
+        && &record.project != project
+    {
+        return false;
     }
-    if let Some(role) = &options.role {
-        if &record.role != role {
-            return false;
-        }
+    if let Some(role) = &options.role
+        && &record.role != role
+    {
+        return false;
     }
-    if let Some(tool) = &options.tool {
-        if record.tool_name.as_deref() != Some(tool.as_str()) {
-            return false;
-        }
+    if let Some(tool) = &options.tool
+        && record.tool_name.as_deref() != Some(tool.as_str())
+    {
+        return false;
     }
-    if let Some(source) = options.source {
-        if !source.matches(record.source) {
-            return false;
-        }
+    if let Some(source) = options.source
+        && !source.matches(record.source)
+    {
+        return false;
     }
-    if let Some(session_id) = &options.session_id {
-        if &record.session_id != session_id {
-            return false;
-        }
+    if let Some(session_id) = &options.session_id
+        && &record.session_id != session_id
+    {
+        return false;
     }
-    if let Some(since) = options.since {
-        if record.ts < since {
-            return false;
-        }
+    if let Some(since) = options.since
+        && record.ts < since
+    {
+        return false;
     }
-    if let Some(until) = options.until {
-        if record.ts > until {
-            return false;
-        }
+    if let Some(until) = options.until
+        && record.ts > until
+    {
+        return false;
     }
     true
 }
