@@ -251,10 +251,9 @@ fn run_index(
         no_embeddings,
         "embeddings",
     )?;
-    if reindex
-        && paths.root.exists() {
-            std::fs::remove_dir_all(&paths.root)?;
-        }
+    if reindex && paths.root.exists() {
+        std::fs::remove_dir_all(&paths.root)?;
+    }
     paths.ensure_dirs()?;
     let index = SearchIndex::open_or_create(&paths.index)?;
     let vector_exists = paths.vectors.join("meta.json").exists()
@@ -460,7 +459,8 @@ fn run_semantic_search(
     let vector = VectorIndex::open(&paths.vectors)?;
     let mut embedder = EmbedderHandle::new()?;
     let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
-    let embedding = embeddings.first()
+    let embedding = embeddings
+        .first()
         .ok_or_else(|| anyhow!("embedding missing"))?;
     let mut results = Vec::new();
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
@@ -505,7 +505,8 @@ fn run_hybrid_search(
     })?;
 
     let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
-    let embedding = embeddings.first()
+    let embedding = embeddings
+        .first()
         .ok_or_else(|| anyhow!("embedding missing"))?;
     let vector_results = vector.search(embedding, vector_k)?;
 

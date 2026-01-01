@@ -117,11 +117,7 @@ impl VectorIndex {
         }
 
         let results = self.index.search(embedding, limit)?;
-        Ok(results
-            .keys
-            .into_iter()
-            .zip(results.distances)
-            .collect())
+        Ok(results.keys.into_iter().zip(results.distances).collect())
     }
 
     pub fn save(&self) -> Result<()> {
