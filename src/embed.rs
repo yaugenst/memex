@@ -8,8 +8,8 @@ pub struct EmbedderHandle {
 
 impl EmbedderHandle {
     pub fn new() -> Result<Self> {
-        let mut opts = InitOptions::new(EmbeddingModel::EmbeddingGemma300M)
-            .with_show_download_progress(false);
+        let mut opts =
+            InitOptions::new(EmbeddingModel::EmbeddingGemma300M).with_show_download_progress(false);
 
         // Use CoreML on macOS for hardware acceleration
         #[cfg(target_os = "macos")]
