@@ -580,10 +580,10 @@ fn parse_claude_file(
                         if block_obj.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
                             let tool_output = block_obj.get("content").map(|v| v.to_string());
                             let mut text = extract_text_from_tool_result(block).unwrap_or_default();
-                            if text.is_empty() {
-                                if let Some(content) = block_obj.get("content") {
-                                    text = content.to_string();
-                                }
+                            if text.is_empty()
+                                && let Some(content) = block_obj.get("content")
+                            {
+                                text = content.to_string();
                             }
                             let tool_name = block_obj
                                 .get("tool_use_id")
@@ -731,10 +731,10 @@ fn parse_codex_session(
                     text_parts.push(text);
                 } else if let Some(arr) = content.as_array() {
                     for block in arr {
-                        if let Some(block_obj) = block.as_object() {
-                            if let Some(text) = block_obj.get("text").and_then(|v| v.as_str()) {
-                                text_parts.push(text);
-                            }
+                        if let Some(block_obj) = block.as_object()
+                            && let Some(text) = block_obj.get("text").and_then(|v| v.as_str())
+                        {
+                            text_parts.push(text);
                         }
                     }
                 }
@@ -772,10 +772,10 @@ fn parse_codex_session(
                 .get("arguments")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) {
-                if let Some(name) = tool_name.clone() {
-                    call_id_to_name.insert(call_id.to_string(), name);
-                }
+            if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str())
+                && let Some(name) = tool_name.clone()
+            {
+                call_id_to_name.insert(call_id.to_string(), name);
             }
             let text = tool_input.clone().unwrap_or_default();
             let record = Record {
@@ -1014,12 +1014,11 @@ fn extract_text_from_tool_result(block: &simd_json::BorrowedValue) -> Option<Str
     if let Some(arr) = content.as_array() {
         let mut parts = Vec::new();
         for item in arr {
-            if let Some(obj) = item.as_object() {
-                if obj.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                        parts.push(text);
-                    }
-                }
+            if let Some(obj) = item.as_object()
+                && obj.get("type").and_then(|v| v.as_str()) == Some("text")
+                && let Some(text) = obj.get("text").and_then(|v| v.as_str())
+            {
+                parts.push(text);
             }
         }
         if !parts.is_empty() {
