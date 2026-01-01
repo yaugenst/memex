@@ -28,10 +28,12 @@ impl VectorIndex {
             }
         }
 
-        let mut options = IndexOptions::default();
-        options.dimensions = dimensions;
-        options.metric = MetricKind::Cos;
-        options.quantization = ScalarKind::F32;
+        let options = IndexOptions {
+            dimensions,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            ..IndexOptions::default()
+        };
 
         let index = Index::new(&options)?;
 
@@ -118,7 +120,7 @@ impl VectorIndex {
         Ok(results
             .keys
             .into_iter()
-            .zip(results.distances.into_iter())
+            .zip(results.distances)
             .collect())
     }
 

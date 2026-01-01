@@ -2,11 +2,11 @@ use crate::config::{Paths, UserConfig};
 use crate::embed::EmbedderHandle;
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all};
-use crate::vector::VectorIndex;
 use crate::types::SourceFilter;
+use crate::vector::VectorIndex;
 use anyhow::{Result, anyhow};
-use clap::{Parser, Subcommand, ValueEnum};
 use chrono::SecondsFormat;
+use clap::{Parser, Subcommand, ValueEnum};
 use regex::RegexBuilder;
 use serde::Serialize;
 use serde_json::Value;
@@ -27,6 +27,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     Index {
         #[arg(long)]
@@ -219,7 +220,11 @@ pub fn run() -> Result<()> {
         } => {
             run_session(session_id, verbose, root)?;
         }
-        Commands::Show { doc_id, verbose, root } => {
+        Commands::Show {
+            doc_id,
+            verbose,
+            root,
+        } => {
             run_show(doc_id, verbose, root)?;
         }
         Commands::Stats { root } => {
@@ -246,11 +251,10 @@ fn run_index(
         no_embeddings,
         "embeddings",
     )?;
-    if reindex {
-        if paths.root.exists() {
+    if reindex
+        && paths.root.exists() {
             std::fs::remove_dir_all(&paths.root)?;
         }
-    }
     paths.ensure_dirs()?;
     let index = SearchIndex::open_or_create(&paths.index)?;
     let vector_exists = paths.vectors.join("meta.json").exists()
@@ -270,7 +274,10 @@ fn run_index(
     if report.records_embedded > 0 {
         println!(
             "indexed {} records, embedded {} across {} files (skipped {})",
-            report.records_added, report.records_embedded, report.files_scanned, report.files_skipped
+            report.records_added,
+            report.records_embedded,
+            report.files_scanned,
+            report.files_skipped
         );
     } else {
         println!(
@@ -304,7 +311,7 @@ fn run_embed(root: Option<PathBuf>) -> Result<()> {
         progress.add_embed_pending(record.source, 1);
         let text = truncate_for_embedding(record.text);
         let embeddings = embedder.embed_texts(&[text.as_str()])?;
-        if let Some(vec) = embeddings.get(0) {
+        if let Some(vec) = embeddings.first() {
             vector.add(record.doc_id, vec)?;
             progress.add_embedded(record.source, 1);
             embedded_counts[record.source.idx()] += 1;
@@ -328,6 +335,7 @@ fn run_embed(root: Option<PathBuf>) -> Result<()> {
     std::process::exit(0);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_search(
     query: String,
     project: Option<String>,
@@ -432,12 +440,8 @@ fn run_search(
     }
     let results = index.search(&options)?;
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    let mut reranked = apply_recency_to_results(
-        results,
-        now_ms,
-        recency_weight,
-        recency_half_life_days,
-    );
+    let mut reranked =
+        apply_recency_to_results(results, now_ms, recency_weight, recency_half_life_days);
     reranked.retain(|(_, record)| matches_filters(record, &options));
     let reranked = apply_post_processing(reranked, &render);
     render_results(reranked, &render)?;
@@ -456,8 +460,7 @@ fn run_semantic_search(
     let vector = VectorIndex::open(&paths.vectors)?;
     let mut embedder = EmbedderHandle::new()?;
     let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
-    let embedding = embeddings
-        .get(0)
+    let embedding = embeddings.first()
         .ok_or_else(|| anyhow!("embedding missing"))?;
     let mut results = Vec::new();
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
@@ -493,8 +496,8 @@ fn run_hybrid_search(
     let vector = VectorIndex::open(&paths.vectors)?;
     let mut embedder = EmbedderHandle::new()?;
 
-    let bm25_k = (limit * 5).max(50).min(500);
-    let vector_k = (limit * 5).max(50).min(500);
+    let bm25_k = (limit * 5).clamp(50, 500);
+    let vector_k = (limit * 5).clamp(50, 500);
 
     let bm25_results = index.search(&QueryOptions {
         limit: bm25_k,
@@ -502,8 +505,7 @@ fn run_hybrid_search(
     })?;
 
     let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
-    let embedding = embeddings
-        .get(0)
+    let embedding = embeddings.first()
         .ok_or_else(|| anyhow!("embedding missing"))?;
     let vector_results = vector.search(embedding, vector_k)?;
 
@@ -649,12 +651,7 @@ fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOpti
             let text = summarize(&record.text, 200);
             println!(
                 "[{score:.3}] {} {} {} {} {} {}",
-                ts,
-                record.doc_id,
-                record.project,
-                record.role,
-                record.session_id,
-                text
+                ts, record.doc_id, record.project, record.role, record.session_id, text
             );
         }
         return Ok(());
@@ -717,7 +714,7 @@ fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOpti
             }
             Value::Object(map)
         } else {
-            Value::from(serde_json::to_value(SearchHit {
+            serde_json::to_value(SearchHit {
                 score,
                 ts,
                 doc_id: record.doc_id,
@@ -728,7 +725,7 @@ fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOpti
                 text,
                 snippet,
                 matches,
-            })?)
+            })?
         };
         if render.json_array {
             output.push(value);
@@ -820,11 +817,7 @@ fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
     };
     println!(
         "vectors: {} (dims {}, ids {}, vectors.f32 {}, doc_ids.u64 {})",
-        vecs,
-        meta.dimensions,
-        ids,
-        vec_bytes,
-        ids_bytes
+        vecs, meta.dimensions, ids, vec_bytes, ids_bytes
     );
     Ok(())
 }
@@ -848,7 +841,7 @@ fn parse_ts_millis(value: Option<String>) -> Result<Option<u64>> {
         return Ok(Some(num * 1000));
     }
     let dt = chrono::DateTime::parse_from_rfc3339(&value)
-        .map_err(|_| anyhow!("invalid timestamp: {}", value))?;
+        .map_err(|_| anyhow!("invalid timestamp: {value}"))?;
     Ok(Some(dt.timestamp_millis() as u64))
 }
 
@@ -934,7 +927,13 @@ fn apply_recency_to_results(
         .into_iter()
         .map(|(score, record)| {
             (
-                apply_recency(score, record.ts, now_ms, recency_weight, recency_half_life_days),
+                apply_recency(
+                    score,
+                    record.ts,
+                    now_ms,
+                    recency_weight,
+                    recency_half_life_days,
+                ),
                 record,
             )
         })

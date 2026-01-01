@@ -2,7 +2,9 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SourceKind {
+    #[default]
     Claude,
     CodexSession,
     CodexHistory,
@@ -35,11 +37,6 @@ impl SourceKind {
     }
 }
 
-impl Default for SourceKind {
-    fn default() -> Self {
-        SourceKind::Claude
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
