@@ -187,8 +187,8 @@ enum IndexServiceCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let is_tui = matches!(cli.command, Commands::Tui { .. });
-    if !is_tui {
+    let should_check = !matches!(cli.command, Commands::Tui { .. } | Commands::Update { .. });
+    if should_check {
         check_for_update_async(None);
     }
     match cli.command {
@@ -1644,7 +1644,7 @@ fn run_update(skip_confirm: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let latest = fetch_latest_version()?;
 
-    if current == latest {
+    if !is_newer_version(current, &latest) {
         println!("memex is already up to date (v{current})");
         return Ok(());
     }
@@ -1771,7 +1771,7 @@ pub fn check_for_update_async(sender: Option<std::sync::mpsc::Sender<String>>) {
     std::thread::spawn(move || {
         if let Ok(latest) = fetch_latest_version() {
             let current = env!("CARGO_PKG_VERSION");
-            if current != latest {
+            if is_newer_version(current, &latest) {
                 if let Some(sender) = sender {
                     let message = format!("update: v{latest} (memex update)");
                     let _ = sender.send(message);
@@ -1784,4 +1784,37 @@ pub fn check_for_update_async(sender: Option<std::sync::mpsc::Sender<String>>) {
             }
         }
     });
+}
+
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    let Some(current) = parse_version_parts(current) else {
+        return false;
+    };
+    let Some(latest) = parse_version_parts(latest) else {
+        return false;
+    };
+    latest > current
+}
+
+fn parse_version_parts(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts: Vec<u64> = Vec::with_capacity(3);
+    let mut buf = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_digit() {
+            buf.push(ch);
+        } else if !buf.is_empty() {
+            parts.push(buf.parse().ok()?);
+            buf.clear();
+            if parts.len() == 3 {
+                break;
+            }
+        }
+    }
+    if !buf.is_empty() && parts.len() < 3 {
+        parts.push(buf.parse().ok()?);
+    }
+    if parts.len() < 3 {
+        return None;
+    }
+    Some((parts[0], parts[1], parts[2]))
 }
