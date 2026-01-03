@@ -2,44 +2,51 @@
 
 Fast local history search for Claude and Codex logs. Uses BM-25 and optionally embeds your transcripts locally and layers on hybrid search.
 
-## Build
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nicosuave/memex/main/scripts/setup.sh | sh
+```
+
+Then run setup to install the skill/prompt:
+
+```bash
+memex setup
+```
+
+Restart Claude/Codex after setup.
+
+## Build from source
 
 ```
-cargo build
+cargo build --release
 ```
 
 Binary:
 ```
-./target/debug/memex
+./target/release/memex
 ```
 
-## Install Skill
+## Setup (manual)
 
-Install the memex-search skill so Claude/Codex can use it automatically:
+If you built from source, run setup to install:
 
 ```bash
-# Install for Claude Code only (default)
-./target/debug/memex skill-install
-
-# Install for both Claude and Codex
-./target/debug/memex skill-install --codex
-
-# Install for Codex only
-./target/debug/memex skill-install --no-claude --codex
+memex setup
 ```
 
-Restart Claude/Codex to load the skill.
+This detects which tools are installed (Claude/Codex) and presents an interactive menu to select which to configure.
 
 ## Quickstart
 
 Index (incremental):
 ```
-./target/debug/memex index
+memex index
 ```
 
 Search (JSONL default):
 ```
-./target/debug/memex search "your query" --limit 20
+memex search "your query" --limit 20
 ```
 
 Notes:
@@ -48,17 +55,17 @@ Notes:
 
 Full transcript:
 ```
-./target/debug/memex session <session_id>
+memex session <session_id>
 ```
 
 Single record:
 ```
-./target/debug/memex show <doc_id>
+memex show <doc_id>
 ```
 
 Human output:
 ```
-./target/debug/memex search "your query" -v
+memex search "your query" -v
 ```
 
 ## Search modes
@@ -89,13 +96,13 @@ Human output:
 
 Enable:
 ```
-./target/debug/memex index-service enable
-./target/debug/memex index-service enable --continuous
+memex index-service enable
+memex index-service enable --continuous
 ```
 
 Disable:
 ```
-./target/debug/memex index-service disable
+memex index-service disable
 ```
 
 `index-service` reads config defaults (mode, interval, log paths). Flags override.
@@ -104,7 +111,7 @@ Disable:
 
 Disable:
 ```
-./target/debug/memex index --no-embeddings
+memex index --no-embeddings
 ```
 
 Recommended when embeddings are on (especially non-`potion` models): run the background
@@ -124,9 +131,9 @@ Select via `--model` flag or `MEMEX_MODEL` env var:
 | potion | 256 | Fastest (tiny) | Lowest (default) |
 
 ```
-./target/debug/memex index --model minilm
+memex index --model minilm
 # or
-MEMEX_MODEL=minilm ./target/debug/memex index
+MEMEX_MODEL=minilm memex index
 ```
 
 ## Config (optional)
@@ -147,4 +154,4 @@ Service logs and the plist live under `~/.memex` by default.
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
 
-The skill definition is bundled in `skills/memex-search/SKILL.md`.
+The skill/prompt definitions are bundled in `skills/`.
