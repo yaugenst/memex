@@ -9,6 +9,11 @@ Includes a TUI for browsing, finding and resumign both Claude Code & Codex CLI s
 ![memex tui](docs/tui.png?raw=1&v=2)
 
 ## Install
+```bash
+brew install nicosuave/tap/memex
+```
+
+Or
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nicosuave/memex/main/scripts/setup.sh | sh
