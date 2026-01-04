@@ -11,9 +11,6 @@ push = true
 # Create and push git tag
 tag = true
 
-# Commit the version bump
-commit = true
-
 # Commit message format (no "chore: " prefix)
 pre-release-commit-message = "Release {{crate_name}} version {{version}}"
 
