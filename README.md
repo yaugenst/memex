@@ -80,6 +80,87 @@ Binary:
 ./target/release/memex
 ```
 
+## Nix
+
+### Quickstart
+
+Run memex directly from the flake:
+
+```bash
+nix run github:nicosuave/memex
+```
+
+### Development Environment
+
+Enter a reproducible development shell:
+
+```bash
+nix develop
+```
+
+> **Note**
+> No public binary cache is currently configured. The first run of `nix build` or `nix run` will build from source locally.
+
+### NixOS Service
+
+Enable the background indexing service using the provided module.
+
+<details>
+<summary>NixOS Module Configuration</summary>
+
+```nix
+{
+  inputs.memex.url = "github:nicosuave/memex";
+
+  outputs = { nixpkgs, memex, ... }: {
+    nixosConfigurations.default = nixpkgs.lib.nixosSystem {
+      modules = [
+        memex.nixosModules.default
+        {
+          services.memex = {
+            enable = true;
+            continuous = true; # Run as a daemon (optional)
+          };
+        }
+      ];
+    };
+  };
+}
+```
+</details>
+
+### Home Manager
+
+Configure settings declaratively. This generates `~/.memex/config.toml`.
+
+<details>
+<summary>Home Manager Configuration</summary>
+
+```nix
+{
+  inputs.memex.url = "github:nicosuave/memex";
+
+  outputs = { memex, ... }: {
+    # Inside your Home Manager configuration
+    modules = [
+      memex.homeManagerModules.default
+      {
+        programs.memex = {
+          enable = true;
+          settings = {
+            embeddings = true;
+            model = "minilm";
+            auto_index_on_search = true;
+            index_service_interval = 3600;
+          };
+        };
+      }
+    ];
+  };
+}
+```
+</details>
+
 ## Setup (manual)
 
 If you built from source, run setup to install:
