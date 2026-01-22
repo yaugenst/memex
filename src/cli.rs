@@ -219,7 +219,7 @@ OUTPUT FIELDS (--fields):
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Install the automem-search skill/prompt for Claude and/or Codex
+    /// Install the memex-search skill for Claude, Codex, and/or Opencode
     Setup {
         /// Overwrite existing skills/prompts (useful after memex update)
         #[arg(short, long)]
@@ -1144,13 +1144,13 @@ fn run_setup(force: bool) -> Result<()> {
     let action = if force { "install/update" } else { "install" };
     println!("This will {action}:");
     if claude_path.is_some() {
-        println!("  Claude Code: automem-search skill, instruction-improver skill");
+        println!("  Claude Code: memex-search skill, instruction-improver skill");
     }
     if codex_path.is_some() {
-        println!("  Codex: automem-search prompt");
+        println!("  Codex: memex-search skill");
     }
     if opencode_path.is_some() {
-        println!("  Opencode: automem-search prompt");
+        println!("  Opencode: memex-search skill");
     }
     if force {
         println!();
@@ -1197,14 +1197,14 @@ fn run_setup(force: bool) -> Result<()> {
 
     let claude_skill = include_str!("../skills/memex-search/SKILL.md");
     let instruction_improver_skill = include_str!("../skills/instruction-improver/SKILL.md");
-    let codex_prompt = include_str!("../skills/codex/automem-search.md");
+    let codex_skill = include_str!("../skills/codex/memex-search.md");
 
     for index in selected {
         let (tool, _) = &items[index];
         match *tool {
             "claude" => {
-                // Install automem-search skill
-                let dest_dir = home.join(".claude").join("skills").join("automem-search");
+                // Install memex-search skill
+                let dest_dir = home.join(".claude").join("skills").join("memex-search");
                 let dest = dest_dir.join("SKILL.md");
                 if dest.exists() && !force {
                     println!(
@@ -1248,22 +1248,22 @@ fn run_setup(force: bool) -> Result<()> {
                 }
             }
             "codex" => {
-                let dest_dir = home.join(".codex").join("prompts");
-                let dest = dest_dir.join("automem-search.md");
+                let dest_dir = home.join(".codex").join("skills");
+                let dest = dest_dir.join("memex-search.md");
                 if dest.exists() && !force {
                     println!(
-                        "Skipping Codex prompt (already installed at {}). Use --force to overwrite.",
+                        "Skipping Codex skill (already installed at {}). Use --force to overwrite.",
                         dest.display()
                     );
                 } else {
                     std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, codex_prompt)?;
+                    std::fs::write(&dest, codex_skill)?;
                     let verb = if dest.exists() {
                         "Updated"
                     } else {
                         "Installed"
                     };
-                    println!("{verb} Codex prompt at {}.", dest.display());
+                    println!("{verb} Codex skill at {}.", dest.display());
                 }
             }
             "opencode" => {
@@ -1271,22 +1271,22 @@ fn run_setup(force: bool) -> Result<()> {
                     .join(".local")
                     .join("share")
                     .join("opencode")
-                    .join("prompts");
-                let dest = dest_dir.join("automem-search.md");
+                    .join("skills");
+                let dest = dest_dir.join("memex-search.md");
                 if dest.exists() && !force {
                     println!(
-                        "Skipping Opencode prompt (already installed at {}). Use --force to overwrite.",
+                        "Skipping Opencode skill (already installed at {}). Use --force to overwrite.",
                         dest.display()
                     );
                 } else {
                     std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, codex_prompt)?;
+                    std::fs::write(&dest, codex_skill)?;
                     let verb = if dest.exists() {
                         "Updated"
                     } else {
                         "Installed"
                     };
-                    println!("{verb} Opencode prompt at {}.", dest.display());
+                    println!("{verb} Opencode skill at {}.", dest.display());
                 }
             }
             _ => {}
@@ -1294,7 +1294,7 @@ fn run_setup(force: bool) -> Result<()> {
     }
 
     println!();
-    println!("Done! Restart Claude Code / Codex / Opencode to pick up changes.");
+    println!("Done! Restart Claude Code, Codex, or Opencode to pick up changes.");
 
     Ok(())
 }
