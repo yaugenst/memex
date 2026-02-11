@@ -117,13 +117,18 @@ Search (JSONL default):
 memex search "your query" --limit 20
 ```
 
+Session activity in a time window:
+```
+memex sessions --since 2026-02-10T00:00:00Z --until 2026-02-11T00:00:00Z --source codex --json-array
+```
+
 TUI:
 ```
 memex tui
 ```
 
 Notes:
-- Embeddings are enabled by default.
+- Embeddings are disabled by default.
 - Searches run an incremental reindex by default (configurable).
 
 Full transcript:
@@ -169,13 +174,28 @@ This detects which tools are installed (Claude/Codex) and presents an interactiv
 | Fuzzy concepts | `search "concept" --semantic` |
 | Mixed | `search "term concept" --hybrid` |
 
+## Session activity
+
+List sessions with activity stats in a time window:
+
+```
+memex sessions --since <iso|unix> --until <iso|unix> --source codex --json-array
+```
+
+Fields include:
+- `session_id`, `source`, `project`
+- `first_ts`, `last_ts`
+- `message_count`, `user_count`, `assistant_count`, `tool_use_count`, `tool_result_count`
+- `tool_names`
+- `source_path`, `source_path_exists`
+
 ## Common filters
 
 - `--project <name>`
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex`
+- `--source claude|codex|opencode`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -238,7 +258,7 @@ MEMEX_MODEL=minilm memex index
 Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 
 ```toml
-embeddings = true
+embeddings = false
 auto_index_on_search = true
 model = "minilm"  # minilm, bge, nomic, gemma, potion
 compute_units = "ane"  # macOS only: ane, gpu, cpu, all

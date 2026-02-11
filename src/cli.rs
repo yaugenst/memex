@@ -3,7 +3,7 @@ use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
 use crate::tui;
-use crate::types::SourceFilter;
+use crate::types::{SourceFilter, SourceKind};
 use crate::vector::VectorIndex;
 use anyhow::{Result, anyhow};
 use chrono::SecondsFormat;
@@ -131,7 +131,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude or codex
+        /// Filter by source: claude, codex, or opencode
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -174,6 +174,40 @@ OUTPUT FIELDS (--fields):
         #[arg(long, value_enum, default_value = "score")]
         sort: SortBy,
         /// Show verbose output with inline text preview
+        #[arg(short, long)]
+        verbose: bool,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// List active sessions in a time window with per-session activity stats
+    #[command(after_help = "\
+EXAMPLES:
+    memex sessions --since 2026-02-10T00:00:00Z --until 2026-02-11T00:00:00Z --source codex --json-array
+    memex sessions --source claude --sort count --limit 200")]
+    Sessions {
+        /// Filter by project name
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by source: claude, codex, or opencode
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Only include sessions with activity after this timestamp (RFC3339 or unix seconds/ms)
+        #[arg(long, value_name = "TIMESTAMP")]
+        since: Option<String>,
+        /// Only include sessions with activity before this timestamp (RFC3339 or unix seconds/ms)
+        #[arg(long, value_name = "TIMESTAMP")]
+        until: Option<String>,
+        /// Maximum number of sessions to return
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// Sort sessions by most recent activity, first activity, or message count
+        #[arg(long, value_enum, default_value = "last-ts")]
+        sort: SessionSort,
+        /// Output results as a single JSON array instead of newline-delimited JSON
+        #[arg(long)]
+        json_array: bool,
+        /// Show human-readable output
         #[arg(short, long)]
         verbose: bool,
         /// Path to memex data directory [default: ~/.memex]
@@ -368,6 +402,21 @@ pub fn run() -> Result<()> {
                 sort,
                 verbose,
                 root,
+            )?;
+        }
+        Commands::Sessions {
+            project,
+            source,
+            since,
+            until,
+            limit,
+            sort,
+            json_array,
+            verbose,
+            root,
+        } => {
+            run_sessions(
+                project, source, since, until, limit, sort, json_array, verbose, root,
             )?;
         }
         Commands::Tui { root } => {
@@ -749,6 +798,261 @@ fn run_search(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_sessions(
+    project: Option<String>,
+    source: Option<SourceFilter>,
+    since: Option<String>,
+    until: Option<String>,
+    limit: usize,
+    sort: SessionSort,
+    json_array: bool,
+    verbose: bool,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    config.apply_embed_runtime_env();
+
+    let auto_index_on_search = config.auto_index_on_search_default();
+    let embeddings_default = config.embeddings_default();
+    let scan_cache_ttl = config.scan_cache_ttl();
+    if auto_index_on_search {
+        paths.ensure_dirs()?;
+        let index = SearchIndex::open_or_create(&paths.index)?;
+        let vector_exists = paths.vectors.join("meta.json").exists()
+            && paths.vectors.join("vectors.f32").exists()
+            && paths.vectors.join("doc_ids.u64").exists();
+        let backfill_embeddings = embeddings_default && !vector_exists && index.doc_count()? > 0;
+        let opts = IngestOptions {
+            claude_source: default_claude_source(),
+            include_agents: false,
+            include_codex: true,
+            include_opencode: true,
+            embeddings: embeddings_default,
+            backfill_embeddings,
+            model: config.resolve_model(None)?,
+            compute_units: config.resolve_compute_units(),
+        };
+        let _ = ingest_if_stale(&paths, &index, &opts, scan_cache_ttl)?;
+    }
+
+    let since_ms = parse_ts_millis(since)?;
+    let until_ms = parse_ts_millis(until)?;
+    let index = SearchIndex::open_or_create(&paths.index)?;
+    let filters = SessionFilters {
+        project: project.as_deref(),
+        source,
+        since: since_ms,
+        until: until_ms,
+    };
+
+    let mut sessions: HashMap<String, SessionAccumulator> = HashMap::new();
+    index.for_each_record(|record| {
+        if record.session_id.trim().is_empty() || !matches_session_filters(&record, &filters) {
+            return Ok(());
+        }
+        sessions
+            .entry(record.session_id.clone())
+            .or_default()
+            .update(&record);
+        Ok(())
+    })?;
+
+    let mut rows: Vec<SessionActivity> = sessions
+        .into_iter()
+        .map(|(session_id, acc)| acc.finalize(session_id))
+        .collect();
+
+    match sort {
+        SessionSort::LastTs => rows.sort_by(|a, b| b.last_ts_ms.cmp(&a.last_ts_ms)),
+        SessionSort::FirstTs => rows.sort_by(|a, b| b.first_ts_ms.cmp(&a.first_ts_ms)),
+        SessionSort::Count => rows.sort_by(|a, b| b.message_count.cmp(&a.message_count)),
+    }
+    if rows.len() > limit {
+        rows.truncate(limit);
+    }
+
+    if verbose {
+        for row in rows {
+            let tools = if row.tool_names.is_empty() {
+                "-".to_string()
+            } else {
+                row.tool_names.join(",")
+            };
+            println!(
+                "{} {} msgs={} user={} assistant={} tool_use={} tool_result={} first={} last={} path_exists={} tools={}",
+                row.session_id,
+                row.source,
+                row.message_count,
+                row.user_count,
+                row.assistant_count,
+                row.tool_use_count,
+                row.tool_result_count,
+                format_ts(row.first_ts_ms),
+                format_ts(row.last_ts_ms),
+                row.source_path_exists,
+                tools
+            );
+        }
+        return Ok(());
+    }
+
+    if json_array {
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        for row in rows {
+            println!("{}", serde_json::to_string(&row)?);
+        }
+    }
+    Ok(())
+}
+
+struct SessionFilters<'a> {
+    project: Option<&'a str>,
+    source: Option<SourceFilter>,
+    since: Option<u64>,
+    until: Option<u64>,
+}
+
+fn matches_session_filters(record: &crate::types::Record, filters: &SessionFilters<'_>) -> bool {
+    if let Some(project) = filters.project
+        && record.project != project
+    {
+        return false;
+    }
+    if let Some(source) = filters.source
+        && !source.matches(record.source)
+    {
+        return false;
+    }
+    if let Some(since) = filters.since
+        && record.ts < since
+    {
+        return false;
+    }
+    if let Some(until) = filters.until
+        && record.ts > until
+    {
+        return false;
+    }
+    true
+}
+
+#[derive(Default)]
+struct SessionAccumulator {
+    first_ts: Option<u64>,
+    last_ts: Option<u64>,
+    message_count: u64,
+    user_count: u64,
+    assistant_count: u64,
+    tool_use_count: u64,
+    tool_result_count: u64,
+    project_counts: HashMap<String, u64>,
+    source_counts: HashMap<String, u64>,
+    tool_names: HashSet<String>,
+    latest_any_path: Option<(u64, String)>,
+    latest_non_history_path: Option<(u64, String)>,
+}
+
+impl SessionAccumulator {
+    fn update(&mut self, record: &crate::types::Record) {
+        self.message_count += 1;
+
+        self.first_ts = Some(match self.first_ts {
+            Some(ts) => ts.min(record.ts),
+            None => record.ts,
+        });
+        self.last_ts = Some(match self.last_ts {
+            Some(ts) => ts.max(record.ts),
+            None => record.ts,
+        });
+
+        match record.role.as_str() {
+            "user" => self.user_count += 1,
+            "assistant" => self.assistant_count += 1,
+            "tool_use" => self.tool_use_count += 1,
+            "tool_result" => self.tool_result_count += 1,
+            _ => {}
+        }
+
+        if let Some(tool) = record.tool_name.as_deref()
+            && !tool.is_empty()
+        {
+            self.tool_names.insert(tool.to_string());
+        }
+
+        *self
+            .project_counts
+            .entry(record.project.clone())
+            .or_insert(0) += 1;
+        *self
+            .source_counts
+            .entry(record.source.label().to_string())
+            .or_insert(0) += 1;
+
+        if self
+            .latest_any_path
+            .as_ref()
+            .map(|(ts, _)| record.ts >= *ts)
+            .unwrap_or(true)
+        {
+            self.latest_any_path = Some((record.ts, record.source_path.clone()));
+        }
+        if record.source != SourceKind::CodexHistory
+            && self
+                .latest_non_history_path
+                .as_ref()
+                .map(|(ts, _)| record.ts >= *ts)
+                .unwrap_or(true)
+        {
+            self.latest_non_history_path = Some((record.ts, record.source_path.clone()));
+        }
+    }
+
+    fn finalize(self, session_id: String) -> SessionActivity {
+        let first_ts_ms = self.first_ts.unwrap_or(0);
+        let last_ts_ms = self.last_ts.unwrap_or(0);
+        let source_path = self
+            .latest_non_history_path
+            .or(self.latest_any_path)
+            .map(|(_, path)| path)
+            .unwrap_or_default();
+
+        let source_path_exists =
+            !source_path.is_empty() && std::path::Path::new(&source_path).exists();
+
+        let mut tool_names: Vec<String> = self.tool_names.into_iter().collect();
+        tool_names.sort();
+
+        SessionActivity {
+            session_id,
+            source: dominant_by_count(self.source_counts, "unknown"),
+            project: dominant_by_count(self.project_counts, ""),
+            first_ts: format_ts(first_ts_ms),
+            last_ts: format_ts(last_ts_ms),
+            first_ts_ms,
+            last_ts_ms,
+            message_count: self.message_count,
+            user_count: self.user_count,
+            assistant_count: self.assistant_count,
+            tool_use_count: self.tool_use_count,
+            tool_result_count: self.tool_result_count,
+            tool_names,
+            source_path,
+            source_path_exists,
+        }
+    }
+}
+
+fn dominant_by_count(counts: HashMap<String, u64>, fallback: &str) -> String {
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+        .map(|(value, _)| value)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 struct SearchContext<'a> {
     render: &'a RenderOptions,
     paths: &'a Paths,
@@ -953,6 +1257,27 @@ struct SearchHit {
     text: String,
     snippet: String,
     matches: Vec<MatchSpan>,
+}
+
+#[derive(Serialize)]
+struct SessionActivity {
+    session_id: String,
+    source: String,
+    project: String,
+    first_ts: String,
+    last_ts: String,
+    #[serde(skip_serializing)]
+    first_ts_ms: u64,
+    #[serde(skip_serializing)]
+    last_ts_ms: u64,
+    message_count: u64,
+    user_count: u64,
+    assistant_count: u64,
+    tool_use_count: u64,
+    tool_result_count: u64,
+    tool_names: Vec<String>,
+    source_path: String,
+    source_path_exists: bool,
 }
 
 fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOptions) -> Result<()> {
@@ -2142,6 +2467,14 @@ fn summarize(text: &str, max: usize) -> String {
 enum SortBy {
     Score,
     Ts,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum SessionSort {
+    LastTs,
+    FirstTs,
+    Count,
 }
 
 fn parse_fields(value: Option<String>) -> Result<Option<HashSet<String>>> {
