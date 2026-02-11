@@ -47,6 +47,11 @@ git push
 - Default development model: `MEMEX_MODEL="minilm"`.
 - Optional macOS tuning: `MEMEX_COMPUTE_UNITS=ane|gpu|cpu` (no effect on Linux; no effect for `potion`).
 
+## Global Install (stow)
+- Global `memex` in `~/.local/bin` is managed via stow from `/Users/yannick/code/memex`.
+- Worktree sessions may build local binaries for testing, but should not run stow or update `~/.local/bin/memex` unless explicitly requested.
+- Treat `/Users/yannick/code/memex` as the canonical source for global install changes.
+
 ## Safety
 - Do not run destructive git commands unless explicitly requested.
 - Do not commit local-only files (`.memex-dev.env`, `docs/dev-workflow.md`).
