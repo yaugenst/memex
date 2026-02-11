@@ -7,6 +7,28 @@ description: Search, filter, and retrieve Claude/Codex/Cursor/OpenCode/Pi/Copilo
 
 Use this skill to index local history and retrieve results in a structured way.
 
+## Session discovery first (daily-report flow)
+
+For "what sessions had activity in this time window", start here:
+
+```bash
+memex sessions --since <iso|unix> --until <iso|unix> --json-array
+```
+
+Common narrowing:
+- `--source claude|codex|opencode`
+- `--project <name>`
+- `--sort last-ts|first-ts|count`
+- `--limit <n>`
+- `-v/--verbose` for human output
+
+Output includes per-session stats:
+- `session_id`, `source`, `project`
+- `first_ts`, `last_ts`
+- `message_count`, `user_count`, `assistant_count`, `tool_use_count`, `tool_result_count`
+- `tool_names`
+- `source_path`, `source_path_exists`
+
 ## Indexing
 
 - Build or update the index (incremental):
@@ -15,8 +37,10 @@ Use this skill to index local history and retrieve results in a structured way.
   - `memex index-service enable --continuous`
 - Full rebuild (clears index):
   - `memex reindex`
-- Embeddings are on by default.
-- Disable embeddings:
+- Embeddings are **off** by default.
+- Enable embeddings during indexing:
+  - `memex index --embeddings`
+- Disable embeddings explicitly:
   - `memex index --no-embeddings`
 - Backfill embeddings only:
   - `memex embed`
@@ -34,7 +58,7 @@ Use this skill to index local history and retrieve results in a structured way.
 
 Run a search; output is JSON lines by default.
 
-```
+```bash
 memex search "query" --limit 20
 ```
 
@@ -80,7 +104,7 @@ Each JSON line includes:
 
 ### Background index service
 
-```
+```bash
 memex index-service enable
 memex index-service enable --continuous
 memex index-service disable
@@ -96,42 +120,34 @@ memex index-service disable
 
 ### Narrow first (fastest reducers)
 
-1) Global search with `--limit`
-2) Reduce with `--project` and `--since/--until`
-3) Optionally `--top-n-per-session` or `--unique-session`
-4) `memex session <id>` for full context
-
-### Practical narrowing tips
-
-- Start with exact terms (quoted) before hybrid if results are noisy.
-- Use `--unique-session` to collapse PR-link spam fast.
-- Use `--min-score` to prune low-signal hits.
-- Use `--sort ts` when you want a timeline view.
-- Use `--role assistant` for narrative outcomes; `--role tool_result` for command errors.
-- For a specific session, prefer `search "<term>" --session <id> --sort ts --limit 50` to jump to outcomes.
+1) Identify active sessions with `memex sessions --since ... --until ...`
+2) Search globally with `--limit`
+3) Reduce with `--project`, `--source`, and `--since/--until`
+4) Optionally `--top-n-per-session` or `--unique-session`
+5) `memex session <id>` for full context
 
 ## Config
 
 Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 
 ```toml
-embeddings = true
+embeddings = false
 auto_index_on_search = true
-model = "potion"  # minilm, bge, nomic, gemma, potion
+model = "gemma"  # minilm, bge, nomic, gemma, potion
+compute_units = "ane"  # macOS only: ane, gpu, cpu, all
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
 ```
 
-`auto_index_on_search` runs an incremental index update before each search.
+`auto_index_on_search` runs an incremental index update before search and sessions listing.
 `scan_cache_ttl` sets the maximum scan staleness for auto-indexing.
 `index-service` reads config defaults (mode, interval, log paths). Flags override.
-Service logs and the plist live under `~/.memex` by default.
 
-Recommended when embeddings are on (especially non-`potion` models): run the
-background index service or `index --watch`, and consider setting
-`auto_index_on_search = false` to keep searches fast.
+When embeddings are on (especially non-`potion` models): run the background index
+service or `index --watch`, and consider setting `auto_index_on_search = false`
+to keep searches fast.
 
 ### Semantic and Hybrid
 
@@ -156,12 +172,13 @@ Both commands return JSON by default.
 Use `-v/--verbose` for human-readable output:
 
 - `memex search "query" -v`
+- `memex sessions --since <iso|unix> --until <iso|unix> -v`
 - `memex show <doc_id> -v`
 - `memex session <session_id> -v`
 
 ## Recommended Flow
 
-1) `memex search "query" --limit 20`
-2) Pick hits using `matches` or `snippet`
+1) `memex sessions --since <iso|unix> --until <iso|unix> --json-array`
+2) `memex search "query" --limit 20`
 3) `memex show <doc_id>` or `memex session <session_id>`
 4) Refine with `--session`, `--role`, or time filters
