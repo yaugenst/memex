@@ -1527,6 +1527,7 @@ fn run_index_service_enable_launchd(
     } else {
         (Some(interval), false)
     };
+    let env_vars = launchd_environment_variables(paths)?;
 
     let contents = build_launchd_plist(
         &label,
@@ -1535,6 +1536,7 @@ fn run_index_service_enable_launchd(
         keep_alive,
         Some(&stdout),
         Some(&stderr),
+        &env_vars,
     );
     std::fs::write(&plist_path, contents)?;
 
@@ -1909,6 +1911,7 @@ fn build_launchd_plist(
     keep_alive: bool,
     stdout: Option<&PathBuf>,
     stderr: Option<&PathBuf>,
+    env_vars: &[(String, String)],
 ) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -1951,10 +1954,42 @@ fn build_launchd_plist(
             xml_escape(&stderr.to_string_lossy())
         ));
     }
+    if !env_vars.is_empty() {
+        out.push_str("  <key>EnvironmentVariables</key>\n");
+        out.push_str("  <dict>\n");
+        for (key, value) in env_vars {
+            out.push_str(&format!("    <key>{}</key>\n", xml_escape(key)));
+            out.push_str(&format!("    <string>{}</string>\n", xml_escape(value)));
+        }
+        out.push_str("  </dict>\n");
+    }
 
     out.push_str("</dict>\n");
     out.push_str("</plist>\n");
     out
+}
+
+fn launchd_environment_variables(paths: &Paths) -> Result<Vec<(String, String)>> {
+    let mut vars = Vec::new();
+    if let Some(base) = directories::BaseDirs::new() {
+        vars.push((
+            "HOME".to_string(),
+            base.home_dir().to_string_lossy().to_string(),
+        ));
+    }
+    let path = std::env::var("PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    vars.push(("PATH".to_string(), path));
+
+    let embed_cache = paths.root.join("embed-cache");
+    std::fs::create_dir_all(&embed_cache)?;
+    let embed_cache = embed_cache.to_string_lossy().to_string();
+    vars.push(("FASTEMBED_CACHE_DIR".to_string(), embed_cache.clone()));
+    vars.push(("HF_HOME".to_string(), embed_cache));
+
+    Ok(vars)
 }
 
 fn xml_escape(input: &str) -> String {
