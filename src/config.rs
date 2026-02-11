@@ -51,6 +51,8 @@ pub struct UserConfig {
     pub auto_index_on_search: Option<bool>,
     /// Embedding model: minilm, bge, nomic, gemma (default), potion
     pub model: Option<String>,
+    /// Embedding runtime compute units on macOS: ane, gpu, cpu, all
+    pub compute_units: Option<String>,
     /// Scan cache TTL in seconds. If a scan was done within this time,
     /// skip re-scanning on search. Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
@@ -112,6 +114,21 @@ impl UserConfig {
             return ModelChoice::parse(&model);
         }
         Ok(ModelChoice::default())
+    }
+
+    pub fn resolve_compute_units(&self) -> Option<String> {
+        if let Some(units) = self.compute_units.as_deref() {
+            return Some(units.to_string());
+        }
+        std::env::var("MEMEX_COMPUTE_UNITS").ok()
+    }
+
+    pub fn apply_embed_runtime_env(&self) {
+        if let Some(units) = self.resolve_compute_units() {
+            unsafe {
+                std::env::set_var("MEMEX_COMPUTE_UNITS", units);
+            }
+        }
     }
 
     pub fn scan_cache_ttl(&self) -> u64 {
