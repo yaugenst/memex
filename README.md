@@ -122,13 +122,18 @@ Search (JSONL default):
 memex search "your query" --limit 20
 ```
 
+Session activity in a time window:
+```
+memex sessions --since 2026-02-10T00:00:00Z --until 2026-02-11T00:00:00Z --source codex --json-array
+```
+
 TUI:
 ```
 memex tui
 ```
 
 Notes:
-- Embeddings are enabled by default.
+- Embeddings are disabled by default.
 - Searches run an incremental reindex by default (configurable).
 
 Full transcript:
@@ -203,6 +208,21 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 | Exact terms | `search "exact term"` |
 | Fuzzy concepts | `search "concept" --semantic` |
 | Mixed | `search "term concept" --hybrid` |
+
+## Session activity
+
+List sessions with activity stats in a time window:
+
+```
+memex sessions --since <iso|unix> --until <iso|unix> --source codex --json-array
+```
+
+Fields include:
+- `session_id`, `source`, `project`
+- `first_ts`, `last_ts`
+- `message_count`, `user_count`, `assistant_count`, `tool_use_count`, `tool_result_count`
+- `tool_names`
+- `source_path`, `source_path_exists`
 
 ## Common filters
 
@@ -301,7 +321,7 @@ keys.
 Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 
 ```toml
-embeddings = true
+embeddings = false
 auto_index_on_search = true
 token_usage = false  # opt in to local token and cost tracking
 model = "minilm"  # minilm, bge, nomic, gemma, potion
