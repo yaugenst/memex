@@ -2043,7 +2043,7 @@ fn run_setup(force: bool) -> Result<()> {
         println!("  Claude Code: memex-search skill, instruction-improver skill");
     }
     if codex_path.is_some() {
-        println!("  Codex: memex-search skill");
+        println!("  Codex: memex-search skill, instruction-improver skill");
     }
     if opencode_path.is_some() {
         println!("  Opencode: memex-search skill");
@@ -2128,6 +2128,8 @@ fn run_setup(force: bool) -> Result<()> {
     let claude_skill = include_str!("../skills/memex-search/SKILL.md");
     let instruction_improver_skill = include_str!("../skills/instruction-improver/SKILL.md");
     let codex_skill = include_str!("../skills/codex/memex-search/SKILL.md");
+    let codex_instruction_improver_skill =
+        include_str!("../skills/codex/instruction-improver/SKILL.md");
     let opencode_skill = include_str!("../skills/opencode/memex-search/SKILL.md");
     let pi_skill = include_str!("../skills/pi/memex-search/SKILL.md");
 
@@ -2196,6 +2198,30 @@ fn run_setup(force: bool) -> Result<()> {
                         "Installed"
                     };
                     println!("{verb} Codex skill at {}.", dest.display());
+                }
+
+                let improver_dir = home
+                    .join(".codex")
+                    .join("skills")
+                    .join("instruction-improver");
+                let improver_dest = improver_dir.join("SKILL.md");
+                if improver_dest.exists() && !force {
+                    println!(
+                        "Skipping Codex instruction-improver skill (already installed at {}). Use --force to overwrite.",
+                        improver_dest.display()
+                    );
+                } else {
+                    std::fs::create_dir_all(&improver_dir)?;
+                    std::fs::write(&improver_dest, codex_instruction_improver_skill)?;
+                    let verb = if improver_dest.exists() {
+                        "Updated"
+                    } else {
+                        "Installed"
+                    };
+                    println!(
+                        "{verb} Codex instruction-improver skill at {}.",
+                        improver_dest.display()
+                    );
                 }
             }
             "opencode" => {

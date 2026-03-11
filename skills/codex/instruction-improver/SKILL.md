@@ -1,7 +1,6 @@
 ---
 name: instruction-improver
-description: Audit memex history for recurring instruction gaps, validate them with full-session evidence, and propose high-confidence improvements to CLAUDE.md or AGENTS.md. Use when the user wants to learn from repeated corrections, failures, or wins before changing standing instructions.
-allowed-tools: Bash(memex:*)
+description: Audit memex history for recurring instruction gaps, validate them with full-session evidence, and propose high-confidence improvements to CLAUDE.md or AGENTS.md. Use when you want to learn from repeated corrections, failures, or wins before changing standing instructions.
 ---
 
 # Instruction Improver
