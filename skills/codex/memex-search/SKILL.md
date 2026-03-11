@@ -153,8 +153,9 @@ common CUDA install paths and active `venv` / `conda` `site-packages/nvidia/*/li
 directories.
 
 When embeddings are on (especially non-`potion` models): run the background index
-service or `index --watch`, and consider setting `auto_index_on_search = false`
-to keep searches fast.
+service (`memex index-service enable --continuous` for always-on indexing, or
+`memex index-service enable` for periodic indexing), and consider setting
+`auto_index_on_search = false` to keep searches fast.
 
 ### Semantic and Hybrid
 
