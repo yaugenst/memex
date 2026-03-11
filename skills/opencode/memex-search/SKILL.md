@@ -72,11 +72,18 @@ Create `~/.memex/config.toml` (or `<root>/config.toml`):
 embeddings = false
 auto_index_on_search = true
 model = "gemma"  # minilm, bge, nomic, gemma, potion
-compute_units = "ane"  # macOS only: ane, gpu, cpu, all
+execution_provider = "auto"  # auto, cpu, coreml, cuda
+cuda_device_id = 0  # optional, when execution_provider = "cuda"
+cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional CUDA library dirs
+cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]  # optional cuDNN library dirs
+compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
 scan_cache_ttl = 3600
 ```
 
 `auto_index_on_search` refreshes index state before search and sessions listing.
+CUDA first tries the system loader paths, then configured library dirs, then
+common CUDA install paths and active `venv` / `conda` `site-packages/nvidia/*/lib`
+directories.
 
 ## Output Parsing
 

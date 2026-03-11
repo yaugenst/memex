@@ -122,7 +122,11 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 embeddings = false
 auto_index_on_search = true
 model = "gemma"  # minilm, bge, nomic, gemma, potion
-compute_units = "ane"  # macOS only: ane, gpu, cpu, all
+execution_provider = "auto"  # auto, cpu, coreml, cuda
+cuda_device_id = 0  # optional, when execution_provider = "cuda"
+cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional CUDA library dirs
+cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]  # optional cuDNN library dirs
+compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
@@ -132,6 +136,9 @@ index_service_poll_interval = 30  # seconds
 `auto_index_on_search` runs an incremental index update before search and sessions listing.
 `scan_cache_ttl` sets the maximum scan staleness for auto-indexing.
 `index-service` reads config defaults (mode, interval, log paths). Flags override.
+CUDA first tries the system loader paths, then configured library dirs, then
+common CUDA install paths and active `venv` / `conda` `site-packages/nvidia/*/lib`
+directories.
 
 When embeddings are on (especially non-`potion` models): run the background index
 service or `index --watch`, and consider setting `auto_index_on_search = false`

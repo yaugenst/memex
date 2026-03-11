@@ -13,14 +13,31 @@ fn generate_texts(n: usize) -> Vec<String> {
         .collect()
 }
 
-fn run_case(model_name: &str, model: ModelChoice, unit: &str, texts: &[String]) -> Result<()> {
-    if unit == "n/a" {
+fn run_case(
+    model_name: &str,
+    model: ModelChoice,
+    provider: &str,
+    detail: &str,
+    texts: &[String],
+) -> Result<()> {
+    unsafe {
+        std::env::set_var("MEMEX_EXECUTION_PROVIDER", provider);
+    }
+
+    if provider == "coreml" {
+        unsafe {
+            std::env::set_var("MEMEX_COMPUTE_UNITS", detail);
+            std::env::remove_var("MEMEX_CUDA_DEVICE_ID");
+        }
+    } else if provider == "cuda" {
         unsafe {
             std::env::remove_var("MEMEX_COMPUTE_UNITS");
+            std::env::set_var("MEMEX_CUDA_DEVICE_ID", detail);
         }
     } else {
         unsafe {
-            std::env::set_var("MEMEX_COMPUTE_UNITS", unit);
+            std::env::remove_var("MEMEX_COMPUTE_UNITS");
+            std::env::remove_var("MEMEX_CUDA_DEVICE_ID");
         }
     }
 
@@ -38,7 +55,7 @@ fn run_case(model_name: &str, model: ModelChoice, unit: &str, texts: &[String]) 
     let tps = out.len() as f64 / run_elapsed.as_secs_f64();
 
     println!(
-        "{model_name},{unit},{},{init_ms},{run_ms},{:.2}",
+        "{model_name},{provider},{detail},{},{init_ms},{run_ms},{:.2}",
         embedder.dims, tps
     );
     Ok(())
@@ -46,7 +63,7 @@ fn run_case(model_name: &str, model: ModelChoice, unit: &str, texts: &[String]) 
 
 fn main() -> Result<()> {
     let texts = generate_texts(500);
-    println!("model,compute_units,dims,init_ms,embed_ms,texts_per_sec");
+    println!("model,execution_provider,detail,dims,init_ms,embed_ms,texts_per_sec");
 
     let fast_models = [
         ("minilm", ModelChoice::MiniLM),
@@ -56,11 +73,18 @@ fn main() -> Result<()> {
     ];
 
     for (name, model) in fast_models {
+        #[cfg(target_os = "macos")]
         for unit in ["all", "ane", "gpu", "cpu"] {
-            run_case(name, model, unit, &texts)?;
+            run_case(name, model, "coreml", unit, &texts)?;
         }
+
+        #[cfg(not(target_os = "macos"))]
+        run_case(name, model, "cpu", "n/a", &texts)?;
+
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        run_case(name, model, "cuda", "0", &texts)?;
     }
 
-    run_case("potion", ModelChoice::Potion, "n/a", &texts)?;
+    run_case("potion", ModelChoice::Potion, "cpu", "n/a", &texts)?;
     Ok(())
 }
