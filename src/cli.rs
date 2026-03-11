@@ -994,7 +994,6 @@ fn run_sessions(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    config.apply_embed_runtime_env();
 
     let auto_index_on_search = config.auto_index_on_search_default();
     let embeddings_default = config.embeddings_default();
@@ -1014,7 +1013,7 @@ fn run_sessions(
             embeddings: embeddings_default,
             backfill_embeddings,
             model: config.resolve_model(None)?,
-            compute_units: config.resolve_compute_units(),
+            embed_runtime: config.resolve_embed_runtime()?,
         };
         let _ = ingest_if_stale(&paths, &index, &opts, scan_cache_ttl)?;
     }
