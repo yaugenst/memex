@@ -249,6 +249,14 @@ fn resolve_library_paths_from_env(var: &str) -> Vec<PathBuf> {
 
 #[cfg(feature = "cuda")]
 fn preload_dylib(path: impl AsRef<std::ffi::OsStr>) -> std::result::Result<(), libloading::Error> {
+    #[cfg(unix)]
+    let library = unsafe {
+        libloading::os::unix::Library::open(
+            Some(path),
+            libloading::os::unix::RTLD_LAZY | libloading::os::unix::RTLD_GLOBAL,
+        )
+    }?;
+    #[cfg(not(unix))]
     let library = unsafe { libloading::Library::new(path) }?;
     mem::forget(library);
     Ok(())
@@ -270,13 +278,25 @@ fn preload_cuda_dependencies(runtime: &EmbedRuntimeConfig) -> Result<()> {
 fn try_preload_cuda_dependencies(runtime: &EmbedRuntimeConfig) -> Result<()> {
     let cuda_dirs = candidate_cuda_library_dirs(&runtime.cuda_library_paths);
     let cudnn_dirs = candidate_cudnn_library_dirs(&runtime.cudnn_library_paths);
-    preload_library_group("CUDA", CUDA_DYLIBS, &cuda_dirs)?;
-    preload_library_group("cuDNN", CUDNN_DYLIBS, &cudnn_dirs)?;
+    preload_library_group(
+        "CUDA",
+        CUDA_DYLIBS,
+        &cuda_dirs,
+        "You can set `cuda_library_paths` and `cudnn_library_paths` in config or via \
+         `MEMEX_CUDA_LIBRARY_PATHS` / `MEMEX_CUDNN_LIBRARY_PATHS`.",
+    )?;
+    preload_library_group(
+        "cuDNN",
+        CUDNN_DYLIBS,
+        &cudnn_dirs,
+        "You can set `cuda_library_paths` and `cudnn_library_paths` in config or via \
+         `MEMEX_CUDA_LIBRARY_PATHS` / `MEMEX_CUDNN_LIBRARY_PATHS`.",
+    )?;
     Ok(())
 }
 
 #[cfg(feature = "cuda")]
-fn preload_library_group(group: &str, dylibs: &[&str], dirs: &[PathBuf]) -> Result<()> {
+fn preload_library_group(group: &str, dylibs: &[&str], dirs: &[PathBuf], hint: &str) -> Result<()> {
     let mut missing = Vec::new();
 
     for dylib in dylibs {
@@ -309,14 +329,9 @@ fn preload_library_group(group: &str, dylibs: &[&str], dirs: &[PathBuf]) -> Resu
             .join(", ")
     };
     Err(anyhow!(
-        "missing {group} libraries: {}. Searched default loader paths and candidate directories: {}. \
-         You can set `{}` and `{}` in config or via `{}` / `{}`.",
+        "missing {group} libraries: {}. Searched default loader paths and candidate directories: {}. {hint}",
         missing.join(", "),
         searched,
-        "cuda_library_paths",
-        "cudnn_library_paths",
-        MEMEX_CUDA_LIBRARY_PATHS_ENV,
-        MEMEX_CUDNN_LIBRARY_PATHS_ENV
     ))
 }
 
