@@ -714,6 +714,8 @@ fn run_index(
     }
     paths.ensure_dirs()?;
     let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+    let vector_exists = vector_exists_for_model(&paths, model_choice)?;
+    let backfill_embeddings = embeddings && !vector_exists && index.doc_count()? > 0;
 
     let opts = IngestOptions {
         claude_source: source.unwrap_or_else(default_claude_source),
@@ -887,6 +889,8 @@ fn run_search(
         let tool_content_limits = config.indexed_tool_content_limits()?;
         paths.ensure_dirs()?;
         let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+        let vector_exists = vector_exists_for_model(&paths, model_choice)?;
+        let backfill_embeddings = embeddings_default && !vector_exists && index.doc_count()? > 0;
         let opts = IngestOptions {
             claude_source: default_claude_source(),
             include_agents: false,
@@ -1001,9 +1005,8 @@ fn run_sessions(
     if auto_index_on_search {
         paths.ensure_dirs()?;
         let index = SearchIndex::open_or_create(&paths.index)?;
-        let vector_exists = paths.vectors.join("meta.json").exists()
-            && paths.vectors.join("vectors.f32").exists()
-            && paths.vectors.join("doc_ids.u64").exists();
+        let model_choice = config.resolve_model(None)?;
+        let vector_exists = vector_exists_for_model(&paths, model_choice)?;
         let backfill_embeddings = embeddings_default && !vector_exists && index.doc_count()? > 0;
         let opts = IngestOptions {
             claude_source: default_claude_source(),
@@ -1012,7 +1015,7 @@ fn run_sessions(
             include_opencode: true,
             embeddings: embeddings_default,
             backfill_embeddings,
-            model: config.resolve_model(None)?,
+            model: model_choice,
             embed_runtime: config.resolve_embed_runtime()?,
         };
         let _ = ingest_if_stale(&paths, &index, &opts, scan_cache_ttl)?;
@@ -2949,6 +2952,10 @@ fn build_index_command_args(
         args.push(root.to_string_lossy().to_string());
     }
     args
+}
+
+fn vector_exists_for_model(paths: &Paths, model_choice: ModelChoice) -> Result<bool> {
+    crate::vector::VectorIndex::exists_with_dimensions(&paths.vectors, model_choice.dims())
 }
 
 fn build_launchd_plist(

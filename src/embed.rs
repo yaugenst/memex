@@ -71,12 +71,20 @@ pub enum ModelChoice {
 }
 
 impl ModelChoice {
+    pub const fn dims(self) -> usize {
+        match self {
+            ModelChoice::MiniLM | ModelChoice::BGESmall => 384,
+            ModelChoice::Nomic | ModelChoice::Gemma => 768,
+            ModelChoice::Potion => 256,
+        }
+    }
+
     fn fastembed_config(self) -> Option<(EmbeddingModel, usize)> {
         match self {
-            ModelChoice::MiniLM => Some((EmbeddingModel::AllMiniLML6V2, 384)),
-            ModelChoice::BGESmall => Some((EmbeddingModel::BGESmallENV15, 384)),
-            ModelChoice::Nomic => Some((EmbeddingModel::NomicEmbedTextV15, 768)),
-            ModelChoice::Gemma => Some((EmbeddingModel::EmbeddingGemma300M, 768)),
+            ModelChoice::MiniLM => Some((EmbeddingModel::AllMiniLML6V2, self.dims())),
+            ModelChoice::BGESmall => Some((EmbeddingModel::BGESmallENV15, self.dims())),
+            ModelChoice::Nomic => Some((EmbeddingModel::NomicEmbedTextV15, self.dims())),
+            ModelChoice::Gemma => Some((EmbeddingModel::EmbeddingGemma300M, self.dims())),
             ModelChoice::Potion => None,
         }
     }

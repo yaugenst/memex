@@ -23,6 +23,18 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
+    pub fn exists_with_dimensions(dir: &Path, dimensions: usize) -> Result<bool> {
+        let index_path = dir.join("usearch.index");
+        let ids_path = dir.join("doc_ids.bin");
+        if !index_path.exists() || !ids_path.exists() {
+            return Ok(false);
+        }
+
+        let existing = Index::new(&IndexOptions::default())?;
+        existing.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
+        Ok(existing.dimensions() == dimensions)
+    }
+
     pub fn open_or_create(dir: &Path, dimensions: usize, model: Option<&str>) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let index_path = dir.join("usearch.index");
@@ -294,6 +306,19 @@ mod tests {
         let query = make_vector(64, 1.0);
         let results = idx.search(&query, 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_exists_with_dimensions() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!VectorIndex::exists_with_dimensions(tmp.path(), 64).unwrap());
+
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
+        idx.add(1, &make_vector(64, 1.0)).unwrap();
+        idx.save().unwrap();
+
+        assert!(VectorIndex::exists_with_dimensions(tmp.path(), 64).unwrap());
+        assert!(!VectorIndex::exists_with_dimensions(tmp.path(), 32).unwrap());
     }
 
     #[test]

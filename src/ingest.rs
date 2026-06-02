@@ -755,9 +755,6 @@ fn writer_loop(
         if let Some(vindex) = vector_index.as_mut() {
             vindex.save()?;
         }
-        if let Some(handle) = embedder.take() {
-            std::mem::forget(handle);
-        }
     }
     Ok((count, embedded_count))
 }
