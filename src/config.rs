@@ -160,16 +160,17 @@ impl UserConfig {
     }
 
     pub fn resolve_execution_provider(&self) -> Result<ExecutionProviderChoice> {
+        match std::env::var("MEMEX_EXECUTION_PROVIDER") {
+            Ok(provider) => return ExecutionProviderChoice::parse(&provider),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(anyhow!("MEMEX_EXECUTION_PROVIDER is not valid unicode"));
+            }
+        }
         if let Some(provider) = self.execution_provider.as_deref() {
             return ExecutionProviderChoice::parse(provider);
         }
-        match std::env::var("MEMEX_EXECUTION_PROVIDER") {
-            Ok(provider) => ExecutionProviderChoice::parse(&provider),
-            Err(std::env::VarError::NotPresent) => Ok(ExecutionProviderChoice::Auto),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                Err(anyhow!("MEMEX_EXECUTION_PROVIDER is not valid unicode"))
-            }
-        }
+        Ok(ExecutionProviderChoice::Auto)
     }
 
     pub fn resolve_cuda_device_id(&self) -> Result<Option<i32>> {
@@ -371,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_execution_provider_prefers_config_over_env() {
+    fn resolve_execution_provider_prefers_env_over_config() {
         let _guard = env_lock();
         let _env = EnvVarGuard::set(&[("MEMEX_EXECUTION_PROVIDER", Some("cpu"))]);
         let config = UserConfig {
@@ -382,7 +383,7 @@ mod tests {
             config
                 .resolve_execution_provider()
                 .expect("resolve execution provider"),
-            ExecutionProviderChoice::Cuda
+            ExecutionProviderChoice::Cpu
         );
     }
 
