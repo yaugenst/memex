@@ -361,6 +361,7 @@ mod tests {
             assert!(idx.contains(100));
             assert!(idx.contains(200));
             assert!(!idx.contains(300));
+            assert_eq!(idx.len(), 2);
             assert_eq!(idx.dimensions(), 64);
 
             // Verify search still works
