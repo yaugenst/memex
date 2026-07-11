@@ -726,7 +726,7 @@ fn run_index(
         include_pi: pi,
         include_copilot: copilot,
         embeddings,
-        backfill_embeddings: false,
+        backfill_embeddings,
         model: model_choice,
         embed_runtime,
         tool_content_limits,
@@ -900,7 +900,7 @@ fn run_search(
             include_pi: true,
             include_copilot: true,
             embeddings: embeddings_default,
-            backfill_embeddings: false,
+            backfill_embeddings,
             model: model_choice,
             embed_runtime: embed_runtime.clone(),
             tool_content_limits,
@@ -1003,8 +1003,9 @@ fn run_sessions(
     let embeddings_default = config.embeddings_default();
     let scan_cache_ttl = config.scan_cache_ttl();
     if auto_index_on_search {
+        let tool_content_limits = config.indexed_tool_content_limits()?;
         paths.ensure_dirs()?;
-        let index = SearchIndex::open_or_create(&paths.index)?;
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
         let model_choice = config.resolve_model(None)?;
         let vector_exists = vector_exists_for_model(&paths, model_choice)?;
         let backfill_embeddings = embeddings_default && !vector_exists && index.doc_count()? > 0;
@@ -1013,10 +1014,14 @@ fn run_sessions(
             include_agents: false,
             include_codex: true,
             include_opencode: true,
+            include_cursor: true,
+            include_pi: true,
+            include_copilot: true,
             embeddings: embeddings_default,
             backfill_embeddings,
             model: model_choice,
             embed_runtime: config.resolve_embed_runtime()?,
+            tool_content_limits,
         };
         let _ = ingest_if_stale(&paths, &index, &opts, scan_cache_ttl)?;
     }
