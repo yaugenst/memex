@@ -1,8 +1,8 @@
 use crate::types::{Record, SourceFilter, SourceKind};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -55,6 +55,7 @@ pub struct AnalyticsStore {
 pub struct AnalyticsWriter {
     store: AnalyticsStore,
     sessions: HashMap<SessionKey, SessionAccumulator>,
+    deleted_source_paths: HashSet<String>,
     metadata_cache: HashMap<SessionKey, SessionMetadata>,
     git_cache: HashMap<String, GitMetadata>,
 }
@@ -628,6 +629,7 @@ impl AnalyticsWriter {
         Ok(Self {
             store: AnalyticsStore::open(path)?,
             sessions: HashMap::new(),
+            deleted_source_paths: HashSet::new(),
             metadata_cache: HashMap::new(),
             git_cache: HashMap::new(),
         })
@@ -637,8 +639,9 @@ impl AnalyticsWriter {
         self.store.clear()
     }
 
-    pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
-        self.store.delete_source_path(source_path)
+    pub fn delete_source_path(&mut self, source_path: &str) -> Result<()> {
+        self.deleted_source_paths.insert(source_path.to_string());
+        Ok(())
     }
 
     pub fn record(&mut self, record: &Record) -> Result<()> {
@@ -671,7 +674,19 @@ impl AnalyticsWriter {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        if self.sessions.is_empty() {
+        self.flush_inner(false, false)
+    }
+
+    fn replace_all_and_mark_complete(&mut self) -> Result<()> {
+        self.flush_inner(true, true)
+    }
+
+    fn flush_inner(&mut self, replace_all: bool, mark_complete: bool) -> Result<()> {
+        if self.sessions.is_empty()
+            && self.deleted_source_paths.is_empty()
+            && !replace_all
+            && !mark_complete
+        {
             return Ok(());
         }
         let pending_sessions: Vec<SessionAccumulator> = self.sessions.values().cloned().collect();
@@ -683,6 +698,14 @@ impl AnalyticsWriter {
             })
             .collect();
         let tx = self.store.conn.transaction()?;
+        if replace_all {
+            tx.execute("DELETE FROM sessions", [])?;
+        } else {
+            let mut delete_stmt = tx.prepare("DELETE FROM sessions WHERE source_path = ?1")?;
+            for source_path in &self.deleted_source_paths {
+                delete_stmt.execute(params![source_path])?;
+            }
+        }
         {
             let mut stmt = tx.prepare(
                 r#"
@@ -720,8 +743,16 @@ impl AnalyticsWriter {
                 ])?;
             }
         }
+        if mark_complete {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES('analytics_complete', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+        }
         tx.commit()?;
         self.sessions.clear();
+        self.deleted_source_paths.clear();
         Ok(())
     }
 
@@ -1079,28 +1110,32 @@ pub fn rebuild_from_records(
     records: impl IntoIterator<Item = Record>,
 ) -> Result<()> {
     let mut writer = AnalyticsWriter::open(path)?;
-    writer.clear()?;
     for record in records {
         writer.record(&record)?;
     }
-    writer.flush()?;
-    writer.store.mark_complete()
+    writer.replace_all_and_mark_complete()
 }
 
 pub fn backfill_from_index(
     path: impl AsRef<Path>,
     index: &crate::index::SearchIndex,
 ) -> Result<()> {
+    let expected_records = index.doc_count()?;
+    let mut scanned_records = 0usize;
     let mut writer = AnalyticsWriter::open(path)?;
-    writer.clear()?;
     index
         .for_each_record(|record| {
+            scanned_records += 1;
             writer.record(&record)?;
             Ok(())
         })
         .context("read records for analytics backfill")?;
-    writer.flush()?;
-    writer.store.mark_complete()
+    if scanned_records != expected_records {
+        bail!(
+            "analytics backfill read {scanned_records} of {expected_records} indexed records; keeping the existing analytics cache"
+        );
+    }
+    writer.replace_all_and_mark_complete()
 }
 
 #[cfg(test)]
@@ -1191,6 +1226,53 @@ mod tests {
         assert_eq!(rows[0].session_id, "s1");
         assert_eq!(rows[0].message_count, 2);
         assert_eq!(rows[0].last_at, 20);
+    }
+
+    #[test]
+    fn replacement_keeps_previous_session_visible_until_flush() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                tmp.path().display()
+            ),
+        )
+        .expect("write transcript");
+        let db = tmp.path().join("analytics.sqlite");
+        let source_path = transcript.to_string_lossy().to_string();
+
+        let mut initial = AnalyticsWriter::open(&db).expect("open initial analytics");
+        initial
+            .record(&record("memex", "s1", &transcript, 10))
+            .expect("record initial session");
+        initial.flush().expect("flush initial session");
+
+        let mut replacement = AnalyticsWriter::open(&db).expect("open replacement analytics");
+        replacement
+            .delete_source_path(&source_path)
+            .expect("stage source deletion");
+        replacement
+            .record(&record("memex", "s1", &transcript, 20))
+            .expect("record replacement session");
+
+        let before_flush = AnalyticsStore::open_read_only(&db).expect("open existing catalog");
+        let rows = before_flush
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("query existing catalog");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_at, 10);
+        drop(before_flush);
+
+        replacement.flush().expect("flush replacement");
+        let after_flush = AnalyticsStore::open_read_only(&db).expect("open replaced catalog");
+        let rows = after_flush
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("query replaced catalog");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_at, 20);
+        assert_eq!(rows[0].message_count, 1);
     }
 
     #[test]
