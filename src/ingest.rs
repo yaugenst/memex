@@ -801,8 +801,10 @@ pub fn ingest_all(
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     let analytics_db = analytics_path(&paths.state);
-    let analytics_needs_backfill =
-        !AnalyticsStore::is_complete(&analytics_db) && index.doc_count()? > 0;
+    let index_has_documents = index.doc_count()? > 0;
+    let analytics_needs_backfill = index_has_documents
+        && (!AnalyticsStore::is_complete(&analytics_db)
+            || !AnalyticsStore::is_ready(&analytics_db));
     if tasks.is_empty() && delete_paths.is_empty() && can_skip_noop_index(paths, index, options)? {
         if analytics_needs_backfill {
             backfill_from_index(&analytics_db, index)?;
@@ -1005,7 +1007,7 @@ fn can_skip_fresh_scan(
         return Ok(false);
     }
     let analytics = AnalyticsStore::open(analytics_path(&paths.state))?;
-    if !analytics.complete()? && index.doc_count()? > 0 {
+    if index.doc_count()? > 0 && (!analytics.complete()? || analytics.session_count()? == 0) {
         return Ok(false);
     }
     can_skip_noop_index(paths, index, options)
@@ -1859,11 +1861,8 @@ mod tests {
         index
     }
 
-    fn mark_analytics_complete(paths: &Paths) {
-        AnalyticsStore::open(analytics_path(&paths.state))
-            .expect("open analytics")
-            .mark_complete()
-            .expect("mark analytics complete");
+    fn backfill_analytics(paths: &Paths, index: &SearchIndex) {
+        backfill_from_index(analytics_path(&paths.state), index).expect("backfill analytics");
     }
 
     #[test]
@@ -2785,9 +2784,45 @@ mod tests {
         let index = save_search_records(&paths, &[record(1, "user", "hello")]);
         let options = ingest_options(false, ModelChoice::BGESmall);
         let cache = fresh_scan_cache();
-        mark_analytics_complete(&paths);
+        backfill_analytics(&paths, &index);
 
         assert!(can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    }
+
+    #[test]
+    fn cannot_skip_fresh_scan_with_complete_but_empty_analytics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+        let options = ingest_options(false, ModelChoice::BGESmall);
+        let cache = fresh_scan_cache();
+        AnalyticsStore::open(analytics_path(&paths.state))
+            .expect("open analytics")
+            .mark_complete()
+            .expect("mark analytics complete");
+
+        assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    }
+
+    #[test]
+    fn noop_ingest_repairs_complete_but_empty_analytics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+        let options = ingest_options(false, ModelChoice::BGESmall);
+        let analytics_db = analytics_path(&paths.state);
+        AnalyticsStore::open(&analytics_db)
+            .expect("open analytics")
+            .mark_complete()
+            .expect("mark analytics complete");
+        let lease = ingest_lease(&paths);
+
+        let report = ingest_all(&paths, &index, &options, &lease).expect("repair analytics");
+
+        assert_eq!(report.records_added, 0);
+        let analytics = AnalyticsStore::open(&analytics_db).expect("reopen analytics");
+        assert!(analytics.complete().expect("complete"));
+        assert_eq!(analytics.session_count().expect("session count"), 1);
     }
 
     #[test]
@@ -2798,7 +2833,7 @@ mod tests {
         let index = save_search_records(&paths, &[record(1, "user", "hello")]);
         let options = ingest_options(true, ModelChoice::BGESmall);
         let cache = fresh_scan_cache();
-        mark_analytics_complete(&paths);
+        backfill_analytics(&paths, &index);
 
         assert!(can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
     }
