@@ -452,10 +452,16 @@ Tracing records retrieval metadata without transcript contents. Evaluation repor
 ```bash
 memex index
 memex embed
+memex stats
 memex index-service status
 ```
 
 Embeddings are optional. If semantic/hybrid retrieval degrades to lexical but the lexical evidence is sufficient, do not turn the user's historical lookup into an embedding-maintenance task.
+
+Embedding backfills checkpoint complete batches in `<root>/state/embed-backfill.sqlite3` and resume
+when `memex embed` is rerun. Semantic and hybrid searches keep using the active complete vector
+generation until its replacement covers every live embeddable record and is atomically published.
+Use `memex stats` to inspect backfill progress and state.
 
 ### Index privacy / scope controls
 

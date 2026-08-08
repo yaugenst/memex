@@ -495,9 +495,36 @@ impl SearchIndex {
         Ok(())
     }
 
+    pub fn segment_count(&self) -> Result<usize> {
+        Ok(self.index.searchable_segment_metas()?.len())
+    }
+
     pub fn delete_by_source_path(&self, writer: &mut IndexWriter, path: &str) {
         let term = Term::from_field_text(self.fields.source_path, path);
         writer.delete_term(term);
+    }
+
+    pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let term = Term::from_field_text(self.fields.source_path, path);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let count = searcher.search(&query, &Count)?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(count))?;
+        let mut doc_ids = Vec::with_capacity(top_docs.len());
+        for (_score, address) in top_docs {
+            let document = searcher.doc::<TantivyDocument>(address)?;
+            if let Some(doc_id) = document
+                .get_first(self.fields.doc_id)
+                .and_then(|value| value.as_u64())
+            {
+                doc_ids.push(doc_id);
+            }
+        }
+        Ok(doc_ids)
     }
 
     pub fn add_record(&self, writer: &mut IndexWriter, record: &Record) -> Result<()> {
@@ -2027,4 +2054,5 @@ mod tests {
         fs::set_permissions(&generation, original_permissions).expect("restore permissions");
         assert_eq!(result.len(), 1);
     }
+
 }
