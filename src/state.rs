@@ -51,6 +51,8 @@ pub struct PendingToolCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::types::SourceKind>,
     pub size: u64,
     pub mtime: i64,
     pub offset: u64,
@@ -207,5 +209,16 @@ mod tests {
         assert_eq!(cache.last_scan_ts, 0);
         assert_eq!(cache.file_count, 0);
         assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[test]
+    fn legacy_file_state_without_source_remains_readable() {
+        let state: FileState = serde_json::from_str(
+            r#"{"size":1,"mtime":2,"offset":1,"turn_id":3,"parser_version":4}"#,
+        )
+        .expect("legacy file state");
+
+        assert_eq!(state.source, None);
+        assert_eq!(state.turn_id, 3);
     }
 }

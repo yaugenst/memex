@@ -18,6 +18,7 @@ pub mod tui;
 pub mod types;
 pub mod usage;
 pub mod vector;
+pub mod vector_backfill;
 pub mod web;
 pub mod web_auth;
 

@@ -1,8 +1,7 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig, default_claude_source};
-use crate::embed::EmbedderHandle;
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
-use crate::ingest::{IngestOptions, ingest_all};
+use crate::ingest::{IngestOptions, ingest_all, prune_missing_paths};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     LocatedRecord, MAX_HYDRATE_INPUT_BYTES, MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE,
@@ -138,6 +137,43 @@ struct IndexArgs {
     /// `exclude_paths` in ~/.memex/config.toml.
     #[arg(long = "exclude", value_name = "GLOB")]
     exclude: Vec<String>,
+    /// Do not remove indexed paths that disappeared from successfully scanned source roots
+    #[arg(long)]
+    no_prune: bool,
+}
+
+#[derive(Args, Clone)]
+struct PruneArgs {
+    /// Path to Claude projects directory [default: ~/.claude/projects]
+    #[arg(long)]
+    source: Option<PathBuf>,
+    /// Include missing Claude Code subagent transcript paths
+    #[arg(long)]
+    include_agents: bool,
+    /// Skip pruning Codex paths
+    #[arg(long = "no-codex")]
+    no_codex: bool,
+    /// Skip pruning OpenCode paths
+    #[arg(long = "no-opencode")]
+    no_opencode: bool,
+    /// Skip pruning Cursor paths
+    #[arg(long = "no-cursor")]
+    no_cursor: bool,
+    /// Skip pruning Pi paths
+    #[arg(long = "no-pi")]
+    no_pi: bool,
+    /// Skip pruning Oh My Pi paths
+    #[arg(long = "no-omp")]
+    no_omp: bool,
+    /// Skip pruning OpenClaw paths
+    #[arg(long = "no-openclaw")]
+    no_openclaw: bool,
+    /// Skip pruning GitHub Copilot CLI paths
+    #[arg(long = "no-copilot")]
+    no_copilot: bool,
+    /// Path to memex data directory [default: ~/.memex]
+    #[arg(long)]
+    root: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -192,6 +228,22 @@ EXAMPLES:
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// Remove records whose source paths no longer exist, without rebuilding the corpus
+    #[command(after_help = "\
+EXAMPLES:
+    memex prune                 # Preview missing paths and affected records
+    memex prune --apply         # Delete them from lexical, analytics, and vector stores
+    memex prune --no-codex      # Preview all enabled sources except Codex")]
+    Prune {
+        #[command(flatten)]
+        prune: PruneArgs,
+        /// Explicitly request preview mode (also the default)
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Apply the displayed deletions
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
     },
     /// Search indexed conversation history
     #[command(after_help = "\
@@ -851,6 +903,13 @@ pub fn run() -> Result<()> {
         Commands::Embed { model, root } => {
             run_embed(model, root)?;
         }
+        Commands::Prune {
+            prune,
+            dry_run: _,
+            apply,
+        } => {
+            run_prune(prune, apply)?;
+        }
         Commands::Search {
             query,
             additional_queries,
@@ -1192,6 +1251,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<
         reindex,
         continuous,
         index.diagnostics,
+        !index.no_prune,
     )
 }
 
@@ -1216,6 +1276,7 @@ fn run_index(
     reindex: bool,
     continuous: bool,
     print_diagnostics: bool,
+    prune_missing: bool,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
@@ -1260,7 +1321,7 @@ fn run_index(
         include_grok: grok,
         exclude_patterns: excludes,
         embeddings,
-        backfill_embeddings: false,
+        prune_missing,
         model: model_choice,
         embed_runtime,
         tool_content_limits,
@@ -1286,6 +1347,76 @@ fn run_index(
             "parser diagnostics:\n{}",
             serde_json::to_string_pretty(&report.diagnostics)?
         );
+    }
+    if report.files_pruned > 0 || report.records_pruned > 0 {
+        println!(
+            "removed {} stale or replaced records ({} missing paths)",
+            report.records_pruned, report.files_pruned
+        );
+    }
+    Ok(())
+}
+
+fn run_prune(args: PruneArgs, apply: bool) -> Result<()> {
+    let paths = Paths::new(args.root)?;
+    if !SearchIndex::exists(&paths.index) {
+        return Err(anyhow!(
+            "memex index not found at {}; run `memex index` first",
+            paths.index.display()
+        ));
+    }
+    let config = UserConfig::load(&paths)?;
+    let _lease = IngestLease::acquire(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
+    let index = if apply {
+        SearchIndex::open_or_create_for_ingest(&paths.index)?
+    } else {
+        SearchIndex::open_or_create(&paths.index)?
+    };
+    let options = IngestOptions {
+        claude_source: args.source.unwrap_or_else(default_claude_source),
+        include_agents: args.include_agents,
+        include_reasoning: config.include_reasoning_default(),
+        include_codex: !args.no_codex,
+        include_opencode: !args.no_opencode,
+        include_cursor: !args.no_cursor,
+        include_pi: !args.no_pi,
+        include_omp: !args.no_omp,
+        include_openclaw: !args.no_openclaw,
+        include_copilot: !args.no_copilot,
+        exclude_patterns: config.exclude_path_patterns(),
+        embeddings: false,
+        prune_missing: true,
+        model: config.resolve_model(None)?,
+        embed_runtime: config.resolve_embed_runtime()?,
+        tool_content_limits: config.indexed_tool_content_limits()?,
+    };
+    let report = prune_missing_paths(&paths, &index, &options, apply)?;
+    if apply && !report.source_paths.is_empty() {
+        index.publish_generation()?;
+    }
+    if report.source_paths.is_empty() {
+        println!("no missing indexed paths found beneath readable source roots");
+        return Ok(());
+    }
+
+    if apply {
+        println!(
+            "pruned {} records from {} missing paths:",
+            report.records,
+            report.source_paths.len()
+        );
+    } else {
+        println!(
+            "would prune {} records from {} missing paths:",
+            report.records,
+            report.source_paths.len()
+        );
+    }
+    for source_path in report.source_paths {
+        println!("  {source_path}");
+    }
+    if !apply {
+        println!("rerun with --apply to delete these records without rebuilding the corpus");
     }
     Ok(())
 }
@@ -1319,108 +1450,19 @@ fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<(
 }
 
 fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
-    const BATCH_SIZE: usize = 256;
-
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let _lease = IngestLease::acquire(&paths, "embed", INGEST_LEASE_TIMEOUT)?;
-
-    // Model priority: CLI flag > config file > env var > default
+    paths.ensure_dirs()?;
     let model_choice = config.resolve_model(model)?;
     let embed_runtime = config.resolve_embed_runtime()?;
-
     let index = SearchIndex::open_or_create(&paths.index)?;
-    let mut embedder = EmbedderHandle::with_model_and_runtime(model_choice, &embed_runtime)?;
-    let mut vector =
-        VectorIndex::open_or_create(&paths.vectors, embedder.dims, Some(model_choice.as_str()))?;
-
-    let progress = std::sync::Arc::new(crate::progress::Progress::new(
-        [0; crate::progress::SOURCE_COUNT],
-        [0; crate::progress::SOURCE_COUNT],
-        true,
-    ));
-    progress.set_embed_ready();
-
-    let mut embedded_counts = [0u64; crate::progress::SOURCE_COUNT];
-    let mut embedded_total = 0u64;
-    let mut batch: Vec<(u64, String, crate::types::SourceKind)> = Vec::with_capacity(BATCH_SIZE);
-
-    let flush_batch = |batch: &mut Vec<(u64, String, crate::types::SourceKind)>,
-                       embedder: &mut EmbedderHandle,
-                       vector: &mut VectorIndex,
-                       progress: &crate::progress::Progress,
-                       embedded_counts: &mut [u64; crate::progress::SOURCE_COUNT],
-                       embedded_total: &mut u64| {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let texts: Vec<&str> = batch.iter().map(|(_, text, _)| text.as_str()).collect();
-        let embeddings = embedder.embed_texts(&texts)?;
-
-        for ((doc_id, _, source), vec) in batch.iter().zip(embeddings.iter()) {
-            vector.add(*doc_id, vec)?;
-            progress.sub_embed_pending(*source, 1);
-            progress.add_embedded(*source, 1);
-            embedded_counts[source.idx()] += 1;
-            *embedded_total += 1;
-        }
-        batch.clear();
-        Ok::<_, anyhow::Error>(())
-    };
-
-    index.for_each_record(|record| {
-        if record.text.is_empty() || !is_embedding_role(&record.role) {
-            return Ok(());
-        }
-        if vector.contains(record.doc_id) {
-            return Ok(());
-        }
-        let text = truncate_for_embedding(record.text);
-        if !text.is_empty() {
-            progress.add_embed_total(record.source, 1);
-            progress.add_embed_pending(record.source, 1);
-            batch.push((record.doc_id, text, record.source));
-
-            if batch.len() >= BATCH_SIZE {
-                flush_batch(
-                    &mut batch,
-                    &mut embedder,
-                    &mut vector,
-                    &progress,
-                    &mut embedded_counts,
-                    &mut embedded_total,
-                )?;
-            }
-        }
-        Ok(())
-    })?;
-
-    // Flush remaining
-    flush_batch(
-        &mut batch,
-        &mut embedder,
-        &mut vector,
-        &progress,
-        &mut embedded_counts,
-        &mut embedded_total,
-    )?;
-
-    vector.save()?;
-    progress.finish();
+    let report = crate::vector_backfill::run(&paths, &index, model_choice, &embed_runtime)?;
     println!(
-        "embedded {} vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {})",
-        embedded_total,
-        embedded_counts[crate::types::SourceKind::Claude.idx()],
-        embedded_counts[crate::types::SourceKind::Codex.idx()],
-        embedded_counts[crate::types::SourceKind::Opencode.idx()],
-        embedded_counts[crate::types::SourceKind::Cursor.idx()],
-        embedded_counts[crate::types::SourceKind::Pi.idx()],
-        embedded_counts[crate::types::SourceKind::OpenClaw.idx()],
-        embedded_counts[crate::types::SourceKind::Copilot.idx()],
+        "embedded {} vectors ({} total, {} resumed from checkpoints)",
+        report.embedded, report.total, report.resumed
     );
-
-    std::io::stdout().flush().ok();
-    std::process::exit(0);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2232,8 +2274,28 @@ fn run_stats(root: Option<PathBuf>) -> Result<()> {
     let index = SearchIndex::open_or_create(&paths.index)?;
     println!("index: {}", paths.index.display());
     println!("documents: {}", index.doc_count()?);
+    println!("segments: {}", index.segment_count()?);
+    let index_bytes = observed_directory_size(&paths.index);
+    println!(
+        "index storage: {} ({} bytes)",
+        crate::progress::format_bytes(index_bytes),
+        index_bytes
+    );
     print_vector_stats(&paths.vectors)?;
+    if let Some(status) = crate::vector_backfill::status(&paths)? {
+        println!("{}", status.line());
+    }
     Ok(())
+}
+
+fn observed_directory_size(path: &std::path::Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
 }
 
 struct UsageCommandOptions {
@@ -2821,21 +2883,17 @@ fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
 }
 
 fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
-    if !vectors_dir.join("usearch.index").exists() {
+    let Some(inventory) = VectorIndex::inventory(vectors_dir)? else {
         return Ok("vectors: none".to_string());
-    }
-    let vector = VectorIndex::open(vectors_dir)?;
-    let index_path = vectors_dir.join("usearch.index");
-    let ids_path = vectors_dir.join("doc_ids.bin");
-    let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
-    let ids_bytes = std::fs::metadata(&ids_path).map(|m| m.len()).unwrap_or(0);
-    let model = vector.model().unwrap_or("unknown");
+    };
+    let (index_bytes, ids_bytes) = VectorIndex::storage_sizes(vectors_dir)?.unwrap_or_default();
+    let model = inventory.model.as_deref().unwrap_or("unknown");
     Ok(format!(
         "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, doc_ids.bin {})",
-        vector.len(),
-        vector.dimensions(),
+        inventory.doc_ids.len(),
+        inventory.dimensions,
         model,
-        vector.doc_id_count(),
+        inventory.doc_ids.len(),
         index_bytes,
         ids_bytes
     ))
@@ -4154,6 +4212,9 @@ fn build_index_command_args(
     if index.diagnostics {
         args.push("--diagnostics".to_string());
     }
+    if index.no_prune {
+        args.push("--no-prune".to_string());
+    }
     if continuous {
         args.push("--watch".to_string());
         args.push("--watch-interval".to_string());
@@ -4584,23 +4645,6 @@ fn take_first_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-fn is_embedding_role(role: &str) -> bool {
-    role == "user" || role == "assistant"
-}
-
-fn truncate_for_embedding(mut text: String) -> String {
-    const EMBED_MAX_CHARS: usize = 8192;
-    if text.len() <= EMBED_MAX_CHARS {
-        return text;
-    }
-    let mut end = EMBED_MAX_CHARS.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text
-}
-
 fn resolve_flag(default: bool, enable: bool, disable: bool, name: &str) -> Result<bool> {
     if enable && disable {
         return Err(anyhow!("--{name} and --no-{name} cannot be used together"));
@@ -4853,6 +4897,7 @@ mod tests {
             model: None,
             root: None,
             diagnostics: false,
+            no_prune: true,
         };
 
         let args = build_index_command_args(&index, false, 30, false, crate::web::DEFAULT_LISTEN);
@@ -4865,6 +4910,7 @@ mod tests {
         assert!(args.contains(&"--no-omp".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
         assert!(args.contains(&"--no-grok".to_string()));
+        assert!(args.contains(&"--no-prune".to_string()));
     }
 
     #[test]
@@ -4894,6 +4940,7 @@ mod tests {
             model: None,
             root: None,
             diagnostics: false,
+            no_prune: false,
         };
 
         let args = build_index_command_args(&index, false, 30, false, "127.0.0.1:7777");
@@ -4931,6 +4978,7 @@ mod tests {
             model: None,
             root: None,
             diagnostics: false,
+            no_prune: false,
         };
 
         let args = build_index_command_args(&index, true, 30, true, "127.0.0.1:6363");
@@ -5153,6 +5201,17 @@ arguments = {
     }
 
     #[test]
+    fn observed_directory_size_sums_nested_files() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(tmp.path().join("one"), b"abc").unwrap();
+        std::fs::write(nested.join("two"), b"defgh").unwrap();
+
+        assert_eq!(observed_directory_size(tmp.path()), 8);
+    }
+
+    #[test]
     fn index_args_accept_negative_source_flags() {
         let cli = Cli::try_parse_from([
             "memex",
@@ -5173,6 +5232,31 @@ arguments = {
         assert!(index.no_pi);
         assert!(index.no_copilot);
         assert!(index.no_grok);
+    }
+
+    #[test]
+    fn prune_defaults_to_preview_and_accepts_source_filters() {
+        let cli =
+            Cli::try_parse_from(["memex", "prune", "--dry-run", "--no-codex", "--no-opencode"])
+                .unwrap();
+
+        let Some(Commands::Prune {
+            prune,
+            dry_run,
+            apply,
+        }) = cli.command
+        else {
+            panic!("expected prune command");
+        };
+        assert!(dry_run);
+        assert!(!apply);
+        assert!(prune.no_codex);
+        assert!(prune.no_opencode);
+    }
+
+    #[test]
+    fn prune_rejects_dry_run_with_apply() {
+        assert!(Cli::try_parse_from(["memex", "prune", "--dry-run", "--apply"]).is_err());
     }
 
     #[test]

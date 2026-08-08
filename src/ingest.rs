@@ -1,6 +1,6 @@
 use crate::analytics::{AnalyticsStore, AnalyticsWriter, analytics_path, backfill_from_index};
 use crate::config::{IndexedToolContentLimits, Paths};
-use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
+use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::SearchIndex;
 use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
@@ -19,10 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-const EMBED_BATCH_SIZE: usize = 64;
-const EMBED_MAX_CHARS: usize = 8192;
-const RETAINED_HEAD_PERCENT: usize = 75;
 const INDEX_PROGRESS_BATCH: u64 = 1;
+const RETAINED_HEAD_PERCENT: usize = 75;
 // Keep a small amount of parser/writer overlap without retaining an unbounded transcript backlog.
 const RECORD_CHANNEL_CAPACITY: usize = 8;
 
@@ -41,7 +39,7 @@ pub struct IngestOptions {
     pub include_grok: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
-    pub backfill_embeddings: bool,
+    pub prune_missing: bool,
     pub model: ModelChoice,
     pub embed_runtime: EmbedRuntimeConfig,
     pub tool_content_limits: IndexedToolContentLimits,
@@ -51,9 +49,17 @@ pub struct IngestOptions {
 pub struct IngestReport {
     pub records_added: usize,
     pub records_embedded: usize,
+    pub records_pruned: usize,
+    pub files_pruned: usize,
     pub files_scanned: usize,
     pub files_skipped: usize,
     pub diagnostics: crate::sources::ParseDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneReport {
+    pub source_paths: Vec<String>,
+    pub records: usize,
 }
 
 #[derive(Debug)]
@@ -65,7 +71,6 @@ struct FileTask {
     size: u64,
     mtime: i64,
     delete_first: bool,
-    parser_version_invalidated: bool,
     pending_tool_calls: HashMap<String, PendingToolCall>,
     identity: FileIdentity,
     parser_version: u32,
@@ -156,8 +161,6 @@ fn prepare_file_task(
         .min(size) as usize;
     let identity = file_identity(&path, metadata, prefix_bytes);
     let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
-    let parser_version_invalidated =
-        previous.is_some_and(|previous| previous.parser_version != parser_version);
     let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
         None => (0, 0, false, HashMap::new(), false),
         Some(previous)
@@ -200,7 +203,6 @@ fn prepare_file_task(
             size,
             mtime,
             delete_first,
-            parser_version_invalidated,
             pending_tool_calls,
             identity,
             parser_version,
@@ -257,6 +259,7 @@ fn completed_file_state(
     pending_tool_calls: HashMap<String, PendingToolCall>,
 ) -> FileState {
     FileState {
+        source: Some(task.source),
         size: task.size,
         mtime: task.mtime,
         offset,
@@ -310,43 +313,9 @@ impl RecordSender {
 }
 
 struct WriterContext {
-    embeddings: bool,
-    do_backfill_embeddings: bool,
-    reset_vector_store: bool,
-    vector_dir: PathBuf,
     analytics_path: PathBuf,
     progress: Arc<Progress>,
-    model: ModelChoice,
-    embed_runtime: EmbedRuntimeConfig,
     tool_content_limits: IndexedToolContentLimits,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VectorMigration {
-    rebuild: bool,
-    model: ModelChoice,
-}
-
-fn vector_migration(
-    vector_dir: &Path,
-    tasks: &[FileTask],
-    configured_model: ModelChoice,
-) -> VectorMigration {
-    let rebuild = tasks.iter().any(|task| task.parser_version_invalidated)
-        && vector_dir.join("usearch.index").exists();
-    let model = if rebuild {
-        crate::vector::VectorIndex::open(vector_dir)
-            .ok()
-            .and_then(|index| {
-                index
-                    .model()
-                    .and_then(|model| ModelChoice::parse(model).ok())
-            })
-            .unwrap_or(configured_model)
-    } else {
-        configured_model
-    };
-    VectorMigration { rebuild, model }
 }
 
 fn record_channel() -> (Sender<Record>, Receiver<Record>) {
@@ -363,6 +332,198 @@ fn build_parser_thread_pool(num_threads: usize) -> Result<rayon::ThreadPool> {
         .thread_name(|index| format!("memex-parser-{index}"))
         .build()
         .context("build parser thread pool")
+}
+
+#[derive(Debug, Clone)]
+struct AuthoritativeRoot {
+    source: SourceKind,
+    path: PathBuf,
+}
+
+fn add_authoritative_root(roots: &mut Vec<AuthoritativeRoot>, source: SourceKind, path: PathBuf) {
+    if path.is_dir() && std::fs::read_dir(&path).is_ok() {
+        roots.push(AuthoritativeRoot { source, path });
+    }
+}
+
+fn authoritative_roots(options: &IngestOptions) -> Vec<AuthoritativeRoot> {
+    let mut roots = Vec::new();
+    add_authoritative_root(
+        &mut roots,
+        SourceKind::Claude,
+        options.claude_source.clone(),
+    );
+    if options.include_codex {
+        for home in crate::sources::codex::homes() {
+            add_authoritative_root(&mut roots, SourceKind::Codex, home);
+        }
+    }
+    if options.include_opencode {
+        add_authoritative_root(
+            &mut roots,
+            SourceKind::Opencode,
+            crate::sources::opencode::message_root(),
+        );
+    }
+    if options.include_cursor {
+        add_authoritative_root(
+            &mut roots,
+            SourceKind::Cursor,
+            crate::sources::cursor::projects_root(),
+        );
+    }
+    if options.include_pi {
+        add_authoritative_root(
+            &mut roots,
+            SourceKind::Pi,
+            crate::sources::pi::sessions_root(),
+        );
+    }
+    if options.include_openclaw {
+        for root in crate::sources::openclaw::state_dirs() {
+            add_authoritative_root(&mut roots, SourceKind::OpenClaw, root);
+        }
+    }
+    if options.include_copilot {
+        add_authoritative_root(
+            &mut roots,
+            SourceKind::Copilot,
+            crate::sources::copilot::session_root(),
+        );
+    }
+    roots
+}
+
+fn path_is_confirmed_missing(path: &str) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn missing_state_paths(
+    state: &IngestState,
+    discovered: &HashSet<String>,
+    roots: &[AuthoritativeRoot],
+    options: &IngestOptions,
+) -> Vec<String> {
+    let mut missing = state
+        .files
+        .iter()
+        .filter_map(|(path, file_state)| {
+            if discovered.contains(path) {
+                return None;
+            }
+            // Discovery can omit a path because of a transient read or permission error. Only
+            // delete state after the filesystem itself confirms that the path is gone.
+            if !path_is_confirmed_missing(path) {
+                return None;
+            }
+            let source = file_state
+                .source
+                .unwrap_or_else(|| SourceKind::from_path(path));
+            if source == SourceKind::Claude
+                && !options.include_agents
+                && is_claude_agent_path(Path::new(path))
+            {
+                return None;
+            }
+            roots
+                .iter()
+                .any(|root| source == root.source && Path::new(path).starts_with(&root.path))
+                .then(|| path.clone())
+        })
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing
+}
+
+fn is_claude_agent_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("agent-"))
+        || path
+            .components()
+            .any(|component| component.as_os_str().to_str() == Some("subagents"))
+}
+
+fn apply_path_deletions(
+    paths: &Paths,
+    index: &SearchIndex,
+    source_paths: &[String],
+) -> Result<usize> {
+    if source_paths.is_empty() {
+        return Ok(0);
+    }
+    let mut doc_ids = HashSet::new();
+    for source_path in source_paths {
+        doc_ids.extend(index.doc_ids_by_source_path(source_path)?);
+    }
+
+    if crate::vector::VectorIndex::exists(&paths.vectors)? {
+        let mut vectors = crate::vector::VectorIndex::open(&paths.vectors)?;
+        let mut removed = 0usize;
+        for doc_id in &doc_ids {
+            removed += usize::from(vectors.remove(*doc_id)?);
+        }
+        if removed > 0 {
+            vectors.save()?;
+        }
+    }
+
+    let mut writer = index
+        .writer()
+        .context("failed to initialize the Tantivy deletion writer")?;
+    let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state))?;
+    for source_path in source_paths {
+        index.delete_by_source_path(&mut writer, source_path);
+        analytics.delete_source_path(source_path)?;
+    }
+    analytics.flush()?;
+    writer.commit()?;
+    // Dropping an IndexWriter cancels publication of in-flight Tantivy merges. Join them so
+    // bounded compaction and deletion garbage collection actually become durable.
+    writer.wait_merging_threads()?;
+    crate::vector_backfill::reconcile(paths, index)?;
+    Ok(doc_ids.len())
+}
+
+/// Preview or apply deletion of indexed paths that are confirmed absent beneath readable,
+/// enabled source roots. This does not rediscover, parse, or re-embed the corpus.
+pub fn prune_missing_paths(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    apply: bool,
+) -> Result<PruneReport> {
+    let state_path = paths.state.join("ingest.json");
+    let mut state = IngestState::load(&state_path)?;
+    let source_paths = missing_state_paths(
+        &state,
+        &HashSet::new(),
+        &authoritative_roots(options),
+        options,
+    );
+    let mut doc_ids = HashSet::new();
+    for source_path in &source_paths {
+        doc_ids.extend(index.doc_ids_by_source_path(source_path)?);
+    }
+    let records = doc_ids.len();
+
+    if apply && !source_paths.is_empty() {
+        apply_path_deletions(paths, index, &source_paths)?;
+        for source_path in &source_paths {
+            state.files.remove(source_path);
+        }
+        state.save(&state_path)?;
+        // Force the next freshness-gated ingest to rediscover the remaining corpus.
+        ScanCache::default().save(&paths.state.join("scan_cache.json"))?;
+    }
+
+    Ok(PruneReport {
+        source_paths,
+        records,
+    })
 }
 
 /// Check if scan cache is fresh and vector state is usable; if so, skip indexing entirely.
@@ -440,10 +601,8 @@ pub fn ingest_all(
     let mut state = IngestState::load(&state_path)?;
     if index.doc_count()? == 0 && !state.files.is_empty() {
         state = IngestState::default();
-        if paths.vectors.exists() {
-            std::fs::remove_dir_all(&paths.vectors)?;
-            std::fs::create_dir_all(&paths.vectors)?;
-        }
+        crate::vector::VectorIndex::reset(&paths.vectors)?;
+        crate::vector_backfill::reconcile(paths, index)?;
     }
 
     // Index-time exclusion: matched transcripts never enter the index, and
@@ -464,6 +623,8 @@ pub fn ingest_all(
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let mut total_bytes = 0u64;
+    let mut discovered_paths = HashSet::new();
+    let authoritative_roots = authoritative_roots(options);
 
     if options.claude_source.exists() {
         let claude_files =
@@ -481,6 +642,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Claude,
@@ -515,6 +677,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Codex,
@@ -543,6 +706,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = history_path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 history_path,
                 SourceKind::Codex,
@@ -573,6 +737,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Opencode,
@@ -603,6 +768,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Cursor,
@@ -633,6 +799,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Pi,
@@ -663,6 +830,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Omp,
@@ -679,7 +847,8 @@ pub fn ingest_all(
     }
 
     if options.include_openclaw {
-        for source_file in crate::sources::openclaw::discover() {
+        let openclaw_files = crate::sources::openclaw::discover();
+        for source_file in openclaw_files {
             let path = source_file.path;
             if excluder.is_excluded(&path) {
                 files_skipped += 1;
@@ -692,6 +861,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::OpenClaw,
@@ -722,6 +892,7 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Copilot,
@@ -781,22 +952,38 @@ pub fn ingest_all(
     }
     files_skipped += excluded_state_paths.len();
 
+    let missing_paths = if options.prune_missing {
+        missing_state_paths(&state, &discovered_paths, &authoritative_roots, options)
+    } else {
+        Vec::new()
+    };
+    let replacement_paths = tasks
+        .iter()
+        .filter(|task| task.delete_first)
+        .map(|task| task.path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let mut delete_paths = excluded_state_paths;
+    delete_paths.extend(excluded_index_paths);
+    delete_paths.extend(missing_paths.iter().cloned());
+    delete_paths.extend(replacement_paths);
+    delete_paths.sort();
+    delete_paths.dedup();
+    let records_pruned = apply_path_deletions(paths, index, &delete_paths)?;
+    if !delete_paths.is_empty() {
+        for path in &delete_paths {
+            state.files.remove(path);
+        }
+        // Persist deletion state before parsing. If a parser fails, the next run must rebuild
+        // that path rather than incorrectly treating its now-deleted index records as current.
+        state.save(&state_path)?;
+    }
+    let files_pruned = missing_paths.len();
+
     let opencode_session_links = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
         crate::sources::opencode::session_links_by_id()
     } else {
         HashMap::new()
     };
-
-    if !excluded_state_paths.is_empty() {
-        state.save(&state_path)?;
-    }
-
-    let mut delete_paths: Vec<String> = excluded_state_paths;
-    for path in excluded_index_paths {
-        if !delete_paths.contains(&path) {
-            delete_paths.push(path);
-        }
-    }
 
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
@@ -814,15 +1001,15 @@ pub fn ingest_all(
         return Ok(IngestReport {
             records_added: 0,
             records_embedded: 0,
+            records_pruned,
+            files_pruned,
             files_scanned,
             files_skipped,
             diagnostics: Default::default(),
         });
     }
 
-    let vector_migration = vector_migration(&paths.vectors, &tasks, options.model);
-    let embeddings = options.embeddings || vector_migration.rebuild;
-    let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
+    let progress = Arc::new(Progress::new(totals, file_totals, false));
 
     let (raw_tx_record, rx_record) = record_channel();
     let shared_diagnostics = Arc::new(Mutex::new(crate::sources::ParseDiagnostics::default()));
@@ -833,30 +1020,17 @@ pub fn ingest_all(
     );
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
-    delete_paths.extend(
-        tasks
-            .iter()
-            .filter(|t| t.delete_first)
-            .map(|t| t.path.to_string_lossy().to_string()),
-    );
     let writer = index
         .writer()
         .context("failed to initialize the Tantivy index writer")?;
     let writer_index = index.clone();
     let writer_ctx = WriterContext {
-        embeddings,
-        do_backfill_embeddings: options.backfill_embeddings || vector_migration.rebuild,
-        reset_vector_store: vector_migration.rebuild,
-        vector_dir: paths.vectors.clone(),
         analytics_path: analytics_db.clone(),
         progress: progress.clone(),
-        model: vector_migration.model,
-        embed_runtime: options.embed_runtime.clone(),
         tool_content_limits: options.tool_content_limits,
     };
-    let writer_handle = std::thread::spawn(move || {
-        writer_loop(writer_index, writer, rx_record, delete_paths, writer_ctx)
-    });
+    let writer_handle =
+        std::thread::spawn(move || writer_loop(writer_index, writer, rx_record, writer_ctx));
 
     let tasks_arc = Arc::new(tasks);
     let parse_skipped = AtomicUsize::new(0);
@@ -952,7 +1126,7 @@ pub fn ingest_all(
         .join()
         .map_err(|_| anyhow!("writer thread panicked"))?;
     progress.finish();
-    let (records_added, records_embedded) =
+    let (records_added, _) =
         writer_result.context("index writer stopped before ingestion completed")?;
     parser_result?;
     if analytics_needs_backfill {
@@ -976,10 +1150,17 @@ pub fn ingest_all(
     state.save(&state_path)?;
 
     update_scan_cache(paths, files_scanned, total_bytes)?;
+    let records_embedded = if options.embeddings {
+        crate::vector_backfill::run(paths, index, options.model, &options.embed_runtime)?.embedded
+    } else {
+        0
+    };
 
     Ok(IngestReport {
         records_added,
         records_embedded,
+        records_pruned,
+        files_pruned,
         files_scanned,
         files_skipped: files_skipped + parse_skipped.load(Ordering::Relaxed),
         diagnostics,
@@ -1024,7 +1205,7 @@ fn can_skip_noop_index(
     let Some(dimensions) = options.model.known_dimensions() else {
         return Ok(false);
     };
-    if !paths.vectors.join("usearch.index").exists() {
+    if !crate::vector::VectorIndex::exists(&paths.vectors)? {
         return Ok(false);
     }
     let vector_index = crate::vector::VectorIndex::open(&paths.vectors)?;
@@ -1058,46 +1239,17 @@ fn writer_loop(
     index: SearchIndex,
     mut writer: tantivy::IndexWriter,
     rx: Receiver<Record>,
-    delete_paths: Vec<String>,
     ctx: WriterContext,
 ) -> Result<(usize, usize)> {
     let WriterContext {
-        embeddings,
-        do_backfill_embeddings,
-        reset_vector_store,
-        vector_dir,
         analytics_path,
         progress,
-        model,
-        embed_runtime,
         tool_content_limits,
     } = ctx;
     let mut analytics = AnalyticsWriter::open(&analytics_path)?;
-    for path in delete_paths {
-        index.delete_by_source_path(&mut writer, &path);
-        analytics.delete_source_path(&path)?;
-    }
 
     let mut count = 0usize;
-    let mut embedded_count = 0usize;
-    let mut vector_index = None;
-    let mut embedder: Option<EmbedderHandle> = None;
-    let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     let mut index_pending = [0u64; SOURCE_COUNT];
-    if embeddings {
-        let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
-        let dims = handle.dims;
-        if reset_vector_store {
-            crate::vector::VectorIndex::reset(&vector_dir)?;
-        }
-        vector_index = Some(crate::vector::VectorIndex::open_or_create(
-            &vector_dir,
-            dims,
-            Some(model.as_str()),
-        )?);
-        embedder = Some(handle);
-        progress.set_embed_ready();
-    }
 
     for mut record in rx.iter() {
         // Parsers apply the limit before queueing; enforce it here as a defensive boundary too.
@@ -1109,30 +1261,6 @@ fn writer_loop(
         if index_pending[source_idx] >= INDEX_PROGRESS_BATCH {
             progress.add_indexed(record.source, index_pending[source_idx]);
             index_pending[source_idx] = 0;
-        }
-        if embeddings
-            && !reset_vector_store
-            && is_embedding_role(&record.role)
-            && !record.text.is_empty()
-        {
-            let text = truncate_for_embedding(std::mem::take(&mut record.text));
-            if let Some(vindex) = vector_index.as_ref()
-                && !vindex.contains(record.doc_id)
-            {
-                progress.add_embed_total(record.source, 1);
-                progress.add_embed_pending(record.source, 1);
-                embed_buffer.push((record.doc_id, text, record.source));
-            }
-            if let Some(emb) = embedder.as_mut()
-                && embed_buffer.len() >= EMBED_BATCH_SIZE
-            {
-                embedded_count += flush_embeddings(
-                    &mut embed_buffer,
-                    emb,
-                    vector_index.as_mut().unwrap(),
-                    &progress,
-                )?;
-            }
         }
         count += 1;
     }
@@ -1149,76 +1277,10 @@ fn writer_loop(
     analytics.flush()?;
     writer.commit()?;
     index.maybe_compact_continuous_segments(&mut writer)?;
-    if embeddings {
-        if !embed_buffer.is_empty() {
-            embedded_count += flush_embeddings(
-                &mut embed_buffer,
-                embedder.as_mut().unwrap(),
-                vector_index.as_mut().unwrap(),
-                &progress,
-            )?;
-        }
-
-        let needs_vector_backfill = match vector_index.as_ref() {
-            Some(vindex) => {
-                vindex.needs_backfill() || !vector_index_covers_embeddable_records(&index, vindex)?
-            }
-            None => false,
-        };
-        if do_backfill_embeddings || needs_vector_backfill {
-            embedded_count += backfill_embeddings(
-                &index,
-                embedder.as_mut().unwrap(),
-                vector_index.as_mut().unwrap(),
-                &progress,
-            )?;
-        }
-        if let Some(vindex) = vector_index.as_mut() {
-            vindex.save()?;
-        }
-        if let Some(handle) = embedder.take() {
-            std::mem::forget(handle);
-        }
-    }
+    // Wait for bounded maintenance before atomically publishing the immutable lexical generation.
     writer.wait_merging_threads()?;
     index.publish_generation()?;
-    Ok((count, embedded_count))
-}
-
-fn backfill_embeddings(
-    index: &SearchIndex,
-    embedder: &mut EmbedderHandle,
-    vector_index: &mut crate::vector::VectorIndex,
-    progress: &Arc<Progress>,
-) -> Result<usize> {
-    use std::cell::Cell;
-    let embedded_count = Cell::new(0usize);
-    let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
-    index.for_each_record(|record| {
-        if record.text.is_empty()
-            || !is_embedding_role(&record.role)
-            || vector_index.contains(record.doc_id)
-        {
-            return Ok(());
-        }
-        progress.add_embed_total(record.source, 1);
-        progress.add_embed_pending(record.source, 1);
-        embed_buffer.push((
-            record.doc_id,
-            truncate_for_embedding(record.text),
-            record.source,
-        ));
-        if embed_buffer.len() >= EMBED_BATCH_SIZE {
-            let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
-            embedded_count.set(embedded_count.get() + n);
-        }
-        Ok(())
-    })?;
-    if !embed_buffer.is_empty() {
-        let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
-        embedded_count.set(embedded_count.get() + n);
-    }
-    Ok(embedded_count.get())
+    Ok((count, 0))
 }
 
 fn parse_claude_file(
@@ -1534,7 +1596,6 @@ fn parse_copilot_session(
         parsed,
     )
 }
-
 fn parse_grok_session(
     task: &FileTask,
     include_reasoning: bool,
@@ -1567,42 +1628,6 @@ fn parse_grok_session(
         parsed,
     )
 }
-fn flush_embeddings(
-    buffer: &mut Vec<(u64, String, SourceKind)>,
-    embedder: &mut EmbedderHandle,
-    vindex: &mut crate::vector::VectorIndex,
-    progress: &Arc<Progress>,
-) -> Result<usize> {
-    if buffer.is_empty() {
-        return Ok(0);
-    }
-
-    // Prepare texts for batch embedding
-    let items: Vec<(u64, String, SourceKind)> = buffer
-        .drain(..)
-        .map(|(doc_id, text, source)| (doc_id, truncate_for_embedding(text), source))
-        .filter(|(_, text, _)| !text.is_empty())
-        .collect();
-
-    if items.is_empty() {
-        return Ok(0);
-    }
-
-    // Batch embed all texts at once (ONNX Runtime handles internal parallelism)
-    let texts: Vec<&str> = items.iter().map(|(_, text, _)| text.as_str()).collect();
-    let embeddings = embedder.embed_texts(&texts)?;
-
-    // Add embeddings to index
-    let mut count = 0;
-    for ((doc_id, _, source), vec) in items.iter().zip(embeddings.iter()) {
-        vindex.add(*doc_id, vec)?;
-        progress.sub_embed_pending(*source, 1);
-        progress.add_embedded(*source, 1);
-        count += 1;
-    }
-    Ok(count)
-}
-
 fn compute_totals(tasks: &[FileTask]) -> [u64; SOURCE_COUNT] {
     let mut totals = [0u64; SOURCE_COUNT];
     for task in tasks {
@@ -1618,18 +1643,6 @@ fn compute_file_totals(tasks: &[FileTask]) -> [u64; SOURCE_COUNT] {
         totals[task.source.idx()] += 1;
     }
     totals
-}
-
-fn truncate_for_embedding(mut text: String) -> String {
-    if text.len() <= EMBED_MAX_CHARS {
-        return text;
-    }
-    let mut end = EMBED_MAX_CHARS.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text
 }
 
 fn limit_record_tool_content(
@@ -1742,7 +1755,7 @@ mod tests {
             include_copilot: false,
             include_grok: false,
             embeddings,
-            backfill_embeddings: false,
+            prune_missing: true,
             model,
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
@@ -1865,6 +1878,27 @@ mod tests {
         backfill_from_index(analytics_path(&paths.state), index).expect("backfill analytics");
     }
 
+    fn claude_prune_fixture(
+        temporary: &tempfile::TempDir,
+    ) -> (Paths, PathBuf, PathBuf, SearchIndex, IngestOptions) {
+        let claude_root = temporary.path().join("claude-projects");
+        let project_root = claude_root.join("-tmp-project");
+        fs::create_dir_all(&project_root).expect("create Claude project");
+        let transcript = project_root.join("session.jsonl");
+        fs::write(
+            &transcript,
+            r#"{"type":"user","uuid":"u1","sessionId":"prune-session","timestamp":"2026-08-08T10:00:00Z","message":{"content":"keep this searchable"}}
+"#,
+        )
+        .expect("write Claude transcript");
+        let paths = Paths::new(Some(temporary.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure paths");
+        let index = SearchIndex::open_or_create(&paths.index).expect("index");
+        let mut options = ingest_options(false, ModelChoice::BGESmall);
+        options.claude_source = claude_root.clone();
+        (paths, claude_root, transcript, index, options)
+    }
+
     #[test]
     fn parser_pool_leaves_global_rayon_available_under_backpressure() {
         let parser_pool = build_parser_thread_pool(2).expect("build parser pool");
@@ -1913,7 +1947,6 @@ mod tests {
                 .map(|duration| duration.as_secs() as i64)
                 .unwrap_or(0),
             delete_first: false,
-            parser_version_invalidated: false,
             pending_tool_calls,
             identity: file_identity(
                 path,
@@ -2588,6 +2621,7 @@ mod tests {
             metadata.len().min(FILE_IDENTITY_PREFIX_BYTES as u64) as usize,
         );
         let previous = FileState {
+            source: Some(SourceKind::Claude),
             size: metadata.len(),
             mtime: metadata
                 .modified()
@@ -2612,40 +2646,8 @@ mod tests {
             prepare_file_task(path, SourceKind::Claude, false, &metadata, Some(&previous));
         assert!(!skip);
         assert!(task.delete_first);
-        assert!(task.parser_version_invalidated);
         assert_eq!(task.offset, 0);
         assert!(task.pending_tool_calls.is_empty());
-    }
-
-    #[test]
-    fn parser_version_migration_rebuilds_vectors_with_the_existing_model() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-        save_vector_store(&paths, "bge", 384);
-        let transcript = tmp.path().join("session.jsonl");
-        fs::write(&transcript, "{}\n").expect("transcript");
-        let mut task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
-        task.parser_version_invalidated = true;
-
-        let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
-
-        assert!(migration.rebuild);
-        assert_eq!(migration.model, ModelChoice::BGESmall);
-    }
-
-    #[test]
-    fn ordinary_file_replacement_does_not_rebuild_the_vector_store() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-        save_vector_store(&paths, "bge", 384);
-        let transcript = tmp.path().join("session.jsonl");
-        fs::write(&transcript, "{}\n").expect("transcript");
-        let task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
-
-        let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
-
-        assert!(!migration.rebuild);
-        assert_eq!(migration.model, ModelChoice::Gemma);
     }
 
     #[test]
@@ -2681,7 +2683,7 @@ mod tests {
             include_copilot: false,
             include_grok: false,
             embeddings: false,
-            backfill_embeddings: false,
+            prune_missing: true,
             model: ModelChoice::default(),
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
@@ -2742,6 +2744,97 @@ mod tests {
             Some("tool-claude")
         );
         assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn incremental_ingest_prunes_a_confirmed_missing_path() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+        {
+            let lease = ingest_lease(&paths);
+            let report = ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+            assert_eq!(report.records_added, 1);
+        }
+        assert_eq!(index.doc_count().expect("document count"), 1);
+
+        fs::remove_file(&transcript).expect("remove transcript");
+        let report = {
+            let lease = ingest_lease(&paths);
+            ingest_all(&paths, &index, &options, &lease).expect("pruning ingest")
+        };
+
+        assert_eq!(report.files_pruned, 1);
+        assert_eq!(report.records_pruned, 1);
+        assert_eq!(index.doc_count().expect("document count"), 0);
+        let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
+        assert!(
+            !state
+                .files
+                .contains_key(&transcript.to_string_lossy().to_string())
+        );
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert_eq!(analytics.session_count().expect("session count"), 0);
+    }
+
+    #[test]
+    fn unavailable_source_root_does_not_authorize_pruning() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let (paths, claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+        {
+            let lease = ingest_lease(&paths);
+            ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+        }
+
+        fs::remove_dir_all(&claude_root).expect("remove unavailable source root");
+        let report = {
+            let lease = ingest_lease(&paths);
+            ingest_all(&paths, &index, &options, &lease).expect("safe ingest")
+        };
+
+        assert_eq!(report.files_pruned, 0);
+        assert_eq!(report.records_pruned, 0);
+        assert_eq!(index.doc_count().expect("document count"), 1);
+        let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
+        assert!(
+            state
+                .files
+                .contains_key(&transcript.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn operator_prune_previews_then_removes_vectors_without_reembedding() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+        {
+            let lease = ingest_lease(&paths);
+            ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+        }
+        let doc_id = index
+            .doc_ids_by_source_path(&transcript.to_string_lossy())
+            .expect("document IDs")[0];
+        let mut vectors =
+            VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).expect("vectors");
+        vectors.add(doc_id, &vec![0.0; 384]).expect("add vector");
+        vectors.save().expect("save vectors");
+
+        fs::remove_file(&transcript).expect("remove transcript");
+        let preview = prune_missing_paths(&paths, &index, &options, false).expect("preview prune");
+        assert_eq!(preview.records, 1);
+        assert_eq!(preview.source_paths, vec![transcript.to_string_lossy()]);
+        assert_eq!(index.doc_count().expect("document count"), 1);
+        assert!(VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
+
+        let applied = prune_missing_paths(&paths, &index, &options, true).expect("apply prune");
+        assert_eq!(applied, preview);
+        assert_eq!(index.doc_count().expect("document count"), 0);
+        assert!(!VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
+        let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
+        assert!(
+            !state
+                .files
+                .contains_key(&transcript.to_string_lossy().to_string())
+        );
     }
 
     #[test]
@@ -3118,7 +3211,7 @@ mod tests {
             include_copilot: false,
             include_grok: false,
             embeddings: false,
-            backfill_embeddings: false,
+            prune_missing: true,
             model: ModelChoice::default(),
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
@@ -3371,7 +3464,6 @@ mod tests {
             size: (existing.len() + appended.len()) as u64,
             mtime: 0,
             delete_first: false,
-            parser_version_invalidated: false,
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Pi),
@@ -3450,7 +3542,6 @@ mod tests {
             size: meta.len(),
             mtime: 0,
             delete_first: false,
-            parser_version_invalidated: false,
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Copilot),
@@ -3508,9 +3599,7 @@ mod tests {
     fn writer_loop_accepts_copilot_source_progress() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let index_dir = tmp.path().join("index");
-        let vector_dir = tmp.path().join("vectors");
         fs::create_dir_all(&index_dir).expect("create index dir");
-        fs::create_dir_all(&vector_dir).expect("create vector dir");
         let index = SearchIndex::open_or_create(&index_dir).expect("open index");
         let (tx_record, rx_record) = unbounded();
         tx_record
@@ -3540,20 +3629,14 @@ mod tests {
 
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let ctx = WriterContext {
-            embeddings: false,
-            do_backfill_embeddings: false,
-            reset_vector_store: false,
-            vector_dir,
             analytics_path: tmp.path().join("state").join("analytics.sqlite"),
             progress,
-            model: ModelChoice::default(),
-            embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
         };
 
         let writer = index.writer().expect("open writer");
         let (records_added, records_embedded) =
-            writer_loop(index, writer, rx_record, Vec::new(), ctx).expect("write copilot record");
+            writer_loop(index, writer, rx_record, ctx).expect("write copilot record");
 
         assert_eq!(records_added, 1);
         assert_eq!(records_embedded, 0);

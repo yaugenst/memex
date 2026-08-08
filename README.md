@@ -151,9 +151,10 @@ Notes:
 - Index updates are copy-on-write generations. A writer builds a private generation and atomically
   publishes it when complete; searches keep using the previous immutable generation until then.
 - Concurrent searches coalesce stale auto-index work: one process refreshes while other lexical
-  searches query the last committed index. Semantic and hybrid searches wait for vector writes to
-  finish. Explicit `index`, `reindex`, `embed`, and analytics backfill commands wait up to 30
-  seconds for another index mutation to finish and report its holder on timeout.
+  searches query the last committed index. Semantic and hybrid searches keep using the active
+  complete vector generation while a replacement is built. Explicit `index`, `reindex`, `embed`,
+  and analytics backfill commands wait up to 30 seconds for another index mutation to finish and
+  report its holder on timeout.
 
 Full transcript:
 ```
@@ -424,6 +425,18 @@ Enable during indexing:
 ```
 memex index --embeddings
 ```
+
+Build or resume semantic vectors for an existing lexical index:
+```
+memex embed
+memex stats
+```
+
+Embedding batches are committed to `<root>/state/embed-backfill.sqlite3`. If the command or machine
+stops, rerunning `memex embed` resumes from the last committed batch. The active complete vector
+generation remains searchable throughout a model change or full backfill; memex publishes the new
+generation atomically only after every live embeddable record is covered. `memex stats` reports
+backfill progress and state while vector work exists.
 
 Recommended when embeddings are on (especially non-`potion` models): run the background
 index service or `index --watch`, and consider setting `auto_index_on_search = false`

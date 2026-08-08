@@ -1118,7 +1118,7 @@ impl App {
                     include_grok: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
-                    backfill_embeddings: false,
+                    prune_missing: true,
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,

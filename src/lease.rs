@@ -68,6 +68,21 @@ impl Drop for IngestLease {
     }
 }
 
+pub fn is_held_by(paths: &Paths, pid: u32) -> bool {
+    let path = lease_path(paths);
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(TryLockError::WouldBlock) => read_holder(&path).is_some_and(|holder| holder.pid == pid),
+        Err(TryLockError::Error(_)) => false,
+    }
+}
+
 fn lease_path(paths: &Paths) -> PathBuf {
     let parent = paths.root.parent().unwrap_or_else(|| Path::new("."));
     let root_name = paths
@@ -162,6 +177,18 @@ mod tests {
             IngestLease::try_acquire(&paths, "third").expect("third lease"),
             LeaseAttempt::Acquired(_)
         ));
+    }
+
+    #[test]
+    fn held_by_distinguishes_active_and_released_leases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
+        let lease =
+            IngestLease::acquire(&paths, "backfill", Duration::from_secs(1)).expect("lease");
+
+        assert!(is_held_by(&paths, std::process::id()));
+        drop(lease);
+        assert!(!is_held_by(&paths, std::process::id()));
     }
 
     #[test]

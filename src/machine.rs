@@ -3,7 +3,7 @@ use crate::config::{MachineConfig, Paths, UserConfig, default_claude_source};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
-use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
+use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
 use crate::types::{Record, SourceFilter};
 use crate::usage::{
     CacheWaste, CostMode, UsageQuery, UsageSummary, scan_usage, scan_usage_activity,
@@ -1467,7 +1467,21 @@ fn apply_project_grouping(
 
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
     if config.auto_index_on_search_default() {
-        let _ = index_local(paths, config, true)?;
+        paths.ensure_dirs()?;
+        match IngestLease::try_acquire(paths, "RPC auto-index")? {
+            LeaseAttempt::Acquired(lease) => {
+                let _ = index_local_with_lease(paths, config, true, &lease)?;
+            }
+            LeaseAttempt::Busy(Some(holder))
+                if holder.operation != "reindex" && paths.index.join("meta.json").exists() =>
+            {
+                // Read the last committed lexical index and active vector generation while a
+                // normal incremental ingest or checkpointed backfill is running.
+            }
+            LeaseAttempt::Busy(_) => {
+                let _ = index_local(paths, config, true)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1475,6 +1489,15 @@ fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
 fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<IngestReport> {
     paths.ensure_dirs()?;
     let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
+    index_local_with_lease(paths, config, stale_only, &lease)
+}
+
+fn index_local_with_lease(
+    paths: &Paths,
+    config: &UserConfig,
+    stale_only: bool,
+    lease: &IngestLease,
+) -> Result<IngestReport> {
     let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
     let options = IngestOptions {
         claude_source: default_claude_source(),
@@ -1490,17 +1513,19 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         include_grok: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),
-        backfill_embeddings: false,
+        prune_missing: true,
         model: config.resolve_model(None)?,
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
     };
     if stale_only {
         Ok(
-            ingest_if_stale(paths, &index, &options, config.scan_cache_ttl(), &lease)?.unwrap_or(
+            ingest_if_stale(paths, &index, &options, config.scan_cache_ttl(), lease)?.unwrap_or(
                 IngestReport {
                     records_added: 0,
                     records_embedded: 0,
+                    records_pruned: 0,
+                    files_pruned: 0,
                     files_scanned: 0,
                     files_skipped: 0,
                     diagnostics: Default::default(),
@@ -1508,7 +1533,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
             ),
         )
     } else {
-        ingest_all(paths, &index, &options, &lease)
+        ingest_all(paths, &index, &options, lease)
     }
 }
 
