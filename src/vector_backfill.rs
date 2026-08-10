@@ -962,6 +962,9 @@ mod tests {
             dimensions: 4,
             model: Some("test".to_string()),
             doc_ids,
+            vector_count: Some(1024),
+            index_bytes: 0,
+            ids_bytes: 0,
         };
 
         let active_ids = compatible_active_ids(Some(inventory), 4, "test").unwrap();
