@@ -4,7 +4,9 @@ use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::SearchIndex;
 use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
-use crate::state::{FileIdentity, FileState, IngestState, PendingToolCall, ScanCache};
+use crate::state::{
+    FileIdentity, FileState, IngestState, PendingIngest, PendingToolCall, ScanCache,
+};
 #[cfg(test)]
 use crate::types::RecordLinks;
 use crate::types::{Record, SourceKind};
@@ -352,8 +354,25 @@ impl RecordSender {
 
 struct WriterContext {
     analytics_path: PathBuf,
+    delete_paths: Vec<String>,
     progress: Arc<Progress>,
     tool_content_limits: IndexedToolContentLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterDecision {
+    Commit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterOutcome {
+    Published(usize),
+    Cancelled,
+}
+
+fn pending_ingest_path(paths: &Paths) -> PathBuf {
+    paths.state.join("ingest.pending.json")
 }
 
 fn record_channel() -> (Sender<Record>, Receiver<Record>) {
@@ -548,6 +567,24 @@ fn apply_path_deletions(
     Ok(records)
 }
 
+fn prepare_pending_ingest_recovery(
+    paths: &Paths,
+    state: &mut IngestState,
+) -> Result<Option<Vec<String>>> {
+    let pending_path = pending_ingest_path(paths);
+    let Some(pending) = PendingIngest::load(&pending_path)
+        .with_context(|| format!("load pending ingest at {}", pending_path.display()))?
+    else {
+        return Ok(None);
+    };
+
+    for source_path in &pending.source_paths {
+        state.files.remove(source_path);
+    }
+    state.next_doc_id = state.next_doc_id.max(pending.next_doc_id);
+    Ok(Some(pending.source_paths))
+}
+
 fn missing_paths_for_options(paths: &Paths, options: &PruneOptions) -> Result<Vec<String>> {
     let state = IngestState::load(&paths.state.join("ingest.json"))?;
     Ok(missing_state_paths(
@@ -682,13 +719,15 @@ pub fn ingest_all(
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
     let state_path = paths.state.join("ingest.json");
     let mut state = IngestState::load(&state_path)?;
+    let pending_recovery_paths = prepare_pending_ingest_recovery(paths, &mut state)?;
+    let recovering_pending_ingest = pending_recovery_paths.is_some();
     if index.doc_count()? == 0 && !state.files.is_empty() {
         let _embedding_lease = IngestLease::acquire_embedding(
             paths,
             "reset vectors for empty lexical index",
             crate::lease::INGEST_LEASE_TIMEOUT,
         )?;
-        state = IngestState::default();
+        state.files.clear();
         crate::vector::VectorIndex::reset(&paths.vectors)?;
         crate::vector_backfill::reconcile(paths, index)?;
     }
@@ -1056,7 +1095,8 @@ pub fn ingest_all(
         .filter(|task| task.delete_first)
         .map(|task| task.path.to_string_lossy().to_string())
         .collect::<Vec<_>>();
-    let mut delete_paths = excluded_state_paths;
+    let mut delete_paths = pending_recovery_paths.unwrap_or_default();
+    delete_paths.extend(excluded_state_paths);
     delete_paths.extend(excluded_index_paths);
     delete_paths.extend(missing_paths.iter().cloned());
     delete_paths.extend(replacement_paths);
@@ -1083,11 +1123,17 @@ pub fn ingest_all(
         && (!AnalyticsStore::is_complete(&analytics_db)
             || !AnalyticsStore::is_ready(&analytics_db));
     if tasks.is_empty() && delete_paths.is_empty() && can_skip_noop_index(paths, index, options)? {
+        index.publish_generation_if_uninitialized()?;
         if analytics_needs_backfill {
             backfill_from_index(&analytics_db, index)?;
         }
+        if recovering_pending_ingest {
+            state.save(&state_path)?;
+        }
         update_scan_cache(paths, files_scanned, total_bytes)?;
-        index.publish_generation_if_uninitialized()?;
+        if recovering_pending_ingest {
+            PendingIngest::clear(&pending_ingest_path(paths))?;
+        }
         return Ok(IngestReport {
             records_added: 0,
             records_embedded: 0,
@@ -1110,21 +1156,24 @@ pub fn ingest_all(
     );
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
+    let parser_pool = parser_thread_pool()?;
     let writer = index
         .writer()
         .context("failed to initialize the Tantivy index writer")?;
     let writer_index = index.clone();
     let writer_ctx = WriterContext {
         analytics_path: analytics_db.clone(),
+        delete_paths: delete_paths.clone(),
         progress: progress.clone(),
         tool_content_limits: options.tool_content_limits,
     };
-    let writer_handle =
-        std::thread::spawn(move || writer_loop(writer_index, writer, rx_record, writer_ctx));
+    let (decision_tx, decision_rx) = bounded(1);
+    let writer_handle = std::thread::spawn(move || {
+        writer_loop(writer_index, writer, rx_record, decision_rx, writer_ctx)
+    });
 
     let tasks_arc = Arc::new(tasks);
     let parse_skipped = AtomicUsize::new(0);
-    let parser_pool = parser_thread_pool()?;
     let parser_result = parser_pool.install(|| {
         tasks_arc.par_iter().try_for_each(|task| -> Result<()> {
             let result = match task.source {
@@ -1212,19 +1261,6 @@ pub fn ingest_all(
     drop(tx_record);
     drop(tx_update);
 
-    let writer_result = writer_handle
-        .join()
-        .map_err(|_| anyhow!("writer thread panicked"))?;
-    progress.finish();
-    let (records_added, _) =
-        writer_result.context("index writer stopped before ingestion completed")?;
-    parser_result?;
-    if analytics_needs_backfill {
-        backfill_from_index(&analytics_db, index)?;
-    } else {
-        AnalyticsStore::open(&analytics_db)?.mark_complete()?;
-    }
-
     let mut diagnostics = shared_diagnostics.lock().unwrap().clone();
     let mut updated_files = HashMap::new();
     while let Ok(update) = rx_update.recv() {
@@ -1233,13 +1269,72 @@ pub fn ingest_all(
         let _ = update.session_id;
     }
 
-    for (path, update) in updated_files {
-        state.files.insert(path, update);
-    }
-    state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
-    state.save(&state_path)?;
+    let mut candidate_state = None;
+    let mut prepare_publication_error = None;
+    if parser_result.is_ok() {
+        let mut next_state = state.clone();
+        for path in &delete_paths {
+            next_state.files.remove(path);
+        }
+        for (path, update) in &updated_files {
+            next_state.files.insert(path.clone(), update.clone());
+        }
+        next_state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
 
+        let mut affected_paths = delete_paths.clone();
+        affected_paths.extend(updated_files.keys().cloned());
+        affected_paths.sort();
+        affected_paths.dedup();
+        let pending = PendingIngest {
+            next_doc_id: next_state.next_doc_id,
+            source_paths: affected_paths,
+        };
+        let pending_path = pending_ingest_path(paths);
+        match pending
+            .save(&pending_path)
+            .with_context(|| format!("save pending ingest at {}", pending_path.display()))
+        {
+            Ok(()) => candidate_state = Some(next_state),
+            Err(error) => prepare_publication_error = Some(error),
+        }
+    }
+
+    let decision = if parser_result.is_ok() && prepare_publication_error.is_none() {
+        WriterDecision::Commit
+    } else {
+        WriterDecision::Cancel
+    };
+    // If the writer has already failed, joining it below preserves that root cause. Otherwise the
+    // one-slot channel cannot block and gives it the parser's final publication decision.
+    let _ = decision_tx.send(decision);
+    let writer_result = writer_handle
+        .join()
+        .map_err(|_| anyhow!("writer thread panicked"))?;
+    progress.finish();
+    let writer_outcome =
+        writer_result.context("index writer stopped before ingestion completed")?;
+    parser_result?;
+    if let Some(error) = prepare_publication_error {
+        return Err(error);
+    }
+    let records_added = match writer_outcome {
+        WriterOutcome::Published(count) => count,
+        WriterOutcome::Cancelled => {
+            return Err(anyhow!(
+                "index writer cancelled a successful ingest publication"
+            ));
+        }
+    };
+    if analytics_needs_backfill {
+        backfill_from_index(&analytics_db, index)?;
+    } else {
+        AnalyticsStore::open(&analytics_db)?.mark_complete()?;
+    }
+
+    state = candidate_state.expect("successful publication has candidate ingest state");
+    state.save(&state_path)?;
     update_scan_cache(paths, files_scanned, total_bytes)?;
+    PendingIngest::clear(&pending_ingest_path(paths))?;
     let records_embedded = if options.embeddings {
         crate::vector_backfill::run(paths, index, options.model, &options.embed_runtime)?.embedded
     } else {
@@ -1271,6 +1366,9 @@ fn can_skip_fresh_scan(
     options: &IngestOptions,
     ttl_seconds: u64,
 ) -> Result<bool> {
+    if pending_ingest_path(paths).exists() {
+        return Ok(false);
+    }
     if index.doc_count()? == 0 {
         return Ok(false);
     }
@@ -1329,10 +1427,12 @@ fn writer_loop(
     index: SearchIndex,
     mut writer: tantivy::IndexWriter,
     rx: Receiver<Record>,
+    decision_rx: Receiver<WriterDecision>,
     ctx: WriterContext,
-) -> Result<(usize, usize)> {
+) -> Result<WriterOutcome> {
     let WriterContext {
         analytics_path,
+        delete_paths,
         progress,
         tool_content_limits,
     } = ctx;
@@ -1344,36 +1444,62 @@ fn writer_loop(
 
     let mut count = 0usize;
     let mut index_pending = [0u64; SOURCE_COUNT];
-    for mut record in rx.iter() {
-        // Parsers apply the limit before queueing; enforce it here as a defensive boundary too.
-        let _ = limit_record_tool_content(&mut record, tool_content_limits);
-        analytics.record(&record)?;
-        index.add_record(&mut writer, &record)?;
-        let source_idx = record.source.idx();
-        index_pending[source_idx] += 1;
-        if index_pending[source_idx] >= INDEX_PROGRESS_BATCH {
-            progress.add_indexed(record.source, index_pending[source_idx]);
-            index_pending[source_idx] = 0;
+    let staging_result = (|| -> Result<()> {
+        for source_path in &delete_paths {
+            index.delete_by_source_path(&mut writer, source_path);
+            analytics.delete_source_path(source_path)?;
         }
-        count += 1;
+
+        for mut record in rx.iter() {
+            // Parsers apply the limit before queueing; enforce it here as a defensive boundary too.
+            let _ = limit_record_tool_content(&mut record, tool_content_limits);
+            analytics.record(&record)?;
+            index.add_record(&mut writer, &record)?;
+            let source_idx = record.source.idx();
+            index_pending[source_idx] += 1;
+            if index_pending[source_idx] >= INDEX_PROGRESS_BATCH {
+                progress.add_indexed(record.source, index_pending[source_idx]);
+                index_pending[source_idx] = 0;
+            }
+            count += 1;
+        }
+
+        Ok(())
+    })();
+    if let Err(error) = staging_result {
+        writer
+            .rollback()
+            .with_context(|| format!("roll back index writer after staging failed: {error:#}"))?;
+        return Err(error);
     }
 
-    // Flush any remaining index progress
-    for (idx, &pending) in index_pending.iter().enumerate() {
-        if pending > 0
-            && let Some(source) = SourceKind::from_idx(idx)
-        {
-            progress.add_indexed(source, pending);
+    match decision_rx.recv() {
+        Ok(WriterDecision::Commit) => {
+            writer.commit()?;
+            index.maybe_compact_continuous_segments(&mut writer)?;
+            // Analytics is a derived projection with its own transaction. The durable pending
+            // marker lets the next ingest clean both stores if the process stops between commits.
+            analytics.flush()?;
+            // The merge policy is bounded; waiting here publishes its maintenance checkpoint
+            // instead of making the next short-lived writer repeat the same work.
+            writer.wait_merging_threads()?;
+            index.publish_generation()?;
+
+            // Flush any remaining index progress only after the batch is published.
+            for (idx, &pending) in index_pending.iter().enumerate() {
+                if pending > 0
+                    && let Some(source) = SourceKind::from_idx(idx)
+                {
+                    progress.add_indexed(source, pending);
+                }
+            }
+            Ok(WriterOutcome::Published(count))
+        }
+        Ok(WriterDecision::Cancel) | Err(_) => {
+            writer.rollback()?;
+            Ok(WriterOutcome::Cancelled)
         }
     }
-
-    analytics.flush()?;
-    writer.commit()?;
-    index.maybe_compact_continuous_segments(&mut writer)?;
-    // Wait for bounded maintenance before atomically publishing the immutable lexical generation.
-    writer.wait_merging_threads()?;
-    index.publish_generation()?;
-    Ok((count, 0))
 }
 
 fn parse_claude_file(
@@ -2162,6 +2288,165 @@ mod tests {
 
         assert!(message.contains("failed to initialize the Tantivy index writer"));
         assert!(!message.contains("disconnected channel"));
+    }
+
+    #[test]
+    fn writer_cancel_keeps_staged_additions_and_deletions_unpublished() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = save_search_records(&paths, &[record(1, "user", "existing")]);
+        backfill_analytics(&paths, &index);
+
+        let (tx_record, rx_record) = unbounded();
+        tx_record
+            .send(record(2, "assistant", "staged"))
+            .expect("stage replacement record");
+        drop(tx_record);
+        let (decision_tx, decision_rx) = bounded(1);
+        decision_tx
+            .send(WriterDecision::Cancel)
+            .expect("cancel decision");
+        let ctx = WriterContext {
+            analytics_path: analytics_path(&paths.state),
+            delete_paths: vec!["source-1.jsonl".to_string()],
+            progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false)),
+            tool_content_limits: IndexedToolContentLimits::default(),
+        };
+        let writer = index.writer().expect("writer");
+
+        let outcome = writer_loop(index.clone(), writer, rx_record, decision_rx, ctx)
+            .expect("cancel staged batch");
+
+        assert_eq!(outcome, WriterOutcome::Cancelled);
+        assert_eq!(index.doc_count().expect("document count"), 1);
+        assert_eq!(
+            index
+                .doc_ids_by_source_path("source-1.jsonl")
+                .expect("existing document IDs"),
+            vec![1]
+        );
+        assert!(
+            index
+                .doc_ids_by_source_path("source-2.jsonl")
+                .expect("staged document IDs")
+                .is_empty()
+        );
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert_eq!(analytics.session_count().expect("session count"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_failure_does_not_publish_staged_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+        {
+            let lease = ingest_lease(&paths);
+            ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+        }
+        let state_path = paths.state.join("ingest.json");
+        let original_state = IngestState::load(&state_path).expect("original state");
+        let original_doc_ids = index
+            .doc_ids_by_source_path(&transcript.to_string_lossy())
+            .expect("original document IDs");
+
+        fs::write(
+            &transcript,
+            r#"{"type":"user","uuid":"u2","sessionId":"prune-session","timestamp":"2026-08-08T11:00:00Z","message":{"content":"replacement must not publish"}}
+"#,
+        )
+        .expect("replace transcript");
+        fs::set_permissions(&transcript, fs::Permissions::from_mode(0o000))
+            .expect("make parser fail");
+
+        let error = {
+            let lease = ingest_lease(&paths);
+            ingest_all(&paths, &index, &options, &lease).expect_err("parser failure")
+        };
+        fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600))
+            .expect("restore transcript permissions");
+
+        let error_message = format!("{error:#}");
+        assert!(
+            error_message.contains("failed to parse claude transcript"),
+            "unexpected error: {error_message}"
+        );
+        assert_eq!(index.doc_count().expect("document count"), 1);
+        assert_eq!(
+            index
+                .doc_ids_by_source_path(&transcript.to_string_lossy())
+                .expect("document IDs after parser failure"),
+            original_doc_ids
+        );
+        let persisted_state = IngestState::load(&state_path).expect("persisted state");
+        assert_eq!(persisted_state.next_doc_id, original_state.next_doc_id);
+        assert_eq!(persisted_state.files.len(), original_state.files.len());
+        assert_eq!(
+            PendingIngest::load(&pending_ingest_path(&paths)).expect("pending ingest marker"),
+            None
+        );
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert_eq!(analytics.session_count().expect("session count"), 1);
+    }
+
+    #[test]
+    fn pending_ingest_recovery_is_deferred_to_the_next_generation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let indexed = record(10, "user", "interrupted publication");
+        let source_path = indexed.source_path.clone();
+        let index = save_search_records(&paths, &[indexed]);
+        backfill_analytics(&paths, &index);
+
+        let state_path = paths.state.join("ingest.json");
+        let mut state = IngestState {
+            next_doc_id: 10,
+            files: HashMap::from([(
+                source_path.clone(),
+                FileState {
+                    source: Some(SourceKind::Claude),
+                    size: 1,
+                    mtime: 1,
+                    offset: 1,
+                    turn_id: 1,
+                    parser_version: 1,
+                    pending_tool_calls: HashMap::new(),
+                    identity: FileIdentity::default(),
+                },
+            )]),
+        };
+        state.save(&state_path).expect("save stale state");
+        PendingIngest {
+            next_doc_id: 11,
+            source_paths: vec![source_path.clone()],
+        }
+        .save(&pending_ingest_path(&paths))
+        .expect("save pending ingest");
+
+        let recovery_paths = prepare_pending_ingest_recovery(&paths, &mut state)
+            .expect("prepare pending ingest recovery")
+            .expect("pending ingest");
+
+        assert_eq!(recovery_paths, vec![source_path.clone()]);
+        assert_eq!(state.next_doc_id, 11);
+        assert!(!state.files.contains_key(&source_path));
+        assert_eq!(index.doc_count().expect("document count"), 1);
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert_eq!(analytics.session_count().expect("session count"), 1);
+        let persisted = IngestState::load(&state_path).expect("persisted state");
+        assert_eq!(persisted.next_doc_id, 10);
+        assert!(persisted.files.contains_key(&source_path));
+        assert_eq!(
+            PendingIngest::load(&pending_ingest_path(&paths)).expect("pending ingest marker"),
+            Some(PendingIngest {
+                next_doc_id: 11,
+                source_paths: vec![source_path],
+            })
+        );
     }
 
     #[test]
@@ -3092,6 +3377,25 @@ mod tests {
     }
 
     #[test]
+    fn cannot_skip_fresh_scan_with_pending_ingest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        paths.ensure_dirs().expect("dirs");
+        let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+        let options = ingest_options(false, ModelChoice::BGESmall);
+        let cache = fresh_scan_cache();
+        backfill_analytics(&paths, &index);
+        PendingIngest {
+            next_doc_id: 2,
+            source_paths: vec!["source-1.jsonl".to_string()],
+        }
+        .save(&pending_ingest_path(&paths))
+        .expect("save pending ingest");
+
+        assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    }
+
+    #[test]
     fn cannot_skip_fresh_scan_with_complete_but_empty_analytics() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
@@ -3839,15 +4143,19 @@ mod tests {
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let ctx = WriterContext {
             analytics_path: tmp.path().join("state").join("analytics.sqlite"),
+            delete_paths: Vec::new(),
             progress,
             tool_content_limits: IndexedToolContentLimits::default(),
         };
 
         let writer = index.writer().expect("open writer");
-        let (records_added, records_embedded) =
-            writer_loop(index, writer, rx_record, ctx).expect("write copilot record");
+        let (decision_tx, decision_rx) = bounded(1);
+        decision_tx
+            .send(WriterDecision::Commit)
+            .expect("commit decision");
+        let outcome =
+            writer_loop(index, writer, rx_record, decision_rx, ctx).expect("write copilot record");
 
-        assert_eq!(records_added, 1);
-        assert_eq!(records_embedded, 0);
+        assert_eq!(outcome, WriterOutcome::Published(1));
     }
 }
