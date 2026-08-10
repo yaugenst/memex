@@ -108,10 +108,12 @@ impl AnalyticsStore {
     }
 
     fn init(&self) -> Result<()> {
+        // The ingest state marker advances only after analytics commits. FULL makes each WAL
+        // commit power-loss durable before that cross-store publication can continue.
         self.conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+            PRAGMA synchronous = FULL;
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -1136,6 +1138,25 @@ mod tests {
             links: RecordLinks::default(),
             source_path: source_path.to_string_lossy().to_string(),
         }
+    }
+
+    #[test]
+    fn writable_connections_use_durable_wal_commits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("analytics.sqlite");
+        let store = AnalyticsStore::open(&db).expect("open analytics");
+
+        let journal_mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode");
+        let synchronous: i64 = store
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous mode");
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 2, "FULL synchronous mode");
     }
 
     #[test]

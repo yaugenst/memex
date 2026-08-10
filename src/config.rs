@@ -2,7 +2,8 @@ use crate::embed::{EmbedRuntimeConfig, ExecutionProviderChoice, ModelChoice};
 use anyhow::{Result, anyhow};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -31,11 +32,48 @@ impl Paths {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.index)?;
-        std::fs::create_dir_all(&self.vectors)?;
-        std::fs::create_dir_all(&self.state)?;
+        create_dir_all_durable(&self.index)?;
+        create_dir_all_durable(&self.vectors)?;
+        create_dir_all_durable(&self.state)?;
         Ok(())
     }
+}
+
+/// Create a directory hierarchy and durably publish every newly created directory entry.
+fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing = Vec::new();
+    let mut current = Some(path.as_path());
+    while let Some(directory) = current {
+        if directory.try_exists()? {
+            break;
+        }
+        missing.push(directory.to_path_buf());
+        current = directory.parent();
+    }
+
+    fs::create_dir_all(&path)?;
+    for directory in missing.iter().rev() {
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub fn default_claude_source() -> PathBuf {
@@ -433,6 +471,21 @@ mod tests {
     #[test]
     fn exclude_paths_default_to_empty() {
         assert!(UserConfig::default().exclude_path_patterns().is_empty());
+    }
+
+    #[test]
+    fn ensure_dirs_creates_a_nested_store_hierarchy() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(
+            temporary.path().join("new").join("parent").join("memex"),
+        ))
+        .expect("paths");
+
+        paths.ensure_dirs().expect("ensure durable directories");
+
+        assert!(paths.index.is_dir());
+        assert!(paths.vectors.is_dir());
+        assert!(paths.state.is_dir());
     }
 
     #[test]
