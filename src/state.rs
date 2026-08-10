@@ -118,6 +118,16 @@ pub struct IngestState {
     pub files: HashMap<String, FileState>,
 }
 
+/// Durable intent for an ingest batch that may have crossed one or both publication boundaries.
+///
+/// Tantivy and SQLite cannot commit atomically together. While this marker exists, the listed
+/// source paths must be removed from both stores and reparsed before their file state is trusted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingIngest {
+    pub next_doc_id: u64,
+    pub source_paths: Vec<String>,
+}
+
 impl Default for IngestState {
     fn default() -> Self {
         Self {
@@ -140,6 +150,29 @@ impl IngestState {
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let data = serde_json::to_string_pretty(self)?;
         atomic_write(path, data.as_bytes())
+    }
+}
+
+impl PendingIngest {
+    pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read_to_string(path)?;
+        Ok(Some(serde_json::from_str(&data)?))
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let data = serde_json::to_string_pretty(self)?;
+        atomic_write(path, data.as_bytes())
+    }
+
+    pub fn clear(path: &Path) -> anyhow::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -209,6 +242,29 @@ mod tests {
         assert_eq!(cache.last_scan_ts, 0);
         assert_eq!(cache.file_count, 0);
         assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[test]
+    fn pending_ingest_round_trips_and_clears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ingest.pending.json");
+        let pending = PendingIngest {
+            next_doc_id: 17,
+            source_paths: vec!["session.jsonl".to_string()],
+        };
+
+        pending.save(&path).expect("save pending ingest");
+        assert_eq!(
+            PendingIngest::load(&path).expect("load pending ingest"),
+            Some(pending)
+        );
+
+        PendingIngest::clear(&path).expect("clear pending ingest");
+        PendingIngest::clear(&path).expect("clear missing pending ingest");
+        assert_eq!(
+            PendingIngest::load(&path).expect("load cleared ingest"),
+            None
+        );
     }
 
     #[test]
