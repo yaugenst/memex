@@ -582,6 +582,9 @@ fn prepare_pending_ingest_recovery(
         state.files.remove(source_path);
     }
     state.next_doc_id = state.next_doc_id.max(pending.next_doc_id);
+    ScanCache::default()
+        .save(&paths.state.join("scan_cache.json"))
+        .context("invalidate scan cache for pending ingest recovery")?;
     Ok(Some(pending.source_paths))
 }
 
@@ -1366,7 +1369,11 @@ fn can_skip_fresh_scan(
     options: &IngestOptions,
     ttl_seconds: u64,
 ) -> Result<bool> {
-    if pending_ingest_path(paths).exists() {
+    let pending_path = pending_ingest_path(paths);
+    if pending_path
+        .try_exists()
+        .with_context(|| format!("check pending ingest at {}", pending_path.display()))?
+    {
         return Ok(false);
     }
     if index.doc_count()? == 0 {
@@ -2399,8 +2406,15 @@ mod tests {
         paths.ensure_dirs().expect("ensure dirs");
         let indexed = record(10, "user", "interrupted publication");
         let source_path = indexed.source_path.clone();
-        let index = save_search_records(&paths, &[indexed]);
+        let index = save_search_records(
+            &paths,
+            &[record(9, "user", "unaffected publication"), indexed],
+        );
         backfill_analytics(&paths, &index);
+        let cache_path = paths.state.join("scan_cache.json");
+        fresh_scan_cache()
+            .save(&cache_path)
+            .expect("save fresh scan cache");
 
         let state_path = paths.state.join("ingest.json");
         let mut state = IngestState {
@@ -2434,9 +2448,10 @@ mod tests {
         assert_eq!(recovery_paths, vec![source_path.clone()]);
         assert_eq!(state.next_doc_id, 11);
         assert!(!state.files.contains_key(&source_path));
-        assert_eq!(index.doc_count().expect("document count"), 1);
+        assert_eq!(index.doc_count().expect("document count"), 2);
         let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
-        assert_eq!(analytics.session_count().expect("session count"), 1);
+        assert!(analytics.complete().expect("analytics complete"));
+        assert_eq!(analytics.session_count().expect("session count"), 2);
         let persisted = IngestState::load(&state_path).expect("persisted state");
         assert_eq!(persisted.next_doc_id, 10);
         assert!(persisted.files.contains_key(&source_path));
@@ -2444,9 +2459,74 @@ mod tests {
             PendingIngest::load(&pending_ingest_path(&paths)).expect("pending ingest marker"),
             Some(PendingIngest {
                 next_doc_id: 11,
-                source_paths: vec![source_path],
+                source_paths: vec![source_path.clone()],
             })
         );
+        let options = ingest_options(false, ModelChoice::BGESmall);
+        assert!(!can_skip_fresh_scan(&fresh_scan_cache(), &paths, &index, &options, 60).unwrap());
+        let invalidated_cache = ScanCache::load(&cache_path).expect("invalidated scan cache");
+        assert!(!invalidated_cache.is_fresh(60));
+        assert!(!can_skip_fresh_scan(&invalidated_cache, &paths, &index, &options, 60).unwrap());
+    }
+
+    #[test]
+    fn pending_ingest_forces_recovery_despite_fresh_complete_indexes() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+        {
+            let lease = ingest_lease(&paths);
+            let report = ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+            assert_eq!(report.records_added, 1);
+        }
+
+        let cache = ScanCache::load(&paths.state.join("scan_cache.json")).expect("scan cache");
+        assert!(cache.is_fresh(60));
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert!(analytics.complete().expect("analytics complete"));
+        assert_eq!(analytics.session_count().expect("session count"), 1);
+        assert!(can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+
+        let state_path = paths.state.join("ingest.json");
+        let state = IngestState::load(&state_path).expect("ingest state");
+        let recovery_frontier = state.next_doc_id + 10;
+        let source_path = transcript.to_string_lossy().to_string();
+        PendingIngest {
+            next_doc_id: recovery_frontier,
+            source_paths: vec![source_path.clone()],
+        }
+        .save(&pending_ingest_path(&paths))
+        .expect("save pending ingest");
+
+        assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+        let report = {
+            let lease = ingest_lease(&paths);
+            let recovery_index =
+                SearchIndex::open_or_create_for_ingest(&paths.index).expect("recovery generation");
+            ingest_if_stale(&paths, &recovery_index, &options, 60, &lease)
+                .expect("recover pending ingest")
+                .expect("pending ingest must bypass the freshness gate")
+        };
+
+        let published_index =
+            SearchIndex::open_or_create(&paths.index).expect("published recovery generation");
+        assert_eq!(report.records_added, 1);
+        assert_eq!(published_index.doc_count().expect("document count"), 1);
+        assert_eq!(
+            published_index
+                .doc_ids_by_source_path(&source_path)
+                .expect("re-ingested document IDs"),
+            vec![recovery_frontier]
+        );
+        let recovered_state = IngestState::load(&state_path).expect("recovered ingest state");
+        assert_eq!(recovered_state.next_doc_id, recovery_frontier + 1);
+        assert!(recovered_state.files.contains_key(&source_path));
+        assert_eq!(
+            PendingIngest::load(&pending_ingest_path(&paths)).expect("pending ingest marker"),
+            None
+        );
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert!(analytics.complete().expect("analytics complete"));
+        assert_eq!(analytics.session_count().expect("session count"), 1);
     }
 
     #[test]
@@ -3228,24 +3308,44 @@ mod tests {
     fn operator_prune_removes_vectors_and_invalidates_partial_backfill() {
         let temporary = tempfile::tempdir().expect("tempdir");
         let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+        let survivor = transcript.with_file_name("survivor.jsonl");
+        fs::write(
+            &survivor,
+            r#"{"type":"user","uuid":"u2","sessionId":"survivor-session","timestamp":"2026-08-08T11:00:00Z","message":{"content":"survivor remains searchable"}}
+"#,
+        )
+        .expect("write survivor transcript");
         {
             let lease = ingest_lease(&paths);
             ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
         }
-        let doc_id = index
+        let target_doc_id = index
             .doc_ids_by_source_path(&transcript.to_string_lossy())
             .expect("document IDs")[0];
+        let survivor_doc_id = index
+            .doc_ids_by_source_path(&survivor.to_string_lossy())
+            .expect("survivor document IDs")[0];
         let mut vectors =
             VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).expect("vectors");
-        vectors.add(doc_id, &vec![0.0; 384]).expect("add vector");
+        vectors
+            .add(target_doc_id, &vec![0.0; 384])
+            .expect("add target vector");
+        vectors
+            .add(survivor_doc_id, &vec![0.1; 384])
+            .expect("add survivor vector");
         vectors.save().expect("save vectors");
+        drop(vectors);
         crate::vector_backfill::seed_checkpoint_for_test(
             &paths,
             "bge",
             384,
-            &[(doc_id, vec![0.1; 384])],
+            &[(target_doc_id, vec![0.2; 384])],
         )
         .expect("seed backfill checkpoint");
+
+        assert_eq!(index.doc_count().expect("document count"), 2);
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert_eq!(analytics.session_count().expect("session count"), 2);
 
         fs::remove_file(&transcript).expect("remove transcript");
         let prune_options = PruneOptions::from(&options);
@@ -3257,8 +3357,10 @@ mod tests {
         let preview = preview_missing_paths(&paths, &index, &prune_options).expect("preview prune");
         assert_eq!(preview.records, 1);
         assert_eq!(preview.source_paths, vec![transcript.to_string_lossy()]);
-        assert_eq!(index.doc_count().expect("document count"), 1);
-        assert!(VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
+        assert_eq!(index.doc_count().expect("document count"), 2);
+        let vectors = VectorIndex::open(&paths.vectors).expect("vectors after preview");
+        assert!(vectors.contains(target_doc_id));
+        assert!(vectors.contains(survivor_doc_id));
         assert!(crate::vector_backfill::status(&paths).unwrap().is_some());
         drop(held_embedding);
         drop(held_ingest);
@@ -3276,14 +3378,43 @@ mod tests {
         )
         .expect("apply prune");
         assert_eq!(applied, preview);
-        assert_eq!(index.doc_count().expect("document count"), 0);
-        assert!(!VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
+        assert_eq!(index.doc_count().expect("document count"), 1);
+        assert!(
+            index
+                .get_by_doc_id(target_doc_id)
+                .expect("pruned lexical record")
+                .is_none()
+        );
+        let survivor_record = index
+            .get_by_doc_id(survivor_doc_id)
+            .expect("survivor lexical record")
+            .expect("survivor remains in lexical index");
+        assert_eq!(survivor_record.source_path, survivor.to_string_lossy());
+
+        let vectors = VectorIndex::open(&paths.vectors).expect("reopen pruned vector generation");
+        assert!(!vectors.contains(target_doc_id));
+        assert!(vectors.contains(survivor_doc_id));
         assert!(crate::vector_backfill::status(&paths).unwrap().is_none());
+
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert_eq!(analytics.session_count().expect("session count"), 1);
+        let sessions = analytics
+            .query_sessions_detailed(None, None, None, None, None)
+            .expect("analytics sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, survivor_record.session_id);
+        assert_eq!(sessions[0].source_path, survivor.to_string_lossy());
+
         let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
         assert!(
             !state
                 .files
                 .contains_key(&transcript.to_string_lossy().to_string())
+        );
+        assert!(
+            state
+                .files
+                .contains_key(&survivor.to_string_lossy().to_string())
         );
     }
 
