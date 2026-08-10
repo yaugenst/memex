@@ -1,6 +1,7 @@
 use crate::config::Paths;
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
+use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::vector::VectorIndex;
 use anyhow::{Context, Result, anyhow};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -351,12 +352,12 @@ pub fn status(paths: &Paths) -> Result<Option<BackfillStatus>> {
     let Some(mut status) = BackfillStore::open(path)?.status()? else {
         return Ok(None);
     };
-    status.running = crate::lease::is_held_by(paths, status.pid);
+    status.running = crate::lease::is_embedding_held_by(paths, status.pid);
     Ok(Some(status))
 }
 
 /// Remove deleted records from a durable in-progress backfill and refresh its totals.
-/// Callers hold the ingest lease, so this cannot race a backfill writer.
+/// Callers must hold the embedding lease.
 pub fn reconcile(paths: &Paths, index: &SearchIndex) -> Result<()> {
     let path = backfill_path(paths);
     if !path.exists() {
@@ -385,6 +386,17 @@ pub fn run(
     index: &SearchIndex,
     model: ModelChoice,
     runtime: &EmbedRuntimeConfig,
+) -> Result<BackfillReport> {
+    let lease = IngestLease::acquire_embedding(paths, "embed", INGEST_LEASE_TIMEOUT)?;
+    run_with_lease(paths, index, model, runtime, &lease)
+}
+
+pub(crate) fn run_with_lease(
+    paths: &Paths,
+    index: &SearchIndex,
+    model: ModelChoice,
+    runtime: &EmbedRuntimeConfig,
+    _lease: &IngestLease,
 ) -> Result<BackfillReport> {
     let inventory = VectorIndex::inventory(&paths.vectors)?;
     let mut embedder = None;

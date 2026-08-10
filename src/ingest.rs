@@ -469,17 +469,6 @@ fn apply_path_deletions(
         doc_ids.extend(index.doc_ids_by_source_path(source_path)?);
     }
 
-    if crate::vector::VectorIndex::exists(&paths.vectors)? {
-        let mut vectors = crate::vector::VectorIndex::open(&paths.vectors)?;
-        let mut removed = 0usize;
-        for doc_id in &doc_ids {
-            removed += usize::from(vectors.remove(*doc_id)?);
-        }
-        if removed > 0 {
-            vectors.save()?;
-        }
-    }
-
     let mut writer = index
         .writer()
         .context("failed to initialize the Tantivy deletion writer")?;
@@ -493,7 +482,6 @@ fn apply_path_deletions(
     // Dropping an IndexWriter cancels publication of in-flight Tantivy merges. Join them so
     // bounded compaction and deletion garbage collection actually become durable.
     writer.wait_merging_threads()?;
-    crate::vector_backfill::reconcile(paths, index)?;
     Ok(doc_ids.len())
 }
 
@@ -609,6 +597,11 @@ pub fn ingest_all(
     let state_path = paths.state.join("ingest.json");
     let mut state = IngestState::load(&state_path)?;
     if index.doc_count()? == 0 && !state.files.is_empty() {
+        let _embedding_lease = IngestLease::acquire_embedding(
+            paths,
+            "reset vectors for empty lexical index",
+            crate::lease::INGEST_LEASE_TIMEOUT,
+        )?;
         state = IngestState::default();
         crate::vector::VectorIndex::reset(&paths.vectors)?;
         crate::vector_backfill::reconcile(paths, index)?;
@@ -2865,7 +2858,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_prune_previews_then_removes_vectors_without_reembedding() {
+    fn operator_prune_preserves_active_vectors_until_next_backfill() {
         let temporary = tempfile::tempdir().expect("tempdir");
         let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
         {
@@ -2890,7 +2883,7 @@ mod tests {
         let applied = prune_missing_paths(&paths, &index, &options, true).expect("apply prune");
         assert_eq!(applied, preview);
         assert_eq!(index.doc_count().expect("document count"), 0);
-        assert!(!VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
+        assert!(VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
         let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
         assert!(
             !state
