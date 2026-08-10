@@ -96,6 +96,21 @@ pub fn is_embedding_held_by(paths: &Paths, pid: u32) -> bool {
     is_path_held_by(&lease_path(paths, "embed"), pid)
 }
 
+pub fn is_embedding_held(paths: &Paths) -> bool {
+    let path = lease_path(paths, "embed");
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => false,
+    }
+}
+
 fn is_path_held_by(path: &Path, pid: u32) -> bool {
     let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
         return false;
@@ -226,12 +241,14 @@ mod tests {
         let embed =
             IngestLease::acquire_embedding(&paths, "embed", Duration::from_secs(1)).unwrap();
 
+        assert!(is_embedding_held(&paths));
         assert!(is_embedding_held_by(&paths, std::process::id()));
         assert!(matches!(
             IngestLease::try_acquire_embedding(&paths, "second embed").unwrap(),
             LeaseAttempt::Busy(_)
         ));
         drop(embed);
+        assert!(!is_embedding_held(&paths));
         assert!(!is_embedding_held_by(&paths, std::process::id()));
     }
 
