@@ -76,6 +76,37 @@ impl SearchSpec {
     }
 }
 
+/// Deepen past stale and filtered records until `limit` matches are found.
+fn search_filtered_records(
+    vector: &VectorIndex,
+    index: &SearchIndex,
+    embedding: &[f32],
+    limit: usize,
+    options: &QueryOptions,
+) -> Result<Vec<(f32, Record)>> {
+    let mut accepted_records = HashMap::new();
+    let candidates = vector.search_filtered(embedding, limit, |doc_id| {
+        let Some(record) = index.get_by_doc_id(doc_id)? else {
+            return Ok(false);
+        };
+        if !matches_filters(&record, options) {
+            return Ok(false);
+        }
+        accepted_records.insert(doc_id, record);
+        Ok(true)
+    })?;
+
+    candidates
+        .into_iter()
+        .map(|(doc_id, distance)| {
+            accepted_records
+                .remove(&doc_id)
+                .map(|record| (distance, record))
+                .ok_or_else(|| anyhow!("accepted vector record {doc_id} was not cached"))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocatedRecord {
     pub machine: String,
@@ -1277,30 +1308,10 @@ fn search_local(
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("embedding missing"))?;
-            let mut records = Vec::new();
-            let vector_limit = if options.session_scope.is_some() {
-                vector.len()
-            } else {
-                spec.limit
-            };
-            let mut live_records = HashMap::new();
-            let semantic = vector.search_filtered(&embedding, vector_limit, |doc_id| {
-                let record = index.get_by_doc_id(doc_id)?;
-                if let Some(record) = record {
-                    live_records.insert(doc_id, record);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            })?;
-            for (doc_id, distance) in semantic {
-                if let Some(record) = live_records.remove(&doc_id)
-                    && matches_filters(&record, &options)
-                {
-                    records.push((1.0 / (1.0 + distance), record));
-                }
-            }
-            records
+            search_filtered_records(&vector, &index, &embedding, spec.limit, &options)?
+                .into_iter()
+                .map(|(distance, record)| (1.0 / (1.0 + distance), record))
+                .collect()
         }
         SearchMode::Hybrid => {
             let vector = match VectorIndex::open(&paths.vectors) {
@@ -1326,21 +1337,8 @@ fn search_local(
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("embedding missing"))?;
-            let semantic_limit = if options.session_scope.is_some() {
-                vector.len()
-            } else {
-                candidate_limit
-            };
-            let mut live_semantic_records = HashMap::new();
-            let semantic = vector.search_filtered(&embedding, semantic_limit, |doc_id| {
-                let record = index.get_by_doc_id(doc_id)?;
-                if let Some(record) = record {
-                    live_semantic_records.insert(doc_id, record);
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            })?;
+            let semantic =
+                search_filtered_records(&vector, &index, &embedding, candidate_limit, &options)?;
             let mut records = HashMap::new();
             let mut scores = HashMap::<u64, f32>::new();
             for (rank, (_, record)) in lexical.into_iter().enumerate() {
@@ -1349,13 +1347,10 @@ fn search_local(
                     records.insert(record.doc_id, record);
                 }
             }
-            for (rank, (doc_id, _)) in semantic.into_iter().enumerate() {
-                if let Some(record) = live_semantic_records.remove(&doc_id)
-                    && matches_filters(&record, &options)
-                {
-                    *scores.entry(doc_id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
-                    records.entry(doc_id).or_insert(record);
-                }
+            for (rank, (_, record)) in semantic.into_iter().enumerate() {
+                let doc_id = record.doc_id;
+                *scores.entry(doc_id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
+                records.entry(doc_id).or_insert(record);
             }
             scores
                 .into_iter()
@@ -1848,6 +1843,24 @@ mod tests {
     use crate::types::{RecordLinks, SourceKind};
     use tempfile::TempDir;
 
+    fn vector_test_record(doc_id: u64, project: &str) -> Record {
+        Record {
+            source: SourceKind::Claude,
+            doc_id,
+            ts: 1_000,
+            project: project.to_string(),
+            session_id: "session-a".to_string(),
+            turn_id: doc_id as u32,
+            role: "assistant".to_string(),
+            text: format!("record {doc_id}"),
+            tool_name: Some("Read".to_string()),
+            tool_input: None,
+            tool_output: None,
+            links: RecordLinks::default(),
+            source_path: format!("/tmp/{doc_id}.jsonl"),
+        }
+    }
+
     fn machine(id: &str) -> MachineConfig {
         MachineConfig {
             id: id.to_string(),
@@ -2181,6 +2194,60 @@ mod tests {
             selected_machine_ids(&config, &[]).unwrap(),
             vec!["local", "mini"]
         );
+    }
+
+    #[test]
+    fn filtered_vector_search_deepens_past_live_records_rejected_by_query_filters() {
+        let temp = TempDir::new().unwrap();
+        let index_path = temp.path().join("index");
+        std::fs::create_dir(&index_path).unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&index_path).unwrap();
+        let mut writer = index.writer().unwrap();
+        for record in [
+            vector_test_record(2, "filtered"),
+            vector_test_record(3, "wanted"),
+        ] {
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        drop(writer);
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let mut vector =
+            VectorIndex::open_or_create(&temp.path().join("vectors"), 4, Some("test")).unwrap();
+        vector.add(1, &query).unwrap();
+        vector.add(2, &[1.0, 0.1, 0.0, 0.0]).unwrap();
+        vector.add(3, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            vector
+                .search(&query, 2)
+                .unwrap()
+                .into_iter()
+                .map(|(doc_id, _)| doc_id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        let options = QueryOptions {
+            query: "record".to_string(),
+            project: Some("wanted".to_string()),
+            role: Some("assistant".to_string()),
+            tool: Some("Read".to_string()),
+            session_id: Some("session-a".to_string()),
+            session_scope: Some(vec![SessionScopeKey {
+                source: SourceKind::Claude,
+                session_id: "session-a".to_string(),
+                source_path: "/tmp/3.jsonl".to_string(),
+            }]),
+            source: Some(SourceFilter::Claude),
+            since: Some(999),
+            until: Some(1_001),
+            limit: 1,
+        };
+        let results = search_filtered_records(&vector, &index, &query, 1, &options).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.doc_id, 3);
     }
 
     #[test]
