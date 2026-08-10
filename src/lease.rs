@@ -30,11 +30,21 @@ pub struct LeaseHolder {
 
 impl IngestLease {
     pub fn try_acquire(paths: &Paths, operation: impl Into<String>) -> Result<LeaseAttempt> {
-        let path = lease_path(paths);
+        Self::try_acquire_path(lease_path(paths, "ingest"), operation.into())
+    }
+
+    pub fn try_acquire_embedding(
+        paths: &Paths,
+        operation: impl Into<String>,
+    ) -> Result<LeaseAttempt> {
+        Self::try_acquire_path(lease_path(paths, "embed"), operation.into())
+    }
+
+    fn try_acquire_path(path: PathBuf, operation: String) -> Result<LeaseAttempt> {
         let mut file = open_lease_file(&path)?;
         match file.try_lock() {
             Ok(()) => {
-                write_holder(&mut file, operation.into())?;
+                write_holder(&mut file, operation)?;
                 Ok(LeaseAttempt::Acquired(Self { file }))
             }
             Err(TryLockError::WouldBlock) => Ok(LeaseAttempt::Busy(read_holder(&path))),
@@ -44,11 +54,21 @@ impl IngestLease {
     }
 
     pub fn acquire(paths: &Paths, operation: impl Into<String>, timeout: Duration) -> Result<Self> {
-        let path = lease_path(paths);
-        let operation = operation.into();
+        Self::acquire_path(lease_path(paths, "ingest"), operation.into(), timeout)
+    }
+
+    pub fn acquire_embedding(
+        paths: &Paths,
+        operation: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::acquire_path(lease_path(paths, "embed"), operation.into(), timeout)
+    }
+
+    fn acquire_path(path: PathBuf, operation: String, timeout: Duration) -> Result<Self> {
         let started = Instant::now();
         loop {
-            match Self::try_acquire(paths, operation.clone())? {
+            match Self::try_acquire_path(path.clone(), operation.clone())? {
                 LeaseAttempt::Acquired(lease) => return Ok(lease),
                 LeaseAttempt::Busy(_) if started.elapsed() < timeout => {
                     thread::sleep(INGEST_LEASE_POLL_INTERVAL);
@@ -69,8 +89,15 @@ impl Drop for IngestLease {
 }
 
 pub fn is_held_by(paths: &Paths, pid: u32) -> bool {
-    let path = lease_path(paths);
-    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+    is_path_held_by(&lease_path(paths, "ingest"), pid)
+}
+
+pub fn is_embedding_held_by(paths: &Paths, pid: u32) -> bool {
+    is_path_held_by(&lease_path(paths, "embed"), pid)
+}
+
+fn is_path_held_by(path: &Path, pid: u32) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
         return false;
     };
     match file.try_lock() {
@@ -78,12 +105,12 @@ pub fn is_held_by(paths: &Paths, pid: u32) -> bool {
             let _ = file.unlock();
             false
         }
-        Err(TryLockError::WouldBlock) => read_holder(&path).is_some_and(|holder| holder.pid == pid),
+        Err(TryLockError::WouldBlock) => read_holder(path).is_some_and(|holder| holder.pid == pid),
         Err(TryLockError::Error(_)) => false,
     }
 }
 
-fn lease_path(paths: &Paths) -> PathBuf {
+fn lease_path(paths: &Paths, kind: &str) -> PathBuf {
     let parent = paths.root.parent().unwrap_or_else(|| Path::new("."));
     let root_name = paths
         .root
@@ -91,7 +118,7 @@ fn lease_path(paths: &Paths) -> PathBuf {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("memex");
-    parent.join(format!(".{root_name}.ingest.lock"))
+    parent.join(format!(".{root_name}.{kind}.lock"))
 }
 
 fn open_lease_file(path: &Path) -> Result<File> {
@@ -189,6 +216,23 @@ mod tests {
         assert!(is_held_by(&paths, std::process::id()));
         drop(lease);
         assert!(!is_held_by(&paths, std::process::id()));
+    }
+
+    #[test]
+    fn ingest_and_embedding_leases_are_independent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
+        let _ingest = IngestLease::acquire(&paths, "index", Duration::from_secs(1)).unwrap();
+        let embed =
+            IngestLease::acquire_embedding(&paths, "embed", Duration::from_secs(1)).unwrap();
+
+        assert!(is_embedding_held_by(&paths, std::process::id()));
+        assert!(matches!(
+            IngestLease::try_acquire_embedding(&paths, "second embed").unwrap(),
+            LeaseAttempt::Busy(_)
+        ));
+        drop(embed);
+        assert!(!is_embedding_held_by(&paths, std::process::id()));
     }
 
     #[test]

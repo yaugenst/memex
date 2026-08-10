@@ -1205,8 +1205,24 @@ pub fn run() -> Result<()> {
 }
 
 fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<String>) -> Result<()> {
+    let paths = Paths::new(index.root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let embeddings = resolve_flag(
+        config.embeddings_default(),
+        index.embeddings,
+        index.no_embeddings,
+        "embeddings",
+    )?;
+    let mut lexical = index.clone();
+    lexical.embeddings = false;
+    lexical.no_embeddings = true;
+    let mut embed_child = None;
+
     let _web_thread = initialize_index_loop(
-        || run_index_args(index, false, true),
+        || {
+            run_index_args(&lexical, false, true)?;
+            refresh_embedding_child(index, embeddings, &mut embed_child)
+        },
         || {
             web_listen
                 .as_deref()
@@ -1216,7 +1232,8 @@ fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<Stri
     )?;
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs));
-        run_index_args(index, false, true)?;
+        run_index_args(&lexical, false, true)?;
+        refresh_embedding_child(index, embeddings, &mut embed_child)?;
         std::io::stdout().flush().ok();
     }
 }
@@ -1228,6 +1245,42 @@ fn initialize_index_loop<T>(
     let web = start_web()?;
     index_once()?;
     Ok(web)
+}
+
+fn refresh_embedding_child(
+    index: &IndexArgs,
+    enabled: bool,
+    child: &mut Option<std::process::Child>,
+) -> Result<()> {
+    if let Some(process) = child
+        && let Some(status) = process.try_wait()?
+    {
+        if !status.success() {
+            eprintln!("embedding worker exited with {status}; retrying after the next index pass");
+        }
+        *child = None;
+    }
+    if enabled && child.is_none() {
+        *child = Some(
+            std::process::Command::new(std::env::current_exe()?)
+                .args(build_embed_command_args(index))
+                .spawn()?,
+        );
+    }
+    Ok(())
+}
+
+fn build_embed_command_args(index: &IndexArgs) -> Vec<String> {
+    let mut args = vec!["embed".to_string()];
+    if let Some(model) = &index.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+    if let Some(root) = &index.root {
+        args.push("--root".to_string());
+        args.push(root.to_string_lossy().to_string());
+    }
+    args
 }
 
 fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
@@ -1297,6 +1350,9 @@ fn run_index(
     )?;
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
+    let embedding_lease = reindex
+        .then(|| IngestLease::acquire_embedding(&paths, "reindex", INGEST_LEASE_TIMEOUT))
+        .transpose()?;
     if reindex && paths.root.exists() {
         std::fs::remove_dir_all(&paths.root)?;
     }
@@ -1320,14 +1376,24 @@ fn run_index(
         include_copilot: copilot,
         include_grok: grok,
         exclude_patterns: excludes,
-        embeddings,
+        embeddings: embeddings && !reindex,
         prune_missing,
         model: model_choice,
         embed_runtime,
         tool_content_limits,
     };
 
-    let report = ingest_all(&paths, &index, &opts, &lease)?;
+    let mut report = ingest_all(&paths, &index, &opts, &lease)?;
+    if reindex && embeddings {
+        report.records_embedded = crate::vector_backfill::run_with_lease(
+            &paths,
+            &index,
+            model_choice,
+            &opts.embed_runtime,
+            embedding_lease.as_ref().expect("reindex embedding lease"),
+        )?
+        .embedded;
+    }
     if report.records_embedded > 0 {
         println!(
             "indexed {} records, embedded {} across {} files (skipped {})",
@@ -1452,7 +1518,6 @@ fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<(
 fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let _lease = IngestLease::acquire(&paths, "embed", INGEST_LEASE_TIMEOUT)?;
     paths.ensure_dirs()?;
     let model_choice = config.resolve_model(model)?;
     let embed_runtime = config.resolve_embed_runtime()?;
@@ -5008,6 +5073,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(*events.borrow(), ["web", "index"]);
+    }
+
+    #[test]
+    fn embedding_worker_only_receives_model_and_root() {
+        let index = IndexArgs {
+            source: Some(PathBuf::from("/ignored/source")),
+            include_agents: true,
+            include_reasoning: true,
+            exclude: vec!["/ignored/**".to_string()],
+            codex: false,
+            opencode: false,
+            cursor: false,
+            pi: false,
+            omp: false,
+            openclaw: false,
+            copilot: false,
+            no_codex: true,
+            no_opencode: true,
+            no_pi: true,
+            no_omp: true,
+            no_openclaw: true,
+            no_copilot: true,
+            embeddings: true,
+            no_embeddings: false,
+            model: Some("bge".to_string()),
+            root: Some(PathBuf::from("/tmp/memex")),
+            diagnostics: true,
+            no_prune: true,
+        };
+
+        assert_eq!(
+            build_embed_command_args(&index),
+            ["embed", "--model", "bge", "--root", "/tmp/memex"]
+        );
     }
 
     #[test]
