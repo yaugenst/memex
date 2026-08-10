@@ -460,8 +460,9 @@ Embeddings are optional. If semantic/hybrid retrieval degrades to lexical but th
 
 Embedding backfills checkpoint complete batches in `<root>/state/embed-backfill.sqlite3` and resume
 when `memex embed` is rerun. Semantic and hybrid searches keep using the active complete vector
-generation until its replacement covers every live embeddable record and is atomically published.
-Use `memex stats` to inspect backfill progress and state.
+generation until its replacement covers the lexical snapshot captured for that pass and is
+atomically published. If lexical indexing commits newer records concurrently, the next embedding
+pass adds them. Use `memex stats` to inspect backfill progress and state.
 
 ### Index privacy / scope controls
 
