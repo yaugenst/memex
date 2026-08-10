@@ -3273,7 +3273,8 @@ mod tests {
         )
         .expect_err("corrupt vector store must stop prune");
 
-        assert!(error.to_string().contains("active vector generation"));
+        let message = format!("{error:#}");
+        assert!(message.contains("load vector index"), "{message}");
         assert_eq!(index.doc_count().expect("document count"), 1);
         assert!(
             !AnalyticsStore::open(&analytics_path)
