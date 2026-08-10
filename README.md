@@ -151,14 +151,15 @@ Notes:
 - Index updates are copy-on-write generations. A writer builds a private generation and atomically
   publishes it when complete; searches keep using the previous immutable generation until then.
 - Incremental indexing automatically removes records for paths that are confirmed missing beneath
-  readable, enabled source roots. It does not wait for a running embedding backfill: physical
-  vector cleanup is deferred, and semantic search skips deleted vector IDs in the meantime. Use
-  `--no-prune` to suppress missing-path cleanup for a particular run.
+  readable, enabled source roots. The lexical and analytics publication does not wait for a running
+  embedding backfill: physical vector cleanup is deferred, and semantic search skips deleted vector
+  IDs in the meantime. If embeddings are requested, the subsequent backfill waits for the embedding
+  lease. Use `--no-prune` to suppress missing-path cleanup for a particular run.
 - Concurrent searches coalesce stale auto-index work: one process refreshes while other lexical
   searches query the last committed index. Semantic and hybrid searches keep using the active
   complete vector generation while a replacement is built. Prune preview is read-only. Explicit
   mutations wait up to 30 seconds for the corresponding ingest or embedding lease and report its
-  holder on timeout; ordinary incremental indexing does not wait for an unrelated backfill.
+  holder on timeout; lexical publication does not wait for an unrelated backfill.
 
 Prune missing paths without rediscovering or rebuilding the corpus:
 ```
