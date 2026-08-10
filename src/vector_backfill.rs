@@ -2,7 +2,7 @@ use crate::config::Paths;
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
-use crate::vector::VectorIndex;
+use crate::vector::{VectorIndex, VectorInventory};
 use anyhow::{Context, Result, anyhow};
 use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -182,11 +182,20 @@ impl BackfillStore {
     }
 
     fn retain_pending(&mut self, live_ids: &HashSet<u64>, active_ids: &HashSet<u64>) -> Result<()> {
-        let stored = self.ids()?;
-        let stale = stored
-            .into_iter()
-            .filter(|doc_id| !live_ids.contains(doc_id) || active_ids.contains(doc_id))
-            .collect::<Vec<_>>();
+        let stale = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT doc_id FROM backfill_vectors")?;
+            let mut rows = statement.query([])?;
+            let mut stale = Vec::new();
+            while let Some(row) = rows.next()? {
+                let doc_id = row.get::<_, i64>(0)? as u64;
+                if !live_ids.contains(&doc_id) || active_ids.contains(&doc_id) {
+                    stale.push(doc_id);
+                }
+            }
+            stale
+        };
         if stale.is_empty() {
             return Ok(());
         }
@@ -213,13 +222,21 @@ impl BackfillStore {
     }
 
     fn ids(&self) -> Result<HashSet<u64>> {
+        let count =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM backfill_vectors", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        let count = usize::try_from(count).context("invalid staged embedding count")?;
         let mut statement = self
             .connection
             .prepare("SELECT doc_id FROM backfill_vectors")?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(ids.into_iter().map(|value| value as u64).collect())
+        let mut ids = HashSet::with_capacity(count);
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            ids.insert(row.get::<_, i64>(0)? as u64);
+        }
+        Ok(ids)
     }
 
     fn checkpoint(&mut self, rows: &[(u64, Vec<f32>)]) -> Result<BackfillStatus> {
@@ -227,6 +244,14 @@ impl BackfillStore {
             return self
                 .status()?
                 .ok_or_else(|| anyhow!("backfill metadata missing"));
+        }
+        let dimensions = self
+            .meta()?
+            .ok_or_else(|| anyhow!("backfill metadata missing"))?
+            .dimensions;
+        for (doc_id, embedding) in rows {
+            validate_embedding(embedding, dimensions)
+                .with_context(|| format!("stage embedding for doc_id {doc_id}"))?;
         }
         let active_ms = self
             .run_active_base_ms
@@ -284,7 +309,9 @@ impl BackfillStore {
         while let Some(row) = rows.next()? {
             let doc_id = row.get::<_, i64>(0)? as u64;
             let bytes = row.get::<_, Vec<u8>>(1)?;
-            visitor(doc_id, decode_embedding(&bytes, dimensions)?)?;
+            let embedding = decode_embedding(&bytes, dimensions)
+                .with_context(|| format!("decode staged embedding for doc_id {doc_id}"))?;
+            visitor(doc_id, embedding)?;
         }
         Ok(())
     }
@@ -409,14 +436,9 @@ pub(crate) fn run_with_lease(
             dimensions
         }
     };
-    let active_compatible = inventory.as_ref().is_some_and(|inventory| {
-        inventory.dimensions == dimensions && inventory.model.as_deref() == Some(model.as_str())
-    });
-    let active_ids = inventory
-        .as_ref()
-        .filter(|_| active_compatible)
-        .map(|inventory| inventory.doc_ids.clone())
-        .unwrap_or_default();
+    let active_ids = compatible_active_ids(inventory, dimensions, model.as_str());
+    let active_compatible = active_ids.is_some();
+    let active_ids = active_ids.unwrap_or_default();
 
     let live_ids = live_embeddable_ids(index)?;
     let base_completed = live_ids.intersection(&active_ids).count() as u64;
@@ -513,6 +535,11 @@ pub(crate) fn run_with_lease(
         std::mem::forget(handle);
     }
 
+    // These corpus-sized lookup tables are only needed while scanning for missing records.
+    // Release them before opening VectorIndex, which loads its own complete doc ID set.
+    drop(active_ids);
+    drop(staged_ids);
+
     store.set_phase("finalizing")?;
     let mut vector = VectorIndex::open_or_create(&paths.vectors, dimensions, Some(model.as_str()))?;
     vector.retain_ids(&live_ids)?;
@@ -537,6 +564,18 @@ pub(crate) fn run_with_lease(
         total: live_ids.len(),
         resumed,
     })
+}
+
+fn compatible_active_ids(
+    inventory: Option<VectorInventory>,
+    dimensions: usize,
+    model: &str,
+) -> Option<HashSet<u64>> {
+    inventory
+        .filter(|inventory| {
+            inventory.dimensions == dimensions && inventory.model.as_deref() == Some(model)
+        })
+        .map(|inventory| inventory.doc_ids)
 }
 
 fn checkpoint_batch(
@@ -600,17 +639,41 @@ fn encode_embedding(embedding: &[f32]) -> Vec<u8> {
 }
 
 fn decode_embedding(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>> {
-    if bytes.len() != dimensions * 4 {
+    let expected_bytes = dimensions
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("staged embedding dimensions overflow: {dimensions}"))?;
+    if bytes.len() != expected_bytes {
         return Err(anyhow!(
             "invalid staged embedding size: expected {} bytes, got {}",
-            dimensions * 4,
+            expected_bytes,
             bytes.len()
         ));
     }
-    Ok(bytes
+    let embedding = bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
-        .collect())
+        .collect::<Vec<_>>();
+    validate_embedding(&embedding, dimensions)?;
+    Ok(embedding)
+}
+
+fn validate_embedding(embedding: &[f32], dimensions: usize) -> Result<()> {
+    if embedding.len() != dimensions {
+        return Err(anyhow!(
+            "invalid staged embedding dimensions: expected {dimensions} values, got {}",
+            embedding.len()
+        ));
+    }
+    if let Some((dimension, value)) = embedding
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(anyhow!(
+            "invalid staged embedding value at dimension {dimension}: {value}"
+        ));
+    }
+    Ok(())
 }
 
 fn backfill_path(paths: &Paths) -> PathBuf {
@@ -752,6 +815,125 @@ mod tests {
             })
             .unwrap();
         assert_eq!(loaded, vec![(7, test_vector(7.0))]);
+    }
+
+    #[test]
+    fn checkpoint_rejects_invalid_embeddings_before_persisting_them() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join(BACKFILL_DB);
+        let mut store = BackfillStore::open(path).unwrap();
+        store.prepare("test", 4, 2, 0).unwrap();
+
+        let wrong_size = store.checkpoint(&[(7, vec![1.0; 3])]).unwrap_err();
+        assert_eq!(
+            format!("{wrong_size:#}"),
+            "stage embedding for doc_id 7: invalid staged embedding dimensions: expected 4 values, got 3"
+        );
+
+        let non_finite = store
+            .checkpoint(&[(8, vec![1.0, f32::NAN, 2.0, 3.0])])
+            .unwrap_err();
+        assert_eq!(
+            format!("{non_finite:#}"),
+            "stage embedding for doc_id 8: invalid staged embedding value at dimension 1: NaN"
+        );
+        assert!(store.ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn corrupt_staged_embedding_reports_its_doc_id() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join(BACKFILL_DB);
+        let mut store = BackfillStore::open(path).unwrap();
+        store.prepare("test", 4, 1, 0).unwrap();
+        store.checkpoint(&[(7, test_vector(7.0))]).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE backfill_vectors SET embedding = ?1 WHERE doc_id = ?2",
+                params![vec![0_u8; 15], 7_i64],
+            )
+            .unwrap();
+
+        let error = store
+            .for_each_vector(4, |_doc_id, _embedding| Ok(()))
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "decode staged embedding for doc_id 7: invalid staged embedding size: expected 16 bytes, got 15"
+        );
+    }
+
+    #[test]
+    fn same_size_non_finite_staged_embedding_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join(BACKFILL_DB);
+        let mut store = BackfillStore::open(path).unwrap();
+        store.prepare("test", 4, 1, 0).unwrap();
+        store.checkpoint(&[(9, test_vector(9.0))]).unwrap();
+        let mut corrupt = test_vector(9.0);
+        corrupt[2] = f32::INFINITY;
+        store
+            .connection
+            .execute(
+                "UPDATE backfill_vectors SET embedding = ?1 WHERE doc_id = ?2",
+                params![encode_embedding(&corrupt), 9_i64],
+            )
+            .unwrap();
+
+        let error = store
+            .for_each_vector(4, |_doc_id, _embedding| Ok(()))
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "decode staged embedding for doc_id 9: invalid staged embedding value at dimension 2: inf"
+        );
+    }
+
+    #[test]
+    fn compatible_inventory_transfers_the_existing_id_set() {
+        let doc_ids = (1..=1024).collect::<HashSet<_>>();
+        let original_entry = doc_ids.get(&512).unwrap() as *const u64 as usize;
+        let original_capacity = doc_ids.capacity();
+        let inventory = VectorInventory {
+            dimensions: 4,
+            model: Some("test".to_string()),
+            doc_ids,
+        };
+
+        let active_ids = compatible_active_ids(Some(inventory), 4, "test").unwrap();
+
+        assert_eq!(active_ids.len(), 1024);
+        assert_eq!(active_ids.capacity(), original_capacity);
+        assert_eq!(
+            active_ids.get(&512).unwrap() as *const u64 as usize,
+            original_entry
+        );
+    }
+
+    #[test]
+    fn retain_pending_filters_large_lookup_sets_without_changing_semantics() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join(BACKFILL_DB);
+        let mut store = BackfillStore::open(path).unwrap();
+        store.prepare("test", 4, 1024, 0).unwrap();
+        let rows = (1..=1024)
+            .map(|doc_id| (doc_id, test_vector(doc_id as f32)))
+            .collect::<Vec<_>>();
+        store.checkpoint(&rows).unwrap();
+        let live_ids = (1..=1024)
+            .filter(|doc_id| doc_id % 2 == 0)
+            .collect::<HashSet<_>>();
+        let active_ids = (1..=1024)
+            .filter(|doc_id| doc_id % 4 == 0)
+            .collect::<HashSet<_>>();
+
+        store.retain_pending(&live_ids, &active_ids).unwrap();
+
+        let expected = (1..=1024)
+            .filter(|doc_id| doc_id % 4 == 2)
+            .collect::<HashSet<_>>();
+        assert_eq!(store.ids().unwrap(), expected);
     }
 
     #[test]
