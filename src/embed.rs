@@ -659,10 +659,14 @@ mod tests {
                 | Some("potion-base-8m")
                 | Some("model2vec")
         );
+        let dimensions = embedder.dims;
+        // Exercise backend teardown before the test process exits. Backfill relies on this drop
+        // returning before it opens the complete vector generation.
+        drop(embedder);
         if is_potion {
-            assert!(embedder.dims > 0);
+            assert!(dimensions > 0);
         } else {
-            assert!(embedder.dims == 384 || embedder.dims == 768);
+            assert!(dimensions == 384 || dimensions == 768);
         }
     }
 

@@ -396,7 +396,13 @@ pub(crate) fn needs_work(paths: &Paths, index: &SearchIndex, model: ModelChoice)
     if checkpoint_exists(paths) {
         return Ok(true);
     }
-    let inventory = VectorIndex::inventory(&paths.vectors)?;
+    let inventory = match VectorIndex::inventory(&paths.vectors) {
+        Ok(inventory) => inventory,
+        // The explicit backfill run will build and atomically publish a replacement. Treat a
+        // stable generation that fails validation as work instead of declaring it complete from
+        // metadata and doc_ids.bin alone.
+        Err(_) => return Ok(true),
+    };
     if inventory.as_ref().is_some_and(|inventory| {
         inventory.model.as_deref() != Some(model.as_str())
             || model
@@ -475,7 +481,13 @@ pub(crate) fn run_with_lease(
     runtime: &EmbedRuntimeConfig,
     _lease: &IngestLease,
 ) -> Result<BackfillReport> {
-    let inventory = VectorIndex::inventory(&paths.vectors)?;
+    let (inventory, rebuild_active) = match VectorIndex::inventory(&paths.vectors) {
+        Ok(inventory) => (inventory, false),
+        Err(error) => {
+            eprintln!("active vector generation failed validation; rebuilding it: {error:#}");
+            (None, true)
+        }
+    };
     let mut embedder = None;
     let dimensions = match model.known_dimensions() {
         Some(dimensions) => dimensions,
@@ -579,11 +591,9 @@ pub(crate) fn run_with_lease(
             eprintln!("{}", status.line());
         }
     }
-    if let Some(handle) = embedder.take() {
-        // ONNX/CoreML teardown has historically hung in long-lived callers; the model is
-        // process-scoped and no longer needed once all durable checkpoints are written.
-        std::mem::forget(handle);
-    }
+    // All new embeddings are durable now. Release the model before USearch opens the complete
+    // active generation; repeated TUI/RPC backfills must not retain one model per refresh.
+    drop(embedder);
 
     // These corpus-sized lookup tables are only needed while scanning for missing records.
     // Release them before opening VectorIndex, which loads its own complete doc ID set.
@@ -591,7 +601,11 @@ pub(crate) fn run_with_lease(
     drop(staged_ids);
 
     store.set_phase("finalizing")?;
-    let mut vector = VectorIndex::open_or_create(&paths.vectors, dimensions, Some(model.as_str()))?;
+    let mut vector = if rebuild_active {
+        VectorIndex::empty_replacement(&paths.vectors, dimensions, Some(model.as_str()))?
+    } else {
+        VectorIndex::open_or_create(&paths.vectors, dimensions, Some(model.as_str()))?
+    };
     vector.retain_ids(&live_ids)?;
     store.for_each_vector(dimensions, |doc_id, embedding| {
         if live_ids.contains(&doc_id) {
@@ -807,6 +821,13 @@ mod tests {
             links: RecordLinks::default(),
             source_path: source_path.to_string(),
         }
+    }
+
+    fn active_vector_dir(root: &Path) -> PathBuf {
+        let pointer: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("current.json")).unwrap()).unwrap();
+        root.join("generations")
+            .join(pointer["generation"].as_str().unwrap())
     }
 
     #[test]
@@ -1077,6 +1098,76 @@ mod tests {
         writer.commit().unwrap();
         drop(writer);
         assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+    }
+
+    #[test]
+    fn corrupt_usearch_generation_is_detected_and_rebuilt_from_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "one.jsonl"))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+
+        let mut active = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
+        active.add(1, &vec![0.1; 384]).unwrap();
+        active.save().unwrap();
+        drop(active);
+        let active_dir = active_vector_dir(&paths.vectors);
+        let metadata_before = fs::read(active_dir.join("meta.json")).unwrap();
+        let ids_before = fs::read(active_dir.join("doc_ids.bin")).unwrap();
+
+        // Replace only usearch.index with another valid, same-cardinality index whose document ID
+        // disagrees with the untouched manifest and sidecar. The lightweight stats inventory
+        // cannot see this.
+        let donor_root = temporary.path().join("wrong-id-vector-donor");
+        let mut donor = VectorIndex::open_or_create(&donor_root, 384, Some("bge")).unwrap();
+        donor.add(2, &vec![0.3; 384]).unwrap();
+        donor.save().unwrap();
+        drop(donor);
+        fs::copy(
+            active_vector_dir(&donor_root).join("usearch.index"),
+            active_dir.join("usearch.index"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(active_dir.join("meta.json")).unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            fs::read(active_dir.join("doc_ids.bin")).unwrap(),
+            ids_before
+        );
+        let cheap_inventory = VectorIndex::inventory(&paths.vectors).unwrap().unwrap();
+        assert_eq!(cheap_inventory.doc_ids, HashSet::from([1]));
+        assert_eq!(cheap_inventory.vector_count, 1);
+        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+
+        // A complete checkpoint lets this exercise repair without loading an embedding model.
+        let mut store = BackfillStore::open(backfill_path(&paths)).unwrap();
+        store.prepare("bge", 384, 1, 0).unwrap();
+        store.checkpoint(&[(1, vec![0.2; 384])]).unwrap();
+        drop(store);
+
+        let report = run(
+            &paths,
+            &index,
+            ModelChoice::BGESmall,
+            &EmbedRuntimeConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.embedded, 0);
+        assert_eq!(report.resumed, 1);
+        assert_eq!(report.total, 1);
+        let repaired = VectorIndex::open(&paths.vectors).unwrap();
+        assert!(repaired.contains(1));
+        drop(repaired);
+        assert!(!needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
     }
 
     #[test]
