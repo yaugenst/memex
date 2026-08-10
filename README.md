@@ -453,8 +453,9 @@ memex stats
 Embedding batches are committed to `<root>/state/embed-backfill.sqlite3`. If the command or machine
 stops, rerunning `memex embed` resumes from the last committed batch. The active complete vector
 generation remains searchable throughout a model change or full backfill; memex publishes the new
-generation atomically only after every live embeddable record is covered. `memex stats` reports
-backfill progress and state while vector work exists.
+generation atomically only after every embeddable record in that pass's captured lexical snapshot
+is covered. If lexical indexing commits newer records concurrently, the next embedding pass adds
+them. `memex stats` reports backfill progress and state while vector work exists.
 
 Recommended when embeddings are on (especially non-`potion` models): run the background
 index service or `index --watch`, and consider setting `auto_index_on_search = false`
