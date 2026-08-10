@@ -383,6 +383,34 @@ pub fn status(paths: &Paths) -> Result<Option<BackfillStatus>> {
     Ok(Some(status))
 }
 
+pub(crate) fn checkpoint_exists(paths: &Paths) -> bool {
+    backfill_path(paths).exists()
+}
+
+/// Return whether the active vector generation is incomplete for the current lexical corpus.
+///
+/// This is intentionally separate from [`run`]: continuous indexing can make an exact decision
+/// before paying the cost of starting an embedding process. Callers should avoid invoking it on
+/// every idle poll because it inventories the embeddable lexical records.
+pub(crate) fn needs_work(paths: &Paths, index: &SearchIndex, model: ModelChoice) -> Result<bool> {
+    if checkpoint_exists(paths) {
+        return Ok(true);
+    }
+    let inventory = VectorIndex::inventory(&paths.vectors)?;
+    if inventory.as_ref().is_some_and(|inventory| {
+        inventory.model.as_deref() != Some(model.as_str())
+            || model
+                .known_dimensions()
+                .is_some_and(|dimensions| inventory.dimensions != dimensions)
+    }) {
+        return Ok(true);
+    }
+    let live_ids = live_embeddable_ids(index)?;
+    Ok(inventory
+        .map(|inventory| inventory.doc_ids != live_ids)
+        .unwrap_or(!live_ids.is_empty()))
+}
+
 /// Remove deleted records from a durable in-progress backfill and refresh its totals.
 /// Callers must hold the embedding lease.
 pub fn reconcile(paths: &Paths, index: &SearchIndex) -> Result<()> {
@@ -1004,6 +1032,60 @@ mod tests {
         assert_eq!(status.total, 1);
         assert_eq!(status.completed, 1);
         assert_eq!(store.ids().unwrap(), HashSet::from([1]));
+    }
+
+    #[test]
+    fn needs_work_matches_the_active_generation_to_the_lexical_corpus() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+
+        assert!(!needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "one.jsonl"))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+
+        let mut active = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
+        active.add(1, &vec![0.1; 384]).unwrap();
+        active.save().unwrap();
+        assert!(!needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(needs_work(&paths, &index, ModelChoice::MiniLM).unwrap());
+
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(&mut writer, &test_record(2, "two.jsonl"))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+
+        active.add(2, &vec![0.2; 384]).unwrap();
+        active.save().unwrap();
+        assert!(!needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+
+        let mut writer = index.writer().unwrap();
+        index.delete_by_source_path(&mut writer, "one.jsonl");
+        writer.commit().unwrap();
+        drop(writer);
+        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+    }
+
+    #[test]
+    fn needs_work_includes_unfinished_checkpoint_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut store = BackfillStore::open(backfill_path(&paths)).unwrap();
+        store.prepare("bge", 384, 0, 0).unwrap();
+
+        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
     }
 
     #[test]

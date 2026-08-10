@@ -1,6 +1,7 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig, default_claude_source};
-use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
+use crate::embed::{EmbedRuntimeConfig, ModelChoice};
+use crate::index::{IndexRevision, QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{
     IngestOptions, PruneOptions, ingest_all, preview_missing_paths, prune_missing_paths,
 };
@@ -34,10 +35,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::process::{Child, Command};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -1208,22 +1211,24 @@ pub fn run() -> Result<()> {
 
 fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<String>) -> Result<()> {
     let paths = Paths::new(index.root.clone())?;
-    let config = UserConfig::load(&paths)?;
-    let embeddings = resolve_flag(
-        config.embeddings_default(),
-        index.embeddings,
-        index.no_embeddings,
-        "embeddings",
-    )?;
     let mut lexical = index.clone();
     lexical.embeddings = false;
     lexical.no_embeddings = true;
-    let mut embed_child = None;
+    let shutdown = watch_shutdown_flag()?;
+    let mut worker = EmbeddingWorker::default();
+    let mut worker_spec = None;
+    let mut vector_work = VectorWorkState::default();
 
     let _web_thread = initialize_index_loop(
         || {
-            run_index_args(&lexical, false, true)?;
-            refresh_embedding_child(index, embeddings, &mut embed_child)
+            run_index_cycle(
+                index,
+                &lexical,
+                &paths,
+                &mut worker,
+                &mut worker_spec,
+                &mut vector_work,
+            )
         },
         || {
             web_listen
@@ -1232,12 +1237,20 @@ fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<Stri
                 .transpose()
         },
     )?;
-    loop {
-        std::thread::sleep(Duration::from_secs(interval_secs));
-        run_index_args(&lexical, false, true)?;
-        refresh_embedding_child(index, embeddings, &mut embed_child)?;
+    let interval = Duration::from_secs(interval_secs);
+    while wait_for_next_index_cycle(interval, &shutdown) {
+        run_index_cycle(
+            index,
+            &lexical,
+            &paths,
+            &mut worker,
+            &mut worker_spec,
+            &mut vector_work,
+        )?;
         std::io::stdout().flush().ok();
     }
+    worker.stop()?;
+    Ok(())
 }
 
 fn initialize_index_loop<T>(
@@ -1249,40 +1262,220 @@ fn initialize_index_loop<T>(
     Ok(web)
 }
 
-fn refresh_embedding_child(
-    index: &IndexArgs,
-    enabled: bool,
-    child: &mut Option<std::process::Child>,
-) -> Result<()> {
-    if let Some(process) = child
-        && let Some(status) = process.try_wait()?
-    {
-        if !status.success() {
-            eprintln!("embedding worker exited with {status}; retrying after the next index pass");
-        }
-        *child = None;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmbedWorkerSpec {
+    model: ModelChoice,
+    runtime: EmbedRuntimeConfig,
+}
+
+fn load_embed_worker_spec(index: &IndexArgs, paths: &Paths) -> Result<Option<EmbedWorkerSpec>> {
+    let config = UserConfig::load(paths)?;
+    let enabled = resolve_flag(
+        config.embeddings_default(),
+        index.embeddings,
+        index.no_embeddings,
+        "embeddings",
+    )?;
+    if !enabled {
+        return Ok(None);
     }
-    if enabled && child.is_none() {
-        *child = Some(
-            std::process::Command::new(std::env::current_exe()?)
-                .args(build_embed_command_args(index))
-                .spawn()?,
-        );
+    Ok(Some(EmbedWorkerSpec {
+        model: config.resolve_model(index.model.clone())?,
+        runtime: config.resolve_embed_runtime()?,
+    }))
+}
+
+fn run_index_cycle(
+    index: &IndexArgs,
+    lexical: &IndexArgs,
+    paths: &Paths,
+    worker: &mut EmbeddingWorker<SystemChild>,
+    active_spec: &mut Option<EmbedWorkerSpec>,
+    vector_work: &mut VectorWorkState,
+) -> Result<()> {
+    if let Some(exit) = worker.poll()? {
+        if !exit {
+            eprintln!("embedding worker failed; checking whether vector work remains");
+        }
+        vector_work.verify = true;
+    }
+
+    let desired_spec = load_embed_worker_spec(index, paths)?;
+    if desired_spec != *active_spec {
+        worker.stop()?;
+        *active_spec = desired_spec;
+        vector_work.verify = true;
+    }
+
+    run_index_args(lexical, false, true)?;
+    let search_index = SearchIndex::open_or_create(&paths.index)?;
+    vector_work.observe_lexical_revision(search_index.revision()?);
+    let external_embedding = !worker.is_running() && crate::lease::is_embedding_held(paths);
+    vector_work.observe_external_embedding(
+        external_embedding,
+        crate::vector_backfill::checkpoint_exists(paths),
+    );
+
+    let Some(spec) = active_spec.as_ref() else {
+        return Ok(());
+    };
+    if !worker.is_running() && !external_embedding {
+        let should_spawn = if vector_work.pending {
+            true
+        } else if vector_work.verify {
+            crate::vector_backfill::needs_work(paths, &search_index, spec.model)?
+        } else {
+            false
+        };
+        vector_work.verify = false;
+        if should_spawn {
+            worker.start(spawn_embedding_process(index, spec)?);
+            // The observed lexical revision is now the worker's input baseline. Any later commit
+            // flips pending back to true while this child continues in isolation.
+            vector_work.pending = false;
+        }
     }
     Ok(())
 }
 
-fn build_embed_command_args(index: &IndexArgs) -> Vec<String> {
-    let mut args = vec!["embed".to_string()];
-    if let Some(model) = &index.model {
-        args.push("--model".to_string());
-        args.push(model.clone());
+#[derive(Debug, Default)]
+struct VectorWorkState {
+    lexical_revision: Option<IndexRevision>,
+    pending: bool,
+    verify: bool,
+    external_embedding_seen: bool,
+}
+
+impl VectorWorkState {
+    fn observe_lexical_revision(&mut self, revision: IndexRevision) {
+        if self
+            .lexical_revision
+            .as_ref()
+            .is_some_and(|previous| previous != &revision)
+        {
+            self.pending = true;
+        }
+        self.lexical_revision = Some(revision);
     }
+
+    fn observe_external_embedding(&mut self, held: bool, checkpoint_exists: bool) {
+        if held {
+            self.external_embedding_seen = true;
+        } else {
+            self.verify |= std::mem::take(&mut self.external_embedding_seen) || checkpoint_exists;
+        }
+    }
+}
+
+trait ChildProcess {
+    fn try_wait(&mut self) -> io::Result<Option<bool>>;
+    fn terminate_and_wait(&mut self) -> io::Result<()>;
+}
+
+struct SystemChild(Child);
+
+impl ChildProcess for SystemChild {
+    fn try_wait(&mut self) -> io::Result<Option<bool>> {
+        self.0
+            .try_wait()
+            .map(|status| status.map(|status| status.success()))
+    }
+
+    fn terminate_and_wait(&mut self) -> io::Result<()> {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            // The process can exit between the poll and kill. Reaping below is authoritative, so
+            // a best-effort kill error is not itself a shutdown failure.
+            let _ = self.0.kill();
+        }
+        self.0.wait().map(|_| ())
+    }
+}
+
+struct EmbeddingWorker<P: ChildProcess> {
+    process: Option<P>,
+}
+
+impl<P: ChildProcess> Default for EmbeddingWorker<P> {
+    fn default() -> Self {
+        Self { process: None }
+    }
+}
+
+impl<P: ChildProcess> EmbeddingWorker<P> {
+    fn is_running(&self) -> bool {
+        self.process.is_some()
+    }
+
+    fn start(&mut self, process: P) {
+        debug_assert!(self.process.is_none());
+        self.process = Some(process);
+    }
+
+    fn poll(&mut self) -> Result<Option<bool>> {
+        let Some(process) = self.process.as_mut() else {
+            return Ok(None);
+        };
+        let exit = process.try_wait()?;
+        if exit.is_some() {
+            self.process = None;
+        }
+        Ok(exit)
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        let Some(mut process) = self.process.take() else {
+            return Ok(());
+        };
+        process.terminate_and_wait()?;
+        Ok(())
+    }
+}
+
+impl<P: ChildProcess> Drop for EmbeddingWorker<P> {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn spawn_embedding_process(index: &IndexArgs, spec: &EmbedWorkerSpec) -> Result<SystemChild> {
+    Ok(SystemChild(
+        Command::new(std::env::current_exe()?)
+            .args(build_embed_command_args(index, spec.model))
+            .spawn()?,
+    ))
+}
+
+fn build_embed_command_args(index: &IndexArgs, model: ModelChoice) -> Vec<String> {
+    let mut args = vec![
+        "embed".to_string(),
+        "--model".to_string(),
+        model.as_str().to_string(),
+    ];
     if let Some(root) = &index.root {
         args.push("--root".to_string());
         args.push(root.to_string_lossy().to_string());
     }
     args
+}
+
+fn watch_shutdown_flag() -> Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+        signal_hook::flag::register(SIGINT, shutdown.clone())?;
+        signal_hook::flag::register(SIGTERM, shutdown.clone())?;
+    }
+    Ok(shutdown)
+}
+
+fn wait_for_next_index_cycle(interval: Duration, shutdown: &AtomicBool) -> bool {
+    let started = Instant::now();
+    while !shutdown.load(AtomicOrdering::Relaxed) && started.elapsed() < interval {
+        let remaining = interval.saturating_sub(started.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(250)));
+    }
+    !shutdown.load(AtomicOrdering::Relaxed)
 }
 
 fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
@@ -4931,6 +5124,8 @@ mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use tempfile::TempDir;
 
     #[test]
@@ -5102,9 +5297,120 @@ mod tests {
         };
 
         assert_eq!(
-            build_embed_command_args(&index),
+            build_embed_command_args(&index, ModelChoice::BGESmall),
             ["embed", "--model", "bge", "--root", "/tmp/memex"]
         );
+    }
+
+    #[test]
+    fn vector_work_is_rechecked_only_after_relevant_events() {
+        let revision = |opstamp| IndexRevision {
+            opstamp,
+            segments: vec![(format!("segment-{opstamp}"), None)],
+        };
+        let mut state = VectorWorkState::default();
+        state.observe_lexical_revision(revision(1));
+        assert!(!state.pending);
+        state.observe_lexical_revision(revision(1));
+        assert!(!state.pending);
+        state.observe_lexical_revision(revision(2));
+        assert!(state.pending);
+
+        state.pending = false;
+        state.observe_external_embedding(true, false);
+        assert!(!state.verify);
+        state.observe_external_embedding(false, false);
+        assert!(state.verify);
+
+        state.verify = false;
+        state.observe_external_embedding(false, true);
+        assert!(state.verify);
+    }
+
+    #[test]
+    fn embedding_configuration_is_reloaded_between_cycles() {
+        let temporary = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = IndexArgs {
+            source: None,
+            include_agents: false,
+            include_reasoning: false,
+            exclude: Vec::new(),
+            codex: true,
+            opencode: true,
+            cursor: true,
+            pi: true,
+            omp: true,
+            openclaw: true,
+            copilot: true,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_omp: false,
+            no_openclaw: false,
+            no_copilot: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: Some(paths.root.clone()),
+            diagnostics: false,
+            no_prune: false,
+        };
+
+        std::fs::write(paths.root.join("config.toml"), "embeddings = false\n").unwrap();
+        assert!(load_embed_worker_spec(&index, &paths).unwrap().is_none());
+
+        std::fs::write(
+            paths.root.join("config.toml"),
+            "embeddings = true\nmodel = \"bge\"\n",
+        )
+        .unwrap();
+        let spec = load_embed_worker_spec(&index, &paths).unwrap().unwrap();
+        assert_eq!(spec.model, ModelChoice::BGESmall);
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeProcessState {
+        running: bool,
+        terminate_and_wait_calls: usize,
+    }
+
+    struct FakeProcess {
+        state: Rc<RefCell<FakeProcessState>>,
+    }
+
+    impl ChildProcess for FakeProcess {
+        fn try_wait(&mut self) -> io::Result<Option<bool>> {
+            if self.state.borrow().running {
+                Ok(None)
+            } else {
+                Ok(Some(true))
+            }
+        }
+
+        fn terminate_and_wait(&mut self) -> io::Result<()> {
+            let mut state = self.state.borrow_mut();
+            state.terminate_and_wait_calls += 1;
+            state.running = false;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dropping_embedding_worker_terminates_and_reaps_child() {
+        let state = Rc::new(RefCell::new(FakeProcessState {
+            running: true,
+            ..FakeProcessState::default()
+        }));
+        {
+            let mut worker = EmbeddingWorker::default();
+            worker.start(FakeProcess {
+                state: state.clone(),
+            });
+        }
+        let state = state.borrow();
+        assert_eq!(state.terminate_and_wait_calls, 1);
     }
 
     #[test]
