@@ -408,6 +408,28 @@ pub fn reconcile(paths: &Paths, index: &SearchIndex) -> Result<()> {
     Ok(())
 }
 
+/// Remove deleted records from the active generation and discard any partial generation.
+///
+/// A checkpoint stores staged vectors and aggregate progress but not its complete input scope.
+/// Once lexical records are removed, adjusting its totals without rescanning the full corpus can
+/// misclassify unprocessed records. Dropping the checkpoint is conservative: the next backfill
+/// resumes from every vector still present in the active generation.
+///
+/// Callers must hold the embedding lease so a backfill cannot publish between vector removal and
+/// checkpoint invalidation.
+pub(crate) fn prune_deleted(
+    paths: &Paths,
+    doc_ids: &HashSet<u64>,
+    _embedding_lease: &IngestLease,
+) -> Result<usize> {
+    let removed = VectorIndex::remove_ids(&paths.vectors, doc_ids)?;
+    let checkpoint = backfill_path(paths);
+    if checkpoint.exists() {
+        remove_sqlite_files(&checkpoint)?;
+    }
+    Ok(removed)
+}
+
 pub fn run(
     paths: &Paths,
     index: &SearchIndex,
@@ -717,6 +739,19 @@ fn format_duration(seconds: u64) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_checkpoint_for_test(
+    paths: &Paths,
+    model: &str,
+    dimensions: usize,
+    rows: &[(u64, Vec<f32>)],
+) -> Result<()> {
+    let mut store = BackfillStore::open(backfill_path(paths))?;
+    store.prepare(model, dimensions, rows.len() as u64, 0)?;
+    store.checkpoint(rows)?;
+    Ok(())
 }
 
 #[cfg(test)]

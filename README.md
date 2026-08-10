@@ -150,11 +150,28 @@ Notes:
 - Searches run an incremental reindex by default (configurable).
 - Index updates are copy-on-write generations. A writer builds a private generation and atomically
   publishes it when complete; searches keep using the previous immutable generation until then.
+- Incremental indexing automatically removes records for paths that are confirmed missing beneath
+  readable, enabled source roots. It does not wait for a running embedding backfill: physical
+  vector cleanup is deferred, and semantic search skips deleted vector IDs in the meantime. Use
+  `--no-prune` to suppress missing-path cleanup for a particular run.
 - Concurrent searches coalesce stale auto-index work: one process refreshes while other lexical
   searches query the last committed index. Semantic and hybrid searches keep using the active
-  complete vector generation while a replacement is built. Explicit `index`, `reindex`, `embed`,
-  and analytics backfill commands wait up to 30 seconds for another index mutation to finish and
-  report its holder on timeout.
+  complete vector generation while a replacement is built. Prune preview is read-only. Explicit
+  mutations wait up to 30 seconds for the corresponding ingest or embedding lease and report its
+  holder on timeout; ordinary incremental indexing does not wait for an unrelated backfill.
+
+Prune missing paths without rediscovering or rebuilding the corpus:
+```
+memex prune             # safe preview (same as --dry-run)
+memex prune --apply     # prune lexical, analytics, vectors, and state; invalidate partial backfill
+```
+
+Apply preserves vectors for live records. If a resumable embedding backfill is in progress, its
+checkpoint is discarded because its original corpus scope is no longer valid; the next backfill
+resumes from the preserved active vector generation.
+
+`memex reindex` is reserved for an intentionally clean rebuild, such as recovering from index
+corruption or applying a schema-wide migration. Routine deletion and path cleanup do not require it.
 
 Full transcript:
 ```

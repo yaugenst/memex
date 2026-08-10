@@ -1,7 +1,9 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
-use crate::ingest::{IngestOptions, ingest_all, prune_missing_paths};
+use crate::ingest::{
+    IngestOptions, PruneOptions, ingest_all, preview_missing_paths, prune_missing_paths,
+};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     LocatedRecord, MAX_HYDRATE_INPUT_BYTES, MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE,
@@ -142,7 +144,7 @@ struct IndexArgs {
     no_prune: bool,
 }
 
-#[derive(Args, Clone)]
+#[derive(Args, Clone, Default)]
 struct PruneArgs {
     /// Path to Claude projects directory [default: ~/.claude/projects]
     #[arg(long)]
@@ -233,7 +235,7 @@ EXAMPLES:
     #[command(after_help = "\
 EXAMPLES:
     memex prune                 # Preview missing paths and affected records
-    memex prune --apply         # Delete them from lexical, analytics, and vector stores
+    memex prune --apply         # Delete them and invalidate any partial embedding backfill
     memex prune --no-codex      # Preview all enabled sources except Codex")]
     Prune {
         #[command(flatten)]
@@ -241,7 +243,7 @@ EXAMPLES:
         /// Explicitly request preview mode (also the default)
         #[arg(long, conflicts_with = "apply")]
         dry_run: bool,
-        /// Apply the displayed deletions
+        /// Apply deletions and invalidate any partial embedding backfill
         #[arg(long, conflicts_with = "dry_run")]
         apply: bool,
     },
@@ -1431,17 +1433,9 @@ fn run_prune(args: PruneArgs, apply: bool) -> Result<()> {
             paths.index.display()
         ));
     }
-    let config = UserConfig::load(&paths)?;
-    let _lease = IngestLease::acquire(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
-    let index = if apply {
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
-    } else {
-        SearchIndex::open_or_create(&paths.index)?
-    };
-    let options = IngestOptions {
+    let options = PruneOptions {
         claude_source: args.source.unwrap_or_else(default_claude_source),
         include_agents: args.include_agents,
-        include_reasoning: config.include_reasoning_default(),
         include_codex: !args.no_codex,
         include_opencode: !args.no_opencode,
         include_cursor: !args.no_cursor,
@@ -1449,17 +1443,22 @@ fn run_prune(args: PruneArgs, apply: bool) -> Result<()> {
         include_omp: !args.no_omp,
         include_openclaw: !args.no_openclaw,
         include_copilot: !args.no_copilot,
-        exclude_patterns: config.exclude_path_patterns(),
-        embeddings: false,
-        prune_missing: true,
-        model: config.resolve_model(None)?,
-        embed_runtime: config.resolve_embed_runtime()?,
-        tool_content_limits: config.indexed_tool_content_limits()?,
     };
-    let report = prune_missing_paths(&paths, &index, &options, apply)?;
-    if apply && !report.source_paths.is_empty() {
-        index.publish_generation()?;
-    }
+    let report = if apply {
+        let ingest_lease = IngestLease::acquire(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
+        let embedding_lease =
+            IngestLease::acquire_embedding(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+        let report =
+            prune_missing_paths(&paths, &index, &options, &ingest_lease, &embedding_lease)?;
+        if !report.source_paths.is_empty() {
+            index.publish_generation()?;
+        }
+        report
+    } else {
+        let index = SearchIndex::open_or_create(&paths.index)?;
+        preview_missing_paths(&paths, &index, &options)?
+    };
     if report.source_paths.is_empty() {
         println!("no missing indexed paths found beneath readable source roots");
         return Ok(());
@@ -5355,6 +5354,36 @@ arguments = {
     #[test]
     fn prune_rejects_dry_run_with_apply() {
         assert!(Cli::try_parse_from(["memex", "prune", "--dry-run", "--apply"]).is_err());
+    }
+
+    #[test]
+    fn prune_preview_does_not_resolve_embedding_configuration() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("memex");
+        let paths = Paths::new(Some(root.clone())).unwrap();
+        paths.ensure_dirs().unwrap();
+        SearchIndex::open_or_create(&paths.index).unwrap();
+        std::fs::write(
+            root.join("config.toml"),
+            "model = 'not-a-model'\nexecution_provider = 'not-a-provider'\n",
+        )
+        .unwrap();
+
+        run_prune(
+            PruneArgs {
+                source: Some(tmp.path().join("missing-claude-root")),
+                no_codex: true,
+                no_opencode: true,
+                no_cursor: true,
+                no_pi: true,
+                no_openclaw: true,
+                no_copilot: true,
+                root: Some(root),
+                ..PruneArgs::default()
+            },
+            false,
+        )
+        .expect("preview should ignore embedding configuration");
     }
 
     #[test]
