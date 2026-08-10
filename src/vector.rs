@@ -103,6 +103,21 @@ impl VectorIndex {
         Self::empty(dir, dimensions, model, true)
     }
 
+    /// Start a complete replacement without opening or deleting the active generation.
+    ///
+    /// Backfill uses this only after validating the immutable active generation has failed. The
+    /// replacement is published through [`save`](Self::save), so readers keep seeing the old
+    /// generation until the new one is durable and Windows never has to delete a mapped index in
+    /// order to repair it.
+    pub(crate) fn empty_replacement(
+        dir: &Path,
+        dimensions: usize,
+        model: Option<&str>,
+    ) -> Result<Self> {
+        fs::create_dir_all(dir)?;
+        Self::empty(dir, dimensions, model.map(str::to_string), true)
+    }
+
     pub fn open(dir: &Path) -> Result<Self> {
         let storage = active_storage(dir)?.ok_or_else(|| anyhow!("vector index not found"))?;
         Self::open_active_snapshot(dir, storage)
@@ -392,6 +407,33 @@ impl VectorIndex {
         }
     }
 
+    /// Inventory the active generation and validate the USearch index against its sidecars.
+    ///
+    /// Unlike [`inventory`](Self::inventory), this opens `usearch.index` and checks every sidecar
+    /// ID. Keep the cheap inventory for status reporting; backfill calls this at explicit runs and
+    /// continuous-mode verification events where an O(N) repair decision is warranted.
+    pub(crate) fn validated_inventory(dir: &Path) -> Result<Option<VectorInventory>> {
+        let Some(mut storage) = active_storage(dir)? else {
+            return Ok(None);
+        };
+        loop {
+            match load_validated_inventory(&storage) {
+                Ok(inventory) => return Ok(Some(inventory)),
+                Err(error) => {
+                    let refreshed = active_storage(dir)?;
+                    if refreshed.as_ref().is_some_and(|active| active != &storage) {
+                        storage = refreshed.expect("checked above");
+                        continue;
+                    }
+                    if refreshed.is_none() {
+                        return Ok(None);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     pub fn contains(&self, doc_id: u64) -> bool {
         self.doc_id_set.contains(&doc_id)
     }
@@ -656,6 +698,19 @@ fn load_inventory(storage: &ActiveStorage) -> Result<VectorInventory> {
         index_bytes,
         ids_bytes: ids_len,
     })
+}
+
+fn load_validated_inventory(storage: &ActiveStorage) -> Result<VectorInventory> {
+    let mut inventory = load_inventory(storage)?;
+    let index_path = storage.path.join("usearch.index");
+    let index = Index::new(&IndexOptions::default())?;
+    index
+        .load(path_str(&index_path)?)
+        .with_context(|| format!("load vector index {}", index_path.display()))?;
+    let metadata = load_storage_metadata(storage)?;
+    validate_snapshot(&index, &inventory.doc_ids, metadata.as_ref(), &storage.path)?;
+    inventory.vector_count = Some(index.size());
+    Ok(inventory)
 }
 
 fn decode_doc_ids(bytes: &[u8], path: &Path) -> Result<HashSet<u64>> {
