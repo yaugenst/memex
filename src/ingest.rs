@@ -47,6 +47,35 @@ pub struct IngestOptions {
     pub tool_content_limits: IndexedToolContentLimits,
 }
 
+#[derive(Debug, Clone)]
+pub struct PruneOptions {
+    pub claude_source: PathBuf,
+    pub include_agents: bool,
+    pub include_codex: bool,
+    pub include_opencode: bool,
+    pub include_cursor: bool,
+    pub include_pi: bool,
+    pub include_omp: bool,
+    pub include_openclaw: bool,
+    pub include_copilot: bool,
+}
+
+impl From<&IngestOptions> for PruneOptions {
+    fn from(options: &IngestOptions) -> Self {
+        Self {
+            claude_source: options.claude_source.clone(),
+            include_agents: options.include_agents,
+            include_codex: options.include_codex,
+            include_opencode: options.include_opencode,
+            include_cursor: options.include_cursor,
+            include_pi: options.include_pi,
+            include_omp: options.include_omp,
+            include_openclaw: options.include_openclaw,
+            include_copilot: options.include_copilot,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct IngestReport {
     pub records_added: usize,
@@ -365,7 +394,7 @@ fn add_authoritative_root(roots: &mut Vec<AuthoritativeRoot>, source: SourceKind
     }
 }
 
-fn authoritative_roots(options: &IngestOptions) -> Vec<AuthoritativeRoot> {
+fn authoritative_roots(options: &PruneOptions) -> Vec<AuthoritativeRoot> {
     let mut roots = Vec::new();
     add_authoritative_root(
         &mut roots,
@@ -398,6 +427,13 @@ fn authoritative_roots(options: &IngestOptions) -> Vec<AuthoritativeRoot> {
             crate::sources::pi::sessions_root(),
         );
     }
+    if options.include_omp {
+        add_authoritative_root(
+            &mut roots,
+            SourceKind::Omp,
+            crate::sources::omp::agent_root().join("sessions"),
+        );
+    }
     if options.include_openclaw {
         for root in crate::sources::openclaw::state_dirs() {
             add_authoritative_root(&mut roots, SourceKind::OpenClaw, root);
@@ -424,7 +460,7 @@ fn missing_state_paths(
     state: &IngestState,
     discovered: &HashSet<String>,
     roots: &[AuthoritativeRoot],
-    options: &IngestOptions,
+    options: &PruneOptions,
 ) -> Vec<String> {
     let mut missing = state
         .files
@@ -470,34 +506,56 @@ fn apply_path_deletions(
     paths: &Paths,
     index: &SearchIndex,
     source_paths: &[String],
+    embedding_lease: Option<&IngestLease>,
 ) -> Result<usize> {
     if source_paths.is_empty() {
         return Ok(0);
     }
-    let doc_ids = doc_ids_for_source_paths(index, source_paths)?;
-
+    // Ordinary ingest needs only the deletion count and leaves physical vector cleanup to the
+    // next backfill. Explicit prune resolves IDs once because it removes them from the active
+    // vector generation under the embedding lease.
+    let doc_ids = embedding_lease
+        .map(|_| {
+            index
+                .doc_ids_by_source_paths(source_paths)
+                .map(|ids| ids.into_iter().collect::<HashSet<_>>())
+        })
+        .transpose()?;
+    let records = match &doc_ids {
+        Some(doc_ids) => doc_ids.len(),
+        None => index.count_by_source_paths(source_paths)?,
+    };
     let mut writer = index
         .writer()
         .context("failed to initialize the Tantivy deletion writer")?;
-    let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state))?;
+    let analytics_marker = AnalyticsStore::open(analytics_path(&paths.state))?;
+    let analytics_was_complete = analytics_marker.complete()?;
+    // There is no transaction spanning Tantivy, SQLite, and the vector generation pointer. Mark
+    // analytics conservatively before the first mutation so any later error triggers backfill.
+    analytics_marker.mark_incomplete()?;
+
+    if let (Some(embedding_lease), Some(doc_ids)) = (embedding_lease, &doc_ids) {
+        crate::vector_backfill::prune_deleted(paths, doc_ids, embedding_lease)?;
+    }
     for source_path in source_paths {
         index.delete_by_source_path(&mut writer, source_path);
-        analytics.delete_source_path(source_path)?;
     }
-    analytics.flush()?;
     writer.commit()?;
+    index.maybe_compact_continuous_segments(&mut writer)?;
     // Dropping an IndexWriter cancels publication of in-flight Tantivy merges. Join them so
     // bounded compaction and deletion garbage collection actually become durable.
     writer.wait_merging_threads()?;
-    Ok(doc_ids.len())
-}
+    index.publish_generation()?;
 
-fn doc_ids_for_source_paths(index: &SearchIndex, source_paths: &[String]) -> Result<HashSet<u64>> {
-    let mut doc_ids = HashSet::new();
+    let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state))?;
     for source_path in source_paths {
-        doc_ids.extend(index.doc_ids_by_source_path(source_path)?);
+        analytics.delete_source_path(source_path)?;
     }
-    Ok(doc_ids)
+    analytics.flush()?;
+    if analytics_was_complete {
+        analytics_marker.mark_complete()?;
+    }
+    Ok(records)
 }
 
 fn prepare_pending_ingest_recovery(
@@ -520,13 +578,39 @@ fn prepare_pending_ingest_recovery(
     Ok(Some(pending.source_paths))
 }
 
-/// Preview or apply deletion of indexed paths that are confirmed absent beneath readable,
-/// enabled source roots. This does not rediscover, parse, or re-embed the corpus.
+fn missing_paths_for_options(paths: &Paths, options: &PruneOptions) -> Result<Vec<String>> {
+    let state = IngestState::load(&paths.state.join("ingest.json"))?;
+    Ok(missing_state_paths(
+        &state,
+        &HashSet::new(),
+        &authoritative_roots(options),
+        options,
+    ))
+}
+
+/// Preview indexed paths that are confirmed absent beneath readable, enabled source roots.
+/// This is read-only and intentionally does not acquire either mutation lease.
+pub fn preview_missing_paths(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &PruneOptions,
+) -> Result<PruneReport> {
+    let source_paths = missing_paths_for_options(paths, options)?;
+    let records = index.count_by_source_paths(&source_paths)?;
+    Ok(PruneReport {
+        source_paths,
+        records,
+    })
+}
+
+/// Delete indexed paths that are confirmed absent beneath readable, enabled source roots.
+/// Callers must acquire the ingest lease before the embedding lease.
 pub fn prune_missing_paths(
     paths: &Paths,
     index: &SearchIndex,
-    options: &IngestOptions,
-    apply: bool,
+    options: &PruneOptions,
+    _ingest_lease: &IngestLease,
+    embedding_lease: &IngestLease,
 ) -> Result<PruneReport> {
     let state_path = paths.state.join("ingest.json");
     let mut state = IngestState::load(&state_path)?;
@@ -536,21 +620,18 @@ pub fn prune_missing_paths(
         &authoritative_roots(options),
         options,
     );
-    let mut doc_ids = HashSet::new();
-    for source_path in &source_paths {
-        doc_ids.extend(index.doc_ids_by_source_path(source_path)?);
-    }
-    let records = doc_ids.len();
-
-    if apply && !source_paths.is_empty() {
-        apply_path_deletions(paths, index, &source_paths)?;
+    let records = if source_paths.is_empty() {
+        0
+    } else {
+        let records = apply_path_deletions(paths, index, &source_paths, Some(embedding_lease))?;
         for source_path in &source_paths {
             state.files.remove(source_path);
         }
         state.save(&state_path)?;
         // Force the next freshness-gated ingest to rediscover the remaining corpus.
         ScanCache::default().save(&paths.state.join("scan_cache.json"))?;
-    }
+        records
+    };
 
     Ok(PruneReport {
         source_paths,
@@ -663,7 +744,8 @@ pub fn ingest_all(
     let mut files_skipped = 0usize;
     let mut total_bytes = 0u64;
     let mut discovered_paths = HashSet::new();
-    let authoritative_roots = authoritative_roots(options);
+    let prune_options = PruneOptions::from(options);
+    let authoritative_roots = authoritative_roots(&prune_options);
 
     if options.claude_source.exists() {
         let claude_files =
@@ -992,7 +1074,12 @@ pub fn ingest_all(
     files_skipped += excluded_state_paths.len();
 
     let missing_paths = if options.prune_missing {
-        missing_state_paths(&state, &discovered_paths, &authoritative_roots, options)
+        missing_state_paths(
+            &state,
+            &discovered_paths,
+            &authoritative_roots,
+            &prune_options,
+        )
     } else {
         Vec::new()
     };
@@ -1008,7 +1095,11 @@ pub fn ingest_all(
     delete_paths.extend(replacement_paths);
     delete_paths.sort();
     delete_paths.dedup();
-    let records_pruned = doc_ids_for_source_paths(index, &delete_paths)?.len();
+    // Ordinary ingest must remain independent of a potentially hours-long embedding backfill.
+    // Its lexical and analytics deletions are staged with additions and publish only after every
+    // parser succeeds. Physical vector cleanup is deferred to the next backfill; semantic search
+    // deepens past IDs no longer present in the lexical index.
+    let records_pruned = index.count_by_source_paths(&delete_paths)?;
     let files_pruned = missing_paths.len();
 
     let opencode_session_links = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
@@ -1338,6 +1429,10 @@ fn writer_loop(
         progress,
         tool_content_limits,
     } = ctx;
+    // Tantivy and SQLite cannot publish atomically. Invalidate the derived projection before
+    // opening its write transaction so any staging, commit, or cancellation failure forces a
+    // later backfill instead of leaving a partially trusted analytics cache.
+    AnalyticsStore::open(&analytics_path)?.mark_incomplete()?;
     let mut analytics = AnalyticsWriter::open(&analytics_path)?;
 
     let mut count = 0usize;
@@ -3035,6 +3130,9 @@ mod tests {
         assert_eq!(index.doc_count().expect("document count"), 1);
 
         fs::remove_file(&transcript).expect("remove transcript");
+        let _running_embedding =
+            IngestLease::acquire_embedding(&paths, "running backfill", Duration::from_secs(1))
+                .expect("acquire embedding lease");
         let report = {
             let lease = ingest_lease(&paths);
             ingest_all(&paths, &index, &options, &lease).expect("pruning ingest")
@@ -3080,7 +3178,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_prune_preserves_active_vectors_until_next_backfill() {
+    fn operator_prune_removes_vectors_and_invalidates_partial_backfill() {
         let temporary = tempfile::tempdir().expect("tempdir");
         let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
         {
@@ -3094,23 +3192,94 @@ mod tests {
             VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).expect("vectors");
         vectors.add(doc_id, &vec![0.0; 384]).expect("add vector");
         vectors.save().expect("save vectors");
+        crate::vector_backfill::seed_checkpoint_for_test(
+            &paths,
+            "bge",
+            384,
+            &[(doc_id, vec![0.1; 384])],
+        )
+        .expect("seed backfill checkpoint");
 
         fs::remove_file(&transcript).expect("remove transcript");
-        let preview = prune_missing_paths(&paths, &index, &options, false).expect("preview prune");
+        let prune_options = PruneOptions::from(&options);
+        // Preview is read-only and remains available while mutation leases are held elsewhere.
+        let held_ingest = ingest_lease(&paths);
+        let held_embedding =
+            IngestLease::acquire_embedding(&paths, "test embedding", Duration::from_secs(1))
+                .expect("acquire embedding lease");
+        let preview = preview_missing_paths(&paths, &index, &prune_options).expect("preview prune");
         assert_eq!(preview.records, 1);
         assert_eq!(preview.source_paths, vec![transcript.to_string_lossy()]);
         assert_eq!(index.doc_count().expect("document count"), 1);
         assert!(VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
+        assert!(crate::vector_backfill::status(&paths).unwrap().is_some());
+        drop(held_embedding);
+        drop(held_ingest);
 
-        let applied = prune_missing_paths(&paths, &index, &options, true).expect("apply prune");
+        let ingest_lease = ingest_lease(&paths);
+        let embedding_lease =
+            IngestLease::acquire_embedding(&paths, "test prune", Duration::from_secs(1))
+                .expect("acquire embedding lease");
+        let applied = prune_missing_paths(
+            &paths,
+            &index,
+            &prune_options,
+            &ingest_lease,
+            &embedding_lease,
+        )
+        .expect("apply prune");
         assert_eq!(applied, preview);
         assert_eq!(index.doc_count().expect("document count"), 0);
-        assert!(VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
+        assert!(!VectorIndex::open(&paths.vectors).unwrap().contains(doc_id));
+        assert!(crate::vector_backfill::status(&paths).unwrap().is_none());
         let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
         assert!(
             !state
                 .files
                 .contains_key(&transcript.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn prune_failure_marks_analytics_incomplete_before_cross_store_mutation() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+        {
+            let lease = ingest_lease(&paths);
+            ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+        }
+        let analytics_path = analytics_path(&paths.state);
+        let analytics = AnalyticsStore::open(&analytics_path).expect("analytics");
+        assert!(analytics.complete().expect("analytics complete"));
+
+        fs::create_dir_all(&paths.vectors).expect("create vectors dir");
+        fs::write(
+            paths.vectors.join("current.json"),
+            r#"{"version":1,"generation":"missing"}"#,
+        )
+        .expect("write corrupt vector pointer");
+        fs::remove_file(&transcript).expect("remove transcript");
+
+        let ingest_lease = ingest_lease(&paths);
+        let embedding_lease =
+            IngestLease::acquire_embedding(&paths, "test prune failure", Duration::from_secs(1))
+                .expect("acquire embedding lease");
+        let error = prune_missing_paths(
+            &paths,
+            &index,
+            &PruneOptions::from(&options),
+            &ingest_lease,
+            &embedding_lease,
+        )
+        .expect_err("corrupt vector store must stop prune");
+
+        assert!(error.to_string().contains("active vector generation"));
+        assert_eq!(index.doc_count().expect("document count"), 1);
+        assert!(
+            !AnalyticsStore::open(&analytics_path)
+                .expect("analytics after failure")
+                .complete()
+                .expect("analytics incomplete")
         );
     }
 

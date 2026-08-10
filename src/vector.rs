@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Component;
@@ -66,6 +66,24 @@ impl VectorIndex {
         }
         fs::create_dir_all(dir)?;
         Ok(())
+    }
+
+    pub fn remove_ids(dir: &Path, doc_ids: &HashSet<u64>) -> Result<usize> {
+        if doc_ids.is_empty() {
+            return Ok(0);
+        }
+        let Some(storage) = active_storage(dir)? else {
+            return Ok(0);
+        };
+        let mut index = Self::open_active_snapshot(dir, storage)?;
+        let mut removed = 0;
+        for doc_id in doc_ids {
+            removed += usize::from(index.remove(*doc_id)?);
+        }
+        if removed > 0 {
+            index.save()?;
+        }
+        Ok(removed)
     }
 
     pub fn open_or_create(dir: &Path, dimensions: usize, model: Option<&str>) -> Result<Self> {
@@ -229,6 +247,43 @@ impl VectorIndex {
 
         let results = self.index.search(embedding, limit)?;
         Ok(results.keys.into_iter().zip(results.distances).collect())
+    }
+
+    /// Search until `limit` accepted candidates are found or the vector inventory is exhausted.
+    /// The acceptance result is cached across progressively deeper searches so callers can filter
+    /// stale IDs without repeating lexical lookups.
+    pub fn search_filtered(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        mut accept: impl FnMut(u64) -> Result<bool>,
+    ) -> Result<Vec<(u64, f32)>> {
+        if limit == 0 || self.is_empty() {
+            return Ok(Vec::new());
+        }
+        let total = self.len();
+        let mut requested = limit.min(total).max(1);
+        let mut accepted = HashMap::<u64, bool>::new();
+        loop {
+            let candidates = self.search(embedding, requested)?;
+            for (doc_id, _) in &candidates {
+                if !accepted.contains_key(doc_id) {
+                    accepted.insert(*doc_id, accept(*doc_id)?);
+                }
+            }
+            let results = candidates
+                .into_iter()
+                .filter(|(doc_id, _)| accepted.get(doc_id).copied().unwrap_or(false))
+                .take(limit)
+                .collect::<Vec<_>>();
+            if results.len() >= limit || requested >= total {
+                return Ok(results);
+            }
+            requested = requested
+                .saturating_mul(2)
+                .max(requested.saturating_add(1))
+                .min(total);
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -793,6 +848,22 @@ mod tests {
     }
 
     #[test]
+    fn remove_ids_publishes_only_the_requested_deletions() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.add(2, &make_vector(4, 2.0)).unwrap();
+        idx.save().unwrap();
+
+        let removed = VectorIndex::remove_ids(tmp.path(), &HashSet::from([1, 3])).unwrap();
+
+        assert_eq!(removed, 1);
+        let reopened = VectorIndex::open(tmp.path()).unwrap();
+        assert!(!reopened.contains(1));
+        assert!(reopened.contains(2));
+    }
+
+    #[test]
     fn test_duplicate_add_ignored() {
         let tmp = TempDir::new().unwrap();
         let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
@@ -842,6 +913,42 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 1); // v1 should be first match
         assert!(results[0].1 < 0.01); // distance should be near zero
+    }
+
+    #[test]
+    fn filtered_search_deepens_past_stale_nearest_ids() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
+        let query = make_vector(64, 1.0);
+        idx.add(1, &query).unwrap();
+        idx.add(2, &make_vector(64, 2.0)).unwrap();
+        idx.add(3, &make_vector(64, 3.0)).unwrap();
+
+        let results = idx
+            .search_filtered(&query, 1, |doc_id| Ok(doc_id == 3))
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 3);
+    }
+
+    #[test]
+    fn filtered_search_stops_when_inventory_is_exhausted() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.add(2, &make_vector(4, 2.0)).unwrap();
+        let mut checked = HashSet::new();
+
+        let results = idx
+            .search_filtered(&make_vector(4, 1.0), 1, |doc_id| {
+                checked.insert(doc_id);
+                Ok(false)
+            })
+            .unwrap();
+
+        assert!(results.is_empty());
+        assert_eq!(checked, HashSet::from([1, 2]));
     }
 
     #[test]

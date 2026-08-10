@@ -201,6 +201,12 @@ impl AnalyticsStore {
         Ok(())
     }
 
+    pub fn mark_incomplete(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = 'analytics_complete'", [])?;
+        Ok(())
+    }
+
     pub fn clear(&self) -> Result<()> {
         self.conn.execute("DELETE FROM sessions", [])?;
         Ok(())

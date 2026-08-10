@@ -1283,8 +1283,18 @@ fn search_local(
             } else {
                 spec.limit
             };
-            for (doc_id, distance) in vector.search(&embedding, vector_limit)? {
-                if let Some(record) = index.get_by_doc_id(doc_id)?
+            let mut live_records = HashMap::new();
+            let semantic = vector.search_filtered(&embedding, vector_limit, |doc_id| {
+                let record = index.get_by_doc_id(doc_id)?;
+                if let Some(record) = record {
+                    live_records.insert(doc_id, record);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })?;
+            for (doc_id, distance) in semantic {
+                if let Some(record) = live_records.remove(&doc_id)
                     && matches_filters(&record, &options)
                 {
                     records.push((1.0 / (1.0 + distance), record));
@@ -1321,7 +1331,16 @@ fn search_local(
             } else {
                 candidate_limit
             };
-            let semantic = vector.search(&embedding, semantic_limit)?;
+            let mut live_semantic_records = HashMap::new();
+            let semantic = vector.search_filtered(&embedding, semantic_limit, |doc_id| {
+                let record = index.get_by_doc_id(doc_id)?;
+                if let Some(record) = record {
+                    live_semantic_records.insert(doc_id, record);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })?;
             let mut records = HashMap::new();
             let mut scores = HashMap::<u64, f32>::new();
             for (rank, (_, record)) in lexical.into_iter().enumerate() {
@@ -1331,7 +1350,7 @@ fn search_local(
                 }
             }
             for (rank, (doc_id, _)) in semantic.into_iter().enumerate() {
-                if let Some(record) = index.get_by_doc_id(doc_id)?
+                if let Some(record) = live_semantic_records.remove(&doc_id)
                     && matches_filters(&record, &options)
                 {
                     *scores.entry(doc_id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);

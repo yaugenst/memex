@@ -504,16 +504,25 @@ impl SearchIndex {
         writer.delete_term(term);
     }
 
-    pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
+    pub fn count_by_source_paths(&self, paths: &[String]) -> Result<usize> {
+        let Some(query) = self.source_paths_query(paths) else {
+            return Ok(0);
+        };
+        let reader = self.reader()?;
+        Ok(reader.searcher().search(query.as_ref(), &Count)?)
+    }
+
+    pub fn doc_ids_by_source_paths(&self, paths: &[String]) -> Result<Vec<u64>> {
+        let Some(query) = self.source_paths_query(paths) else {
+            return Ok(Vec::new());
+        };
         let reader = self.reader()?;
         let searcher = reader.searcher();
-        let term = Term::from_field_text(self.fields.source_path, path);
-        let query = TermQuery::new(term, IndexRecordOption::Basic);
-        let count = searcher.search(&query, &Count)?;
-        if count == 0 {
+        let limit = searcher.num_docs() as usize;
+        if limit == 0 {
             return Ok(Vec::new());
         }
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(count))?;
+        let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(limit))?;
         let mut doc_ids = Vec::with_capacity(top_docs.len());
         for (_score, address) in top_docs {
             let document = searcher.doc::<TantivyDocument>(address)?;
@@ -525,6 +534,30 @@ impl SearchIndex {
             }
         }
         Ok(doc_ids)
+    }
+
+    pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
+        self.doc_ids_by_source_paths(&[path.to_string()])
+    }
+
+    fn source_paths_query(&self, paths: &[String]) -> Option<Box<dyn Query>> {
+        let clauses = paths
+            .iter()
+            .map(|path| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.source_path, path),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect::<Vec<_>>();
+        match clauses.len() {
+            0 => None,
+            1 => clauses.into_iter().next().map(|(_, query)| query),
+            _ => Some(Box::new(BooleanQuery::new(clauses))),
+        }
     }
 
     pub fn add_record(&self, writer: &mut IndexWriter, record: &Record) -> Result<()> {
@@ -2035,5 +2068,4 @@ mod tests {
         fs::set_permissions(&generation, original_permissions).expect("restore permissions");
         assert_eq!(result.len(), 1);
     }
-
 }
