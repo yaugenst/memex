@@ -2951,16 +2951,19 @@ fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
     let Some(inventory) = VectorIndex::inventory(vectors_dir)? else {
         return Ok("vectors: none".to_string());
     };
-    let (index_bytes, ids_bytes) = VectorIndex::storage_sizes(vectors_dir)?.unwrap_or_default();
     let model = inventory.model.as_deref().unwrap_or("unknown");
+    let vector_count = inventory
+        .vector_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     Ok(format!(
-        "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, doc_ids.bin {})",
-        inventory.doc_ids.len(),
+        "vectors: {} (dims {}, model {}, sidecar IDs {}, usearch.index {}, doc_ids.bin {})",
+        vector_count,
         inventory.dimensions,
         model,
         inventory.doc_ids.len(),
-        index_bytes,
-        ids_bytes
+        inventory.index_bytes,
+        inventory.ids_bytes
     ))
 }
 
@@ -5285,7 +5288,7 @@ arguments = {
 
         let line = vector_stats_line(tmp.path()).unwrap();
 
-        assert!(line.starts_with("vectors: 1 (dims 64, model bge, ids 1,"));
+        assert!(line.starts_with("vectors: 1 (dims 64, model bge, sidecar IDs 1,"));
         assert!(line.contains("usearch.index"));
         assert!(line.contains("doc_ids.bin"));
         assert!(!line.contains("vectors.f32"));

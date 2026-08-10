@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,8 @@ struct VectorMetadata {
     model: Option<String>,
     index_file: String,
     ids_file: String,
+    #[serde(default)]
+    vector_count: Option<usize>,
 }
 
 pub struct VectorIndex {
@@ -41,10 +43,24 @@ pub struct VectorInventory {
     pub dimensions: usize,
     pub model: Option<String>,
     pub doc_ids: HashSet<u64>,
+    pub vector_count: Option<usize>,
+    pub index_bytes: u64,
+    pub ids_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveStorage {
+    path: PathBuf,
+    generation: Option<String>,
+}
+
+struct VectorStoreLock {
+    _file: fs::File,
 }
 
 impl VectorIndex {
     pub fn reset(dir: &Path) -> Result<()> {
+        let _write_lock = VectorStoreLock::acquire_exclusive(dir)?;
         if dir.exists() {
             fs::remove_dir_all(dir)?;
         }
@@ -55,8 +71,8 @@ impl VectorIndex {
     pub fn open_or_create(dir: &Path, dimensions: usize, model: Option<&str>) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let model = model.map(str::to_string);
-        if let Some(storage) = active_storage_dir(dir)? {
-            let existing = Self::load_from_storage(dir, &storage)?;
+        if let Some(storage) = active_storage(dir)? {
+            let existing = Self::open_active_snapshot(dir, storage)?;
             let model_matches = match model.as_deref() {
                 Some(model) => existing.model() == Some(model),
                 None => true,
@@ -70,39 +86,59 @@ impl VectorIndex {
     }
 
     pub fn open(dir: &Path) -> Result<Self> {
-        let storage = active_storage_dir(dir)?.ok_or_else(|| anyhow!("vector index not found"))?;
-        Self::load_active_snapshot(dir, storage)
+        let storage = active_storage(dir)?.ok_or_else(|| anyhow!("vector index not found"))?;
+        Self::open_active_snapshot(dir, storage)
     }
 
-    fn load_active_snapshot(root: &Path, storage: PathBuf) -> Result<Self> {
-        match Self::load_from_storage(root, &storage) {
-            Ok(index) => Ok(index),
-            Err(first_error) => {
-                // A publisher may swap current.json and collect the previous generation between
-                // our pointer read and opening its files. Retry only when the active generation
-                // actually changed so genuine corruption is still surfaced.
-                let refreshed = active_storage_dir(root)?;
-                if refreshed.as_ref().is_some_and(|path| path != &storage) {
-                    Self::load_from_storage(root, refreshed.as_ref().expect("checked above"))
-                } else {
-                    Err(first_error)
+    fn open_active_snapshot(root: &Path, storage: ActiveStorage) -> Result<Self> {
+        Self::open_active_snapshot_with(root, storage, &mut |_| {})
+    }
+
+    fn open_active_snapshot_with(
+        root: &Path,
+        mut storage: ActiveStorage,
+        after_index_open: &mut impl FnMut(&ActiveStorage),
+    ) -> Result<Self> {
+        loop {
+            match Self::open_from_storage(root, &storage, after_index_open) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(load_error) => {
+                    // Generation files are immutable. A missing file during load can therefore
+                    // only be recovered by restarting from a newly published generation. When
+                    // the pointer is unchanged, surface the corruption instead of hiding it.
+                    let refreshed = active_storage(root)?;
+                    if refreshed.as_ref().is_some_and(|active| active != &storage) {
+                        storage = refreshed.expect("checked above");
+                        continue;
+                    }
+                    if refreshed.is_none() {
+                        return Err(anyhow!("vector index not found"));
+                    }
+                    return Err(load_error);
                 }
             }
         }
     }
 
-    fn load_from_storage(root: &Path, storage: &Path) -> Result<Self> {
-        let index_path = storage.join("usearch.index");
-        let ids_path = storage.join("doc_ids.bin");
-        let meta_path = storage.join("meta.json");
+    fn open_from_storage(
+        root: &Path,
+        storage: &ActiveStorage,
+        after_index_open: &mut impl FnMut(&ActiveStorage),
+    ) -> Result<Self> {
+        let index_path = storage.path.join("usearch.index");
+        let ids_path = storage.path.join("doc_ids.bin");
         let index = Index::new(&IndexOptions::default())?;
-        index.load(path_str(&index_path)?)?;
-        let doc_id_set = if ids_path.exists() {
-            load_doc_ids(&ids_path)?
-        } else {
-            HashSet::new()
-        };
-        let model = load_metadata_if_exists(&meta_path)?.and_then(|meta| meta.model);
+        index
+            .load(path_str(&index_path)?)
+            .with_context(|| format!("load vector index {}", index_path.display()))?;
+        after_index_open(storage);
+
+        let ids_bytes = fs::read(&ids_path)
+            .with_context(|| format!("read vector ID sidecar {}", ids_path.display()))?;
+        let doc_id_set = decode_doc_ids(&ids_bytes, &ids_path)?;
+        let metadata = load_storage_metadata(storage)?;
+        validate_snapshot(&index, &doc_id_set, metadata.as_ref(), &storage.path)?;
+        let model = metadata.and_then(|meta| meta.model);
         Ok(Self {
             dims: index.dimensions(),
             model,
@@ -196,6 +232,10 @@ impl VectorIndex {
     }
 
     pub fn save(&self) -> Result<()> {
+        // Serialize the complete write with reset and other publishers. A reset must not remove a
+        // temporary generation while it is being written, and only the lock holder may finalize,
+        // publish, or collect generation directories.
+        let _write_lock = VectorStoreLock::acquire_exclusive(&self.root)?;
         fs::create_dir_all(&self.root)?;
         let generations = self.root.join(GENERATIONS_DIR);
         fs::create_dir_all(&generations)?;
@@ -218,6 +258,7 @@ impl VectorIndex {
                     model: self.model.clone(),
                     index_file: "usearch.index".to_string(),
                     ids_file: "doc_ids.bin".to_string(),
+                    vector_count: Some(self.index.size()),
                 },
             )?;
             sync_file(&index_path)?;
@@ -233,6 +274,8 @@ impl VectorIndex {
             };
             atomic_write_json(&self.root.join(CURRENT_GENERATION_FILE), &pointer)?;
             sync_directory(&self.root)?;
+            cleanup_inactive_generations(&self.root);
+            cleanup_legacy_files(&self.root);
             Ok(())
         })();
         if write_result.is_err() {
@@ -242,47 +285,56 @@ impl VectorIndex {
             // next successful save will collect it safely.
         }
         write_result?;
-        cleanup_inactive_generations(&self.root, &generation);
-        cleanup_legacy_files(&self.root);
         Ok(())
     }
 
     pub fn exists(dir: &Path) -> Result<bool> {
-        Ok(active_storage_dir(dir)?.is_some())
-    }
-
-    pub fn storage_sizes(dir: &Path) -> Result<Option<(u64, u64)>> {
-        let Some(storage) = active_storage_dir(dir)? else {
-            return Ok(None);
+        let Some(mut storage) = active_storage(dir)? else {
+            return Ok(false);
         };
-        let index_bytes = fs::metadata(storage.join("usearch.index"))?.len();
-        let ids_bytes = fs::metadata(storage.join("doc_ids.bin"))?.len();
-        Ok(Some((index_bytes, ids_bytes)))
+        loop {
+            let complete = storage.path.join("usearch.index").exists()
+                && storage.path.join("doc_ids.bin").exists()
+                && (storage.generation.is_none() || storage.path.join("meta.json").exists());
+            if complete {
+                return Ok(true);
+            }
+
+            let refreshed = active_storage(dir)?;
+            if refreshed.as_ref().is_some_and(|active| active != &storage) {
+                storage = refreshed.expect("checked above");
+                continue;
+            }
+            if refreshed.is_none() {
+                return Ok(false);
+            }
+            return Err(anyhow!(
+                "active vector generation is incomplete: {}",
+                storage.path.display()
+            ));
+        }
     }
 
     pub fn inventory(dir: &Path) -> Result<Option<VectorInventory>> {
-        let Some(storage) = active_storage_dir(dir)? else {
+        let Some(mut storage) = active_storage(dir)? else {
             return Ok(None);
         };
-        let metadata = load_metadata_if_exists(&storage.join("meta.json"))?;
-        let ids_path = storage.join("doc_ids.bin");
-        let doc_ids = if ids_path.exists() {
-            load_doc_ids(&ids_path)?
-        } else {
-            HashSet::new()
-        };
-        let (dimensions, model) = if let Some(metadata) = metadata {
-            (metadata.dimensions, metadata.model)
-        } else {
-            let index = Index::new(&IndexOptions::default())?;
-            index.load(path_str(&storage.join("usearch.index"))?)?;
-            (index.dimensions(), None)
-        };
-        Ok(Some(VectorInventory {
-            dimensions,
-            model,
-            doc_ids,
-        }))
+        loop {
+            match load_inventory(&storage) {
+                Ok(inventory) => return Ok(Some(inventory)),
+                Err(error) => {
+                    let refreshed = active_storage(dir)?;
+                    if refreshed.as_ref().is_some_and(|active| active != &storage) {
+                        storage = refreshed.expect("checked above");
+                        continue;
+                    }
+                    if refreshed.is_none() {
+                        return Ok(None);
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
 
     pub fn contains(&self, doc_id: u64) -> bool {
@@ -319,32 +371,39 @@ impl VectorIndex {
     }
 }
 
-fn active_storage_dir(root: &Path) -> Result<Option<PathBuf>> {
+fn active_storage(root: &Path) -> Result<Option<ActiveStorage>> {
     let pointer_path = root.join(CURRENT_GENERATION_FILE);
-    if pointer_path.exists() {
-        let pointer: VectorGenerationPointer = serde_json::from_slice(&fs::read(&pointer_path)?)
-            .with_context(|| {
+    match fs::read(&pointer_path) {
+        Ok(bytes) => {
+            let pointer: VectorGenerationPointer =
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!("read vector generation pointer {}", pointer_path.display())
+                })?;
+            if pointer.version != 1 || !is_safe_generation_name(&pointer.generation) {
+                return Err(anyhow!(
+                    "invalid vector generation pointer at {}",
+                    pointer_path.display()
+                ));
+            }
+            return Ok(Some(ActiveStorage {
+                path: root.join(GENERATIONS_DIR).join(&pointer.generation),
+                generation: Some(pointer.generation),
+            }));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
                 format!("read vector generation pointer {}", pointer_path.display())
-            })?;
-        if pointer.version != 1 || !is_safe_generation_name(&pointer.generation) {
-            return Err(anyhow!(
-                "invalid vector generation pointer at {}",
-                pointer_path.display()
-            ));
+            });
         }
-        let storage = root.join(GENERATIONS_DIR).join(&pointer.generation);
-        if !storage.join("usearch.index").exists() {
-            return Err(anyhow!(
-                "active vector generation is missing: {}",
-                storage.display()
-            ));
-        }
-        return Ok(Some(storage));
     }
 
     // Backward compatibility for pre-generation vector stores.
     if root.join("usearch.index").exists() {
-        Ok(Some(root.to_path_buf()))
+        Ok(Some(ActiveStorage {
+            path: root.to_path_buf(),
+            generation: None,
+        }))
     } else {
         Ok(None)
     }
@@ -391,14 +450,63 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_inactive_generations(root: &Path, active: &str) {
+impl VectorStoreLock {
+    fn open(root: &Path) -> Result<(fs::File, PathBuf)> {
+        let parent = root
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let root_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("vectors");
+        let path = parent.join(format!(".{root_name}.write.lock"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open vector publication lock {}", path.display()))?;
+        Ok((file, path))
+    }
+
+    fn acquire_exclusive(root: &Path) -> Result<Self> {
+        let (file, path) = Self::open(root)?;
+        file.lock()
+            .with_context(|| format!("acquire vector publication lock {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn cleanup_inactive_generations(root: &Path) {
+    // Do not trust the generation that the caller intended to publish. current.json is the sole
+    // authority, and the publication lock prevents another cooperating writer from changing it
+    // while collection runs.
+    let Ok(Some(ActiveStorage {
+        generation: Some(active),
+        ..
+    })) = active_storage(root)
+    else {
+        return;
+    };
     let generations = root.join(GENERATIONS_DIR);
     let Ok(entries) = fs::read_dir(generations) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if entry.file_name() != active {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // The complete save holds the publication lock, so dot-prefixed temporaries can only be
+        // crash leftovers. Unknown directories are left alone.
+        let finalized = name.starts_with("generation-");
+        let abandoned_temporary = name.starts_with(".generation-") && name.ends_with(".tmp");
+        if name != active && (finalized || abandoned_temporary) {
             let _ = fs::remove_dir_all(path);
         }
     }
@@ -429,14 +537,147 @@ fn save_metadata(path: &Path, metadata: &VectorMetadata) -> Result<()> {
     Ok(())
 }
 
-fn load_doc_ids(path: &Path) -> Result<HashSet<u64>> {
-    let bytes = fs::read(path)?;
-    let (chunks, _) = bytes.as_chunks::<8>();
-    let ids: Vec<u64> = chunks
-        .iter()
-        .map(|bytes| u64::from_le_bytes(*bytes))
-        .collect();
-    Ok(ids.into_iter().collect())
+fn load_storage_metadata(storage: &ActiveStorage) -> Result<Option<VectorMetadata>> {
+    let path = storage.path.join("meta.json");
+    let metadata = if storage.generation.is_some() {
+        Some(
+            load_metadata(&path)
+                .with_context(|| format!("read vector metadata sidecar {}", path.display()))?,
+        )
+    } else {
+        load_metadata_if_exists(&path)?
+    };
+    if let Some(metadata) = metadata.as_ref() {
+        validate_metadata_layout(metadata, &storage.path)?;
+    }
+    Ok(metadata)
+}
+
+fn load_inventory(storage: &ActiveStorage) -> Result<VectorInventory> {
+    let index_path = storage.path.join("usearch.index");
+    let ids_path = storage.path.join("doc_ids.bin");
+    let index_bytes = fs::metadata(&index_path)
+        .with_context(|| format!("read vector index metadata {}", index_path.display()))?
+        .len();
+    let ids_bytes = fs::read(&ids_path)
+        .with_context(|| format!("read vector ID sidecar {}", ids_path.display()))?;
+    let ids_len = ids_bytes.len() as u64;
+    let doc_ids = decode_doc_ids(&ids_bytes, &ids_path)?;
+    let metadata = load_storage_metadata(storage)?;
+
+    if let Some(metadata) = metadata {
+        if let Some(vector_count) = metadata.vector_count
+            && vector_count != doc_ids.len()
+        {
+            return Err(anyhow!(
+                "vector sidecar cardinality mismatch in {}: doc_ids.bin has {} IDs, metadata records {} vectors",
+                storage.path.display(),
+                doc_ids.len(),
+                vector_count
+            ));
+        }
+        return Ok(VectorInventory {
+            dimensions: metadata.dimensions,
+            model: metadata.model,
+            doc_ids,
+            vector_count: metadata.vector_count,
+            index_bytes,
+            ids_bytes: ids_len,
+        });
+    }
+
+    // Pre-metadata legacy stores are rare but remain readable. Inspect the index once so callers
+    // still receive dimensions and a validated count; the next save migrates to a generation.
+    let index = Index::new(&IndexOptions::default())?;
+    index
+        .load(path_str(&index_path)?)
+        .with_context(|| format!("load legacy vector index {}", index_path.display()))?;
+    validate_snapshot(&index, &doc_ids, None, &storage.path)?;
+    Ok(VectorInventory {
+        dimensions: index.dimensions(),
+        model: None,
+        doc_ids,
+        vector_count: Some(index.size()),
+        index_bytes,
+        ids_bytes: ids_len,
+    })
+}
+
+fn decode_doc_ids(bytes: &[u8], path: &Path) -> Result<HashSet<u64>> {
+    if !bytes.len().is_multiple_of(8) {
+        return Err(anyhow!(
+            "invalid vector ID sidecar {}: {} bytes is not a multiple of 8",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    let mut ids = HashSet::with_capacity(bytes.len() / 8);
+    for chunk in bytes.chunks_exact(8) {
+        let id = u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk"));
+        if !ids.insert(id) {
+            return Err(anyhow!(
+                "invalid vector ID sidecar {}: duplicate document ID {id}",
+                path.display()
+            ));
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_snapshot(
+    index: &Index,
+    doc_ids: &HashSet<u64>,
+    metadata: Option<&VectorMetadata>,
+    storage: &Path,
+) -> Result<()> {
+    if let Some(metadata) = metadata {
+        validate_metadata_layout(metadata, storage)?;
+        if metadata.dimensions != index.dimensions() {
+            return Err(anyhow!(
+                "vector metadata dimension mismatch in {}: metadata has {}, index has {}",
+                storage.join("meta.json").display(),
+                metadata.dimensions,
+                index.dimensions()
+            ));
+        }
+        if let Some(recorded_count) = metadata.vector_count
+            && recorded_count != index.size()
+        {
+            return Err(anyhow!(
+                "vector metadata count mismatch in {}: metadata records {}, index has {}",
+                storage.join("meta.json").display(),
+                recorded_count,
+                index.size()
+            ));
+        }
+    }
+
+    let vector_count = index.size();
+    if doc_ids.len() != vector_count {
+        return Err(anyhow!(
+            "vector sidecar cardinality mismatch in {}: doc_ids.bin has {} IDs, usearch.index has {} vectors",
+            storage.display(),
+            doc_ids.len(),
+            vector_count
+        ));
+    }
+    if let Some(missing) = doc_ids.iter().find(|doc_id| !index.contains(**doc_id)) {
+        return Err(anyhow!(
+            "vector sidecar identity mismatch in {}: document ID {missing} is absent from usearch.index",
+            storage.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_metadata_layout(metadata: &VectorMetadata, storage: &Path) -> Result<()> {
+    if metadata.index_file != "usearch.index" || metadata.ids_file != "doc_ids.bin" {
+        return Err(anyhow!(
+            "invalid vector metadata {}: expected usearch.index and doc_ids.bin",
+            storage.join("meta.json").display()
+        ));
+    }
+    Ok(())
 }
 
 fn save_doc_ids(path: &Path, ids: &HashSet<u64>) -> Result<()> {
@@ -460,24 +701,67 @@ mod tests {
     }
 
     fn active_dir(root: &Path) -> PathBuf {
-        active_storage_dir(root).unwrap().unwrap()
+        active_storage(root).unwrap().unwrap().path
     }
 
     #[test]
-    fn reader_retries_when_generation_changes_before_files_open() {
+    fn reader_restarts_snapshot_when_generation_changes_after_index_load() {
         let tmp = TempDir::new().unwrap();
         let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
         idx.add(1, &make_vector(4, 1.0)).unwrap();
         idx.save().unwrap();
-        let stale_storage = active_dir(tmp.path());
+        let stale_storage = active_storage(tmp.path()).unwrap().unwrap();
+        let stale_path = stale_storage.path.clone();
+        let expected_storage = stale_storage.clone();
+        let mut generation_changed = false;
+        let mut publish_after_index_open = |storage: &ActiveStorage| {
+            if generation_changed {
+                return;
+            }
+            assert_eq!(storage, &expected_storage);
+            idx.add(2, &make_vector(4, 2.0)).unwrap();
+            idx.save().unwrap();
+            generation_changed = true;
+        };
 
-        idx.add(2, &make_vector(4, 2.0)).unwrap();
-        idx.save().unwrap();
-        assert!(!stale_storage.exists());
+        let reopened = VectorIndex::open_active_snapshot_with(
+            tmp.path(),
+            stale_storage,
+            &mut publish_after_index_open,
+        )
+        .unwrap();
 
-        let reopened = VectorIndex::load_active_snapshot(tmp.path(), stale_storage).unwrap();
+        assert!(generation_changed);
+        assert!(!stale_path.exists());
         assert!(reopened.contains(1));
         assert!(reopened.contains(2));
+    }
+
+    #[test]
+    fn reader_reports_not_found_when_reset_removes_loaded_generation() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        let storage = active_storage(tmp.path()).unwrap().unwrap();
+        let mut reset = false;
+        let mut reset_after_index_open = |_: &ActiveStorage| {
+            if !reset {
+                VectorIndex::reset(tmp.path()).unwrap();
+                reset = true;
+            }
+        };
+
+        let error = VectorIndex::open_active_snapshot_with(
+            tmp.path(),
+            storage,
+            &mut reset_after_index_open,
+        )
+        .err()
+        .expect("reset should remove snapshot");
+
+        assert!(reset);
+        assert_eq!(error.to_string(), "vector index not found");
     }
 
     #[test]
@@ -609,6 +893,7 @@ mod tests {
         assert_eq!(metadata["model"], "bge");
         assert_eq!(metadata["index_file"], "usearch.index");
         assert_eq!(metadata["ids_file"], "doc_ids.bin");
+        assert_eq!(metadata["vector_count"], 1);
     }
 
     #[test]
@@ -674,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_model_metadata_resets_when_model_specified() {
+    fn missing_generation_metadata_is_rejected() {
         let tmp = TempDir::new().unwrap();
 
         {
@@ -686,12 +971,11 @@ mod tests {
 
         fs::remove_file(active_dir(tmp.path()).join("meta.json")).unwrap();
 
-        {
-            let idx = VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).unwrap();
-            assert!(!idx.contains(1));
-            assert_eq!(idx.model(), Some("alpha"));
-            assert!(idx.needs_backfill());
-        }
+        let error = VectorIndex::open(tmp.path())
+            .err()
+            .expect("missing metadata");
+        assert!(format!("{error:#}").contains("read vector metadata sidecar"));
+        assert!(VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).is_err());
     }
 
     #[test]
@@ -708,6 +992,124 @@ mod tests {
 
         assert!(VectorIndex::open(tmp.path()).is_err());
         assert!(VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).is_err());
+    }
+
+    #[test]
+    fn missing_generation_id_sidecar_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        fs::remove_file(active_dir(tmp.path()).join("doc_ids.bin")).unwrap();
+
+        let error = VectorIndex::open(tmp.path()).err().expect("missing IDs");
+
+        assert!(format!("{error:#}").contains("read vector ID sidecar"));
+    }
+
+    #[test]
+    fn truncated_id_sidecar_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        fs::write(active_dir(tmp.path()).join("doc_ids.bin"), [0; 9]).unwrap();
+
+        let error = VectorIndex::open(tmp.path()).err().expect("truncated IDs");
+
+        assert!(format!("{error:#}").contains("not a multiple of 8"));
+    }
+
+    #[test]
+    fn duplicate_ids_in_sidecar_are_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+
+        let error = decode_doc_ids(&bytes, Path::new("doc_ids.bin")).expect_err("duplicate IDs");
+
+        assert!(format!("{error:#}").contains("duplicate document ID 1"));
+    }
+
+    #[test]
+    fn id_sidecar_cardinality_must_match_usearch() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.add(2, &make_vector(4, 2.0)).unwrap();
+        idx.save().unwrap();
+        fs::write(
+            active_dir(tmp.path()).join("doc_ids.bin"),
+            1_u64.to_le_bytes(),
+        )
+        .unwrap();
+
+        let inventory_error =
+            VectorIndex::inventory(tmp.path()).expect_err("manifest cardinality mismatch");
+        let error = VectorIndex::open(tmp.path())
+            .err()
+            .expect("cardinality mismatch");
+
+        assert!(
+            format!("{inventory_error:#}")
+                .contains("doc_ids.bin has 1 IDs, metadata records 2 vectors")
+        );
+        assert!(format!("{error:#}").contains("doc_ids.bin has 1 IDs, usearch.index has 2"));
+    }
+
+    #[test]
+    fn id_sidecar_identity_must_match_usearch() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        fs::write(
+            active_dir(tmp.path()).join("doc_ids.bin"),
+            99_u64.to_le_bytes(),
+        )
+        .unwrap();
+
+        let error = VectorIndex::open(tmp.path())
+            .err()
+            .expect("identity mismatch");
+
+        assert!(format!("{error:#}").contains("document ID 99 is absent"));
+    }
+
+    #[test]
+    fn metadata_dimensions_must_match_usearch() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        let metadata_path = active_dir(tmp.path()).join("meta.json");
+        let mut metadata = load_metadata(&metadata_path).unwrap();
+        metadata.dimensions = 8;
+        save_metadata(&metadata_path, &metadata).unwrap();
+
+        let error = VectorIndex::open(tmp.path())
+            .err()
+            .expect("dimension mismatch");
+
+        assert!(format!("{error:#}").contains("metadata has 8, index has 4"));
+    }
+
+    #[test]
+    fn inventory_marks_pre_manifest_generation_count_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        let metadata_path = active_dir(tmp.path()).join("meta.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata.as_object_mut().unwrap().remove("vector_count");
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let inventory = VectorIndex::inventory(tmp.path()).unwrap().unwrap();
+
+        assert_eq!(inventory.vector_count, None);
+        assert_eq!(inventory.doc_ids, HashSet::from([1]));
     }
 
     #[test]
@@ -761,6 +1163,35 @@ mod tests {
         assert_eq!(
             fs::read_dir(tmp.path().join(GENERATIONS_DIR))
                 .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_abandoned_temporary_generation() {
+        let tmp = TempDir::new().unwrap();
+        let generations = tmp.path().join(GENERATIONS_DIR);
+        fs::create_dir_all(&generations).unwrap();
+        let in_progress = generations.join(".generation-other.tmp");
+        fs::create_dir(&in_progress).unwrap();
+        fs::write(in_progress.join("usearch.index"), b"still being written").unwrap();
+
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+
+        assert!(!in_progress.exists());
+        assert_eq!(
+            fs::read_dir(&generations)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("generation-"))
+                })
                 .count(),
             1
         );
