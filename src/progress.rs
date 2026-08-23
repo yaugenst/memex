@@ -12,21 +12,13 @@ pub struct Progress {
     headers: Vec<ProgressBar>,
     parse: Vec<ProgressBar>,
     index: Vec<ProgressBar>,
-    embed: Vec<ProgressBar>,
     files_total: [u64; SOURCE_COUNT],
     files_done: [AtomicU64; SOURCE_COUNT],
     produced: [AtomicU64; SOURCE_COUNT],
-    embed_total: [AtomicU64; SOURCE_COUNT],
-    embed_pending: [AtomicU64; SOURCE_COUNT],
-    embeddings_enabled: bool,
 }
 
 impl Progress {
-    pub fn new(
-        _totals_bytes: [u64; SOURCE_COUNT],
-        files_total: [u64; SOURCE_COUNT],
-        embeddings: bool,
-    ) -> Self {
+    pub fn new(files_total: [u64; SOURCE_COUNT]) -> Self {
         let multi = MultiProgress::new();
         let header_style = ProgressStyle::with_template("{msg}").unwrap();
         let spinner_style = ProgressStyle::with_template("  {spinner:.cyan} {msg}")
@@ -36,7 +28,6 @@ impl Progress {
         let mut headers = Vec::with_capacity(SOURCE_COUNT);
         let mut parse = Vec::with_capacity(SOURCE_COUNT);
         let mut index = Vec::with_capacity(SOURCE_COUNT);
-        let mut embed = Vec::with_capacity(SOURCE_COUNT);
 
         for source in SOURCES {
             let idx = source.idx();
@@ -57,17 +48,6 @@ impl Progress {
             index_bar.set_message("indexed 0 rec");
             index_bar.enable_steady_tick(Duration::from_millis(80));
             index.push(index_bar);
-
-            let embed_bar = if embeddings {
-                let bar = multi.add(ProgressBar::new_spinner());
-                bar.set_style(spinner_style.clone());
-                bar.set_message("embedded 0");
-                bar.enable_steady_tick(Duration::from_millis(80));
-                bar
-            } else {
-                ProgressBar::hidden()
-            };
-            embed.push(embed_bar);
         }
 
         Self {
@@ -75,13 +55,9 @@ impl Progress {
             headers,
             parse,
             index,
-            embed,
             files_total,
             files_done: std::array::from_fn(|_| AtomicU64::new(0)),
             produced: std::array::from_fn(|_| AtomicU64::new(0)),
-            embed_total: std::array::from_fn(|_| AtomicU64::new(0)),
-            embed_pending: std::array::from_fn(|_| AtomicU64::new(0)),
-            embeddings_enabled: embeddings,
         }
     }
 
@@ -129,79 +105,6 @@ impl Progress {
         }
     }
 
-    pub fn add_embed_total(&self, source: SourceKind, count: u64) {
-        self.embed_total[source.idx()].fetch_add(count, Ordering::Relaxed);
-        self.update_embed_message(source);
-    }
-
-    pub fn add_embed_pending(&self, source: SourceKind, count: u64) {
-        self.embed_pending[source.idx()].fetch_add(count, Ordering::Relaxed);
-        self.update_embed_message(source);
-    }
-
-    #[allow(dead_code)]
-    pub fn sub_embed_pending(&self, source: SourceKind, count: u64) {
-        self.embed_pending[source.idx()].fetch_sub(count, Ordering::Relaxed);
-        self.update_embed_message(source);
-    }
-
-    fn update_embed_message(&self, source: SourceKind) {
-        if !self.embeddings_enabled {
-            return;
-        }
-        let idx = source.idx();
-        let embedded = self.embed[idx].position();
-        let total = self.embed_total[idx].load(Ordering::Relaxed);
-        let pending = self.embed_pending[idx].load(Ordering::Relaxed);
-        let msg = if total > 0 {
-            if pending > 0 {
-                format!(
-                    "embedded {} / {} ({} queued)",
-                    format_count(embedded),
-                    format_count(total),
-                    format_count(pending)
-                )
-            } else {
-                format!(
-                    "embedded {} / {}",
-                    format_count(embedded),
-                    format_count(total)
-                )
-            }
-        } else {
-            format!("embedded {}", format_count(embedded))
-        };
-        self.embed[idx].set_message(msg);
-    }
-
-    pub fn add_embedded(&self, source: SourceKind, count: u64) {
-        let idx = source.idx();
-        self.embed[idx].inc(count);
-        let embedded = self.embed[idx].position();
-        let total = self.embed_total[idx].load(Ordering::Relaxed);
-        let pending = self.embed_pending[idx].load(Ordering::Relaxed);
-        let indexed = self.index[idx].position();
-        let produced = self.produced[idx].load(Ordering::Relaxed);
-        if indexed >= produced && pending == 0 && embedded >= total && total > 0 {
-            self.embed[idx]
-                .finish_with_message(format!("embedded {} done", format_count(embedded)));
-            return;
-        }
-        self.update_embed_message(source);
-    }
-
-    pub fn set_embed_ready(&self) {
-        if !self.embeddings_enabled {
-            return;
-        }
-        for source in SOURCES {
-            let idx = source.idx();
-            if self.embed_total[idx].load(Ordering::Relaxed) == 0 {
-                self.embed[idx].set_message("embedded 0 ready");
-            }
-        }
-    }
-
     pub fn finish(&self) {
         for source in SOURCES {
             let idx = source.idx();
@@ -224,13 +127,6 @@ impl Progress {
                     .finish_with_message(format!("indexed {} rec", format_count(indexed)));
             } else {
                 self.index[idx].finish_and_clear();
-            }
-
-            let embedded = self.embed[idx].position();
-            if self.embeddings_enabled && embedded > 0 {
-                self.embed[idx].finish_with_message(format!("embedded {}", format_count(embedded)));
-            } else {
-                self.embed[idx].finish_and_clear();
             }
         }
     }

@@ -809,8 +809,10 @@ mod tests {
     fn invalid_direct_metric_grades_do_not_produce_nan() {
         let first = located("local", SourceKind::Codex, "s", "s.jsonl", 1, 1.0, 1);
         let invalid = relevance(&first, f32::INFINITY);
-        assert_eq!(recall_at_k(&[first.clone()], &[invalid.clone()], 1), 0.0);
-        assert_eq!(ndcg_at_k(&[first], &[invalid], 1), 0.0);
+        let records = [first];
+        let grades = [invalid];
+        assert_eq!(recall_at_k(&records, &grades, 1), 0.0);
+        assert_eq!(ndcg_at_k(&records, &grades, 1), 0.0);
     }
 
     #[test]

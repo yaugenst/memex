@@ -557,10 +557,6 @@ impl SearchIndex {
         Ok(doc_ids)
     }
 
-    pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
-        self.doc_ids_by_source_paths(&[path.to_string()])
-    }
-
     fn source_paths_query(&self, paths: &[String]) -> Option<Box<dyn Query>> {
         let clauses = paths
             .iter()

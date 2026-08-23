@@ -243,11 +243,8 @@ EXAMPLES:
     Prune {
         #[command(flatten)]
         prune: PruneArgs,
-        /// Explicitly request preview mode (also the default)
-        #[arg(long, conflicts_with = "apply")]
-        dry_run: bool,
         /// Apply deletions and invalidate any partial embedding backfill
-        #[arg(long, conflicts_with = "dry_run")]
+        #[arg(long)]
         apply: bool,
     },
     /// Search indexed conversation history
@@ -908,11 +905,7 @@ pub fn run() -> Result<()> {
         Commands::Embed { model, root } => {
             run_embed(model, root)?;
         }
-        Commands::Prune {
-            prune,
-            dry_run: _,
-            apply,
-        } => {
+        Commands::Prune { prune, apply } => {
             run_prune(prune, apply)?;
         }
         Commands::Search {
@@ -1329,7 +1322,7 @@ fn run_index_cycle(
         };
         vector_work.verify = false;
         if should_spawn {
-            worker.start(spawn_embedding_process(index, spec)?);
+            worker.start(spawn_embedding_process(index.root.as_deref(), spec)?);
             // The observed lexical revision is now the worker's input baseline. Any later commit
             // flips pending back to true while this child continues in isolation.
             vector_work.pending = false;
@@ -1437,21 +1430,21 @@ impl<P: ChildProcess> Drop for EmbeddingWorker<P> {
     }
 }
 
-fn spawn_embedding_process(index: &IndexArgs, spec: &EmbedWorkerSpec) -> Result<SystemChild> {
+fn spawn_embedding_process(root: Option<&Path>, spec: &EmbedWorkerSpec) -> Result<SystemChild> {
     Ok(SystemChild(
         Command::new(std::env::current_exe()?)
-            .args(build_embed_command_args(index, spec.model))
+            .args(build_embed_command_args(root, spec.model))
             .spawn()?,
     ))
 }
 
-fn build_embed_command_args(index: &IndexArgs, model: ModelChoice) -> Vec<String> {
+fn build_embed_command_args(root: Option<&Path>, model: ModelChoice) -> Vec<String> {
     let mut args = vec![
         "embed".to_string(),
         "--model".to_string(),
         model.as_str().to_string(),
     ];
-    if let Some(root) = &index.root {
+    if let Some(root) = root {
         args.push("--root".to_string());
         args.push(root.to_string_lossy().to_string());
     }
@@ -1658,19 +1651,12 @@ fn run_prune(args: PruneArgs, apply: bool) -> Result<()> {
         return Ok(());
     }
 
-    if apply {
-        println!(
-            "pruned {} records from {} missing paths:",
-            report.records,
-            report.source_paths.len()
-        );
-    } else {
-        println!(
-            "would prune {} records from {} missing paths:",
-            report.records,
-            report.source_paths.len()
-        );
-    }
+    let action = if apply { "pruned" } else { "would prune" };
+    println!(
+        "{action} {} records from {} missing paths:",
+        report.records,
+        report.source_paths.len()
+    );
     for source_path in report.source_paths {
         println!("  {source_path}");
     }
@@ -5280,34 +5266,8 @@ mod tests {
 
     #[test]
     fn embedding_worker_only_receives_model_and_root() {
-        let index = IndexArgs {
-            source: Some(PathBuf::from("/ignored/source")),
-            include_agents: true,
-            include_reasoning: true,
-            exclude: vec!["/ignored/**".to_string()],
-            codex: false,
-            opencode: false,
-            cursor: false,
-            pi: false,
-            omp: false,
-            openclaw: false,
-            copilot: false,
-            no_codex: true,
-            no_opencode: true,
-            no_pi: true,
-            no_omp: true,
-            no_openclaw: true,
-            no_copilot: true,
-            embeddings: true,
-            no_embeddings: false,
-            model: Some("bge".to_string()),
-            root: Some(PathBuf::from("/tmp/memex")),
-            diagnostics: true,
-            no_prune: true,
-        };
-
         assert_eq!(
-            build_embed_command_args(&index, ModelChoice::BGESmall),
+            build_embed_command_args(Some(Path::new("/tmp/memex")), ModelChoice::BGESmall),
             ["embed", "--model", "bge", "--root", "/tmp/memex"]
         );
     }
@@ -5342,30 +5302,9 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
         paths.ensure_dirs().unwrap();
-        let index = IndexArgs {
-            source: None,
-            include_agents: false,
-            include_reasoning: false,
-            exclude: Vec::new(),
-            codex: true,
-            opencode: true,
-            cursor: true,
-            pi: true,
-            omp: true,
-            openclaw: true,
-            copilot: true,
-            no_codex: false,
-            no_opencode: false,
-            no_pi: false,
-            no_omp: false,
-            no_openclaw: false,
-            no_copilot: false,
-            embeddings: false,
-            no_embeddings: false,
-            model: None,
-            root: Some(paths.root.clone()),
-            diagnostics: false,
-            no_prune: false,
+        let cli = Cli::try_parse_from(["memex", "index"]).unwrap();
+        let Some(Commands::Index { index, .. }) = cli.command else {
+            panic!("expected index command");
         };
 
         std::fs::write(paths.root.join("config.toml"), "embeddings = false\n").unwrap();
@@ -5649,27 +5588,14 @@ arguments = {
 
     #[test]
     fn prune_defaults_to_preview_and_accepts_source_filters() {
-        let cli =
-            Cli::try_parse_from(["memex", "prune", "--dry-run", "--no-codex", "--no-opencode"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["memex", "prune", "--no-codex", "--no-opencode"]).unwrap();
 
-        let Some(Commands::Prune {
-            prune,
-            dry_run,
-            apply,
-        }) = cli.command
-        else {
+        let Some(Commands::Prune { prune, apply }) = cli.command else {
             panic!("expected prune command");
         };
-        assert!(dry_run);
         assert!(!apply);
         assert!(prune.no_codex);
         assert!(prune.no_opencode);
-    }
-
-    #[test]
-    fn prune_rejects_dry_run_with_apply() {
-        assert!(Cli::try_parse_from(["memex", "prune", "--dry-run", "--apply"]).is_err());
     }
 
     #[test]

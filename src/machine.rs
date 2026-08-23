@@ -1851,24 +1851,6 @@ mod tests {
     use crate::types::{RecordLinks, SourceKind};
     use tempfile::TempDir;
 
-    fn vector_test_record(doc_id: u64, project: &str) -> Record {
-        Record {
-            source: SourceKind::Claude,
-            doc_id,
-            ts: 1_000,
-            project: project.to_string(),
-            session_id: "session-a".to_string(),
-            turn_id: doc_id as u32,
-            role: "assistant".to_string(),
-            text: format!("record {doc_id}"),
-            tool_name: Some("Read".to_string()),
-            tool_input: None,
-            tool_output: None,
-            links: RecordLinks::default(),
-            source_path: format!("/tmp/{doc_id}.jsonl"),
-        }
-    }
-
     fn machine(id: &str) -> MachineConfig {
         MachineConfig {
             id: id.to_string(),
@@ -2227,10 +2209,9 @@ mod tests {
         std::fs::create_dir(&index_path).unwrap();
         let index = SearchIndex::open_or_create_for_ingest(&index_path).unwrap();
         let mut writer = index.writer().unwrap();
-        for record in [
-            vector_test_record(2, "filtered"),
-            vector_test_record(3, "wanted"),
-        ] {
+        let mut filtered = test_record(2, "session", "source.jsonl", 2);
+        filtered.project = "filtered".to_string();
+        for record in [filtered, test_record(3, "session", "source.jsonl", 3)] {
             index.add_record(&mut writer, &record).unwrap();
         }
         writer.commit().unwrap();
@@ -2252,22 +2233,10 @@ mod tests {
             [1, 2]
         );
 
-        let options = QueryOptions {
-            query: "record".to_string(),
-            project: Some("wanted".to_string()),
-            role: Some("assistant".to_string()),
-            tool: Some("Read".to_string()),
-            session_id: Some("session-a".to_string()),
-            session_scope: Some(vec![SessionScopeKey {
-                source: SourceKind::Claude,
-                session_id: "session-a".to_string(),
-                source_path: "/tmp/3.jsonl".to_string(),
-            }]),
-            source: Some(SourceFilter::Claude),
-            since: Some(999),
-            until: Some(1_001),
-            limit: 1,
-        };
+        let mut spec = search_spec(SearchMode::Semantic);
+        spec.project = Some("memex".to_string());
+        spec.limit = 1;
+        let options = spec.query_options();
         let results = search_filtered_records(&vector, &index, &query, 1, &options).unwrap();
 
         assert_eq!(results.len(), 1);

@@ -20,7 +20,6 @@ const BACKFILL_DB: &str = "embed-backfill.sqlite3";
 #[derive(Debug, Clone)]
 pub struct BackfillStatus {
     pub model: String,
-    pub dimensions: usize,
     pub total: u64,
     pub completed: u64,
     pub checkpointed: u64,
@@ -83,7 +82,6 @@ struct BackfillMeta {
     dimensions: usize,
     total: u64,
     base_completed: u64,
-    started_at_ms: u64,
     active_ms: u64,
     updated_at_ms: u64,
     phase: String,
@@ -92,7 +90,6 @@ struct BackfillMeta {
 
 struct BackfillStore {
     connection: Connection,
-    path: PathBuf,
     run_started: Instant,
     run_active_base_ms: u64,
 }
@@ -125,7 +122,6 @@ impl BackfillStore {
         )?;
         Ok(Self {
             connection,
-            path,
             run_started: Instant::now(),
             run_active_base_ms: 0,
         })
@@ -148,10 +144,6 @@ impl BackfillStore {
             self.connection.execute("DELETE FROM backfill_meta", [])?;
         }
         let previous = self.meta()?;
-        let started_at_ms = previous
-            .as_ref()
-            .map(|meta| meta.started_at_ms)
-            .unwrap_or_else(now_ms);
         self.run_active_base_ms = previous.as_ref().map(|meta| meta.active_ms).unwrap_or(0);
         self.run_started = Instant::now();
         self.connection.execute(
@@ -172,7 +164,7 @@ impl BackfillStore {
                 dimensions as i64,
                 total as i64,
                 base_completed as i64,
-                started_at_ms as i64,
+                now_ms() as i64,
                 self.run_active_base_ms as i64,
                 now_ms() as i64,
                 std::process::id() as i64,
@@ -319,8 +311,8 @@ impl BackfillStore {
     fn meta(&self) -> Result<Option<BackfillMeta>> {
         self.connection
             .query_row(
-                "SELECT model, dimensions, total, base_completed, started_at_ms,
-                        active_ms, updated_at_ms, phase, pid
+                "SELECT model, dimensions, total, base_completed, active_ms,
+                        updated_at_ms, phase, pid
                  FROM backfill_meta WHERE id = 1",
                 [],
                 |row| {
@@ -329,11 +321,10 @@ impl BackfillStore {
                         dimensions: row.get::<_, i64>(1)? as usize,
                         total: row.get::<_, i64>(2)? as u64,
                         base_completed: row.get::<_, i64>(3)? as u64,
-                        started_at_ms: row.get::<_, i64>(4)? as u64,
-                        active_ms: row.get::<_, i64>(5)? as u64,
-                        updated_at_ms: row.get::<_, i64>(6)? as u64,
-                        phase: row.get(7)?,
-                        pid: row.get::<_, i64>(8)? as u32,
+                        active_ms: row.get::<_, i64>(4)? as u64,
+                        updated_at_ms: row.get::<_, i64>(5)? as u64,
+                        phase: row.get(6)?,
+                        pid: row.get::<_, i64>(7)? as u32,
                     })
                 },
             )
@@ -352,7 +343,6 @@ impl BackfillStore {
                 })? as u64;
         Ok(Some(BackfillStatus {
             model: meta.model,
-            dimensions: meta.dimensions,
             total: meta.total,
             completed: meta.base_completed.saturating_add(checkpointed),
             checkpointed,
@@ -362,12 +352,6 @@ impl BackfillStore {
             pid: meta.pid,
             running: true,
         }))
-    }
-
-    fn clear(self) -> Result<()> {
-        let path = self.path.clone();
-        drop(self.connection);
-        remove_sqlite_files(&path)
     }
 }
 
@@ -458,9 +442,7 @@ pub(crate) fn prune_deleted(
 ) -> Result<usize> {
     let removed = VectorIndex::remove_ids(&paths.vectors, doc_ids)?;
     let checkpoint = backfill_path(paths);
-    if checkpoint.exists() {
-        remove_sqlite_files(&checkpoint)?;
-    }
+    remove_sqlite_files(&checkpoint)?;
     Ok(removed)
 }
 
@@ -505,9 +487,7 @@ pub(crate) fn run_with_lease(
     let live_ids = live_embeddable_ids(index)?;
     let base_completed = live_ids.intersection(&active_ids).count() as u64;
     if active_compatible && active_ids == live_ids {
-        if backfill_path(paths).exists() {
-            remove_sqlite_files(&backfill_path(paths))?;
-        }
+        remove_sqlite_files(&backfill_path(paths))?;
         return Ok(BackfillReport {
             total: live_ids.len(),
             ..BackfillReport::default()
@@ -556,9 +536,6 @@ pub(crate) fn run_with_lease(
             return Ok(());
         }
         let text = truncate_for_embedding(record.text);
-        if text.is_empty() {
-            return Ok(());
-        }
         batch.push((record.doc_id, text));
         if batch.len() >= BATCH_SIZE {
             let pending = batch.len();
@@ -622,7 +599,8 @@ pub(crate) fn run_with_lease(
     if let Some(progress) = progress {
         progress.finish_with_message(format!("vector backfill {} complete", live_ids.len()));
     }
-    store.clear()?;
+    drop(store);
+    remove_sqlite_files(&backfill_path(paths))?;
     Ok(BackfillReport {
         embedded: embedded_this_run,
         total: live_ids.len(),
@@ -834,7 +812,6 @@ mod tests {
     fn status_line_exposes_checkpoint_state_and_eta() {
         let status = BackfillStatus {
             model: "bge".to_string(),
-            dimensions: 384,
             total: 20,
             completed: 10,
             checkpointed: 10,

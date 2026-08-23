@@ -33,13 +33,6 @@ impl IngestLease {
         Self::try_acquire_path(lease_path(paths, "ingest"), operation.into())
     }
 
-    pub fn try_acquire_embedding(
-        paths: &Paths,
-        operation: impl Into<String>,
-    ) -> Result<LeaseAttempt> {
-        Self::try_acquire_path(lease_path(paths, "embed"), operation.into())
-    }
-
     fn try_acquire_path(path: PathBuf, operation: String) -> Result<LeaseAttempt> {
         let mut file = open_lease_file(&path)?;
         match file.try_lock() {
@@ -86,10 +79,6 @@ impl Drop for IngestLease {
         let _ = self.file.set_len(0);
         let _ = self.file.unlock();
     }
-}
-
-pub fn is_held_by(paths: &Paths, pid: u32) -> bool {
-    is_path_held_by(&lease_path(paths, "ingest"), pid)
 }
 
 pub fn is_embedding_held_by(paths: &Paths, pid: u32) -> bool {
@@ -222,18 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn held_by_distinguishes_active_and_released_leases() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
-        let lease =
-            IngestLease::acquire(&paths, "backfill", Duration::from_secs(1)).expect("lease");
-
-        assert!(is_held_by(&paths, std::process::id()));
-        drop(lease);
-        assert!(!is_held_by(&paths, std::process::id()));
-    }
-
-    #[test]
     fn ingest_and_embedding_leases_are_independent() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
@@ -243,10 +220,6 @@ mod tests {
 
         assert!(is_embedding_held(&paths));
         assert!(is_embedding_held_by(&paths, std::process::id()));
-        assert!(matches!(
-            IngestLease::try_acquire_embedding(&paths, "second embed").unwrap(),
-            LeaseAttempt::Busy(_)
-        ));
         drop(embed);
         assert!(!is_embedding_held(&paths));
         assert!(!is_embedding_held_by(&paths, std::process::id()));

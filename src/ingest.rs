@@ -477,7 +477,7 @@ fn missing_state_paths(
                 .unwrap_or_else(|| SourceKind::from_path(path));
             if source == SourceKind::Claude
                 && !options.include_agents
-                && is_claude_agent_path(Path::new(path))
+                && crate::sources::claude::is_subagent_path(Path::new(path))
             {
                 return None;
             }
@@ -491,38 +491,17 @@ fn missing_state_paths(
     missing
 }
 
-fn is_claude_agent_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("agent-"))
-        || path
-            .components()
-            .any(|component| component.as_os_str().to_str() == Some("subagents"))
-}
-
 fn apply_path_deletions(
     paths: &Paths,
     index: &SearchIndex,
     source_paths: &[String],
-    embedding_lease: Option<&IngestLease>,
+    embedding_lease: &IngestLease,
 ) -> Result<usize> {
-    if source_paths.is_empty() {
-        return Ok(0);
-    }
-    // Ordinary ingest needs only the deletion count and leaves physical vector cleanup to the
-    // next backfill. Explicit prune resolves IDs once because it removes them from the active
-    // vector generation under the embedding lease.
-    let doc_ids = embedding_lease
-        .map(|_| {
-            index
-                .doc_ids_by_source_paths(source_paths)
-                .map(|ids| ids.into_iter().collect::<HashSet<_>>())
-        })
-        .transpose()?;
-    let records = match &doc_ids {
-        Some(doc_ids) => doc_ids.len(),
-        None => index.count_by_source_paths(source_paths)?,
-    };
+    let doc_ids = index
+        .doc_ids_by_source_paths(source_paths)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let records = doc_ids.len();
     let mut writer = index
         .writer()
         .context("failed to initialize the Tantivy deletion writer")?;
@@ -532,9 +511,7 @@ fn apply_path_deletions(
     // analytics conservatively before the first mutation so any later error triggers backfill.
     analytics_marker.mark_incomplete()?;
 
-    if let (Some(embedding_lease), Some(doc_ids)) = (embedding_lease, &doc_ids) {
-        crate::vector_backfill::prune_deleted(paths, doc_ids, embedding_lease)?;
-    }
+    crate::vector_backfill::prune_deleted(paths, &doc_ids, embedding_lease)?;
     for source_path in source_paths {
         index.delete_by_source_path(&mut writer, source_path);
     }
@@ -624,7 +601,7 @@ pub fn prune_missing_paths(
     let records = if source_paths.is_empty() {
         0
     } else {
-        let records = apply_path_deletions(paths, index, &source_paths, Some(embedding_lease))?;
+        let records = apply_path_deletions(paths, index, &source_paths, embedding_lease)?;
         for source_path in &source_paths {
             state.files.remove(source_path);
         }
@@ -1109,7 +1086,6 @@ pub fn ingest_all(
         HashMap::new()
     };
 
-    let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     let analytics_db = analytics_path(&paths.state);
     let index_has_documents = index.doc_count()? > 0;
@@ -1140,7 +1116,7 @@ pub fn ingest_all(
         });
     }
 
-    let progress = Arc::new(Progress::new(totals, file_totals, false));
+    let progress = Arc::new(Progress::new(file_totals));
 
     let (raw_tx_record, rx_record) = record_channel();
     let shared_diagnostics = Arc::new(Mutex::new(crate::sources::ParseDiagnostics::default()));
@@ -1396,37 +1372,14 @@ fn can_skip_noop_index(
     if !options.embeddings {
         return Ok(true);
     }
-    let Some(dimensions) = options.model.known_dimensions() else {
-        return Ok(false);
-    };
-    if !crate::vector::VectorIndex::exists(&paths.vectors)? {
+    if options.model.known_dimensions().is_none() {
         return Ok(false);
     }
-    let vector_index = crate::vector::VectorIndex::open(&paths.vectors)?;
-    if vector_index.model() != Some(options.model.as_str())
-        || vector_index.dimensions() != dimensions
-    {
-        return Ok(false);
-    }
-    vector_index_covers_embeddable_records(index, &vector_index)
-}
-
-fn vector_index_covers_embeddable_records(
-    index: &SearchIndex,
-    vector_index: &crate::vector::VectorIndex,
-) -> Result<bool> {
-    let mut covers_all = true;
-    index.for_each_record(|record| {
-        if record_needs_embedding(&record) && !vector_index.contains(record.doc_id) {
-            covers_all = false;
-        }
-        Ok(())
-    })?;
-    Ok(covers_all)
-}
-
-fn record_needs_embedding(record: &Record) -> bool {
-    is_embedding_role(&record.role) && !record.text.is_empty()
+    Ok(!crate::vector_backfill::needs_work(
+        paths,
+        index,
+        options.model,
+    )?)
 }
 
 fn writer_loop(
@@ -1854,15 +1807,6 @@ fn parse_grok_session(
         parsed,
     )
 }
-fn compute_totals(tasks: &[FileTask]) -> [u64; SOURCE_COUNT] {
-    let mut totals = [0u64; SOURCE_COUNT];
-    for task in tasks {
-        let remaining = task.size.saturating_sub(task.offset);
-        totals[task.source.idx()] += remaining;
-    }
-    totals
-}
-
 fn compute_file_totals(tasks: &[FileTask]) -> [u64; SOURCE_COUNT] {
     let mut totals = [0u64; SOURCE_COUNT];
     for task in tasks {
@@ -1949,10 +1893,6 @@ fn char_boundary_at_or_after(text: &str, mut position: usize) -> usize {
 
 fn truncation_marker(omitted_bytes: usize) -> String {
     format!("\n\n[... {omitted_bytes} bytes truncated ...]\n\n")
-}
-
-fn is_embedding_role(role: &str) -> bool {
-    role == "user" || role == "assistant"
 }
 
 #[cfg(test)]
@@ -2254,7 +2194,7 @@ mod tests {
         let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
         let (tx_update, _rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
-        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT]));
         let skipped = AtomicUsize::new(0);
 
         let parse_result = parse_claude_file(
@@ -2317,7 +2257,7 @@ mod tests {
         let ctx = WriterContext {
             analytics_path: analytics_path(&paths.state),
             delete_paths: vec!["source-1.jsonl".to_string()],
-            progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false)),
+            progress: Arc::new(Progress::new([0; SOURCE_COUNT])),
             tool_content_limits: IndexedToolContentLimits::default(),
         };
         let writer = index.writer().expect("writer");
@@ -2329,13 +2269,13 @@ mod tests {
         assert_eq!(index.doc_count().expect("document count"), 1);
         assert_eq!(
             index
-                .doc_ids_by_source_path("source-1.jsonl")
+                .doc_ids_by_source_paths(&["source-1.jsonl".to_string()])
                 .expect("existing document IDs"),
             vec![1]
         );
         assert!(
             index
-                .doc_ids_by_source_path("source-2.jsonl")
+                .doc_ids_by_source_paths(&["source-2.jsonl".to_string()])
                 .expect("staged document IDs")
                 .is_empty()
         );
@@ -2357,7 +2297,7 @@ mod tests {
         let state_path = paths.state.join("ingest.json");
         let original_state = IngestState::load(&state_path).expect("original state");
         let original_doc_ids = index
-            .doc_ids_by_source_path(&transcript.to_string_lossy())
+            .doc_ids_by_source_paths(&[transcript.to_string_lossy().into_owned()])
             .expect("original document IDs");
 
         fs::write(
@@ -2384,7 +2324,7 @@ mod tests {
         assert_eq!(index.doc_count().expect("document count"), 1);
         assert_eq!(
             index
-                .doc_ids_by_source_path(&transcript.to_string_lossy())
+                .doc_ids_by_source_paths(&[transcript.to_string_lossy().into_owned()])
                 .expect("document IDs after parser failure"),
             original_doc_ids
         );
@@ -2482,7 +2422,7 @@ mod tests {
         let source_path = transcript.to_string_lossy().to_string();
         assert_eq!(
             index
-                .doc_ids_by_source_path(&source_path)
+                .doc_ids_by_source_paths(std::slice::from_ref(&source_path))
                 .expect("legacy document IDs"),
             vec![1]
         );
@@ -2554,7 +2494,7 @@ mod tests {
         assert_eq!(published_index.doc_count().expect("document count"), 1);
         assert_eq!(
             published_index
-                .doc_ids_by_source_path(&source_path)
+                .doc_ids_by_source_paths(std::slice::from_ref(&source_path))
                 .expect("re-ingested document IDs"),
             vec![recovery_frontier]
         );
@@ -2855,7 +2795,7 @@ mod tests {
         );
         fs::write(&path, calls).expect("write calls");
 
-        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT]));
         let next_doc_id = AtomicU64::new(1);
         let (tx_record, rx_record, tx_update, rx_update) = parser_channels();
         let first = incremental_task(&path, SourceKind::Claude, 0, 0, HashMap::new());
@@ -2942,7 +2882,7 @@ mod tests {
         let result = "{\"timestamp\":\"2026-07-20T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"/Users/nico/Code/memex\"}}\n";
         fs::write(&path, call).expect("write call");
 
-        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT]));
         let next_doc_id = AtomicU64::new(10);
         let (tx_record, rx_record, tx_update, rx_update) = parser_channels();
         let first = incremental_task(&path, SourceKind::Codex, 0, 0, HashMap::new());
@@ -3327,10 +3267,10 @@ mod tests {
             ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
         }
         let target_doc_id = index
-            .doc_ids_by_source_path(&transcript.to_string_lossy())
+            .doc_ids_by_source_paths(&[transcript.to_string_lossy().into_owned()])
             .expect("document IDs")[0];
         let survivor_doc_id = index
-            .doc_ids_by_source_path(&survivor.to_string_lossy())
+            .doc_ids_by_source_paths(&[survivor.to_string_lossy().into_owned()])
             .expect("survivor document IDs")[0];
         let mut vectors =
             VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).expect("vectors");
@@ -3709,13 +3649,13 @@ mod tests {
     }
 
     #[test]
-    fn cannot_skip_noop_index_when_vectors_are_missing() {
+    fn can_skip_noop_index_without_embeddable_records() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
         let index = open_search_index(&paths);
         let options = ingest_options(true, ModelChoice::BGESmall);
 
-        assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
+        assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
     }
 
     #[test]
@@ -3745,7 +3685,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
         save_vector_store(&paths, "potion", 256);
-        let index = open_search_index(&paths);
+        let index = save_search_records(&paths, &[record(1, "user", "hello")]);
         let options = ingest_options(true, ModelChoice::Potion);
 
         assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
@@ -4170,7 +4110,7 @@ mod tests {
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Pi),
         };
-        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT]));
         let next_doc_id = AtomicU64::new(1);
 
         parse_pi_file(
@@ -4252,11 +4192,7 @@ mod tests {
         let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
-        let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len(), 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            false,
-        ));
+        let progress = Arc::new(Progress::new([0, 0, 0, 0, 0, 0, 1, 0, 0, 0]));
 
         parse_copilot_session(&task, &tx_record, &tx_update, &next_doc_id, &progress)
             .expect("parse copilot session");
@@ -4329,7 +4265,7 @@ mod tests {
             .expect("send record");
         drop(tx_record);
 
-        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT]));
         let ctx = WriterContext {
             analytics_path: tmp.path().join("state").join("analytics.sqlite"),
             delete_paths: Vec::new(),

@@ -35,7 +35,6 @@ pub struct VectorIndex {
     root: PathBuf,
     index: Index,
     doc_id_set: HashSet<u64>,
-    needs_backfill: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,13 +53,9 @@ struct ActiveStorage {
     generation: Option<String>,
 }
 
-struct VectorStoreLock {
-    _file: fs::File,
-}
-
 impl VectorIndex {
     pub fn reset(dir: &Path) -> Result<()> {
-        let _write_lock = VectorStoreLock::acquire_exclusive(dir)?;
+        let _write_lock = acquire_vector_store_lock(dir)?;
         if dir.exists() {
             fs::remove_dir_all(dir)?;
         }
@@ -100,7 +95,7 @@ impl VectorIndex {
             }
         }
 
-        Self::empty(dir, dimensions, model, true)
+        Self::empty(dir, dimensions, model)
     }
 
     /// Start a complete replacement without opening or deleting the active generation.
@@ -115,7 +110,7 @@ impl VectorIndex {
         model: Option<&str>,
     ) -> Result<Self> {
         fs::create_dir_all(dir)?;
-        Self::empty(dir, dimensions, model.map(str::to_string), true)
+        Self::empty(dir, dimensions, model.map(str::to_string))
     }
 
     pub fn open(dir: &Path) -> Result<Self> {
@@ -178,16 +173,10 @@ impl VectorIndex {
             root: root.to_path_buf(),
             index,
             doc_id_set,
-            needs_backfill: false,
         })
     }
 
-    fn empty(
-        root: &Path,
-        dimensions: usize,
-        model: Option<String>,
-        needs_backfill: bool,
-    ) -> Result<Self> {
+    fn empty(root: &Path, dimensions: usize, model: Option<String>) -> Result<Self> {
         let options = IndexOptions {
             dimensions,
             metric: MetricKind::Cos,
@@ -202,7 +191,6 @@ impl VectorIndex {
             root: root.to_path_buf(),
             index,
             doc_id_set: HashSet::new(),
-            needs_backfill,
         })
     }
 
@@ -236,7 +224,7 @@ impl VectorIndex {
         Ok(true)
     }
 
-    pub fn retain_ids(&mut self, live_ids: &HashSet<u64>) -> Result<usize> {
+    pub fn retain_ids(&mut self, live_ids: &HashSet<u64>) -> Result<()> {
         let stale = self
             .doc_id_set
             .difference(live_ids)
@@ -245,7 +233,7 @@ impl VectorIndex {
         for doc_id in &stale {
             self.remove(*doc_id)?;
         }
-        Ok(stale.len())
+        Ok(())
     }
 
     pub fn search(&self, embedding: &[f32], limit: usize) -> Result<Vec<(u64, f32)>> {
@@ -305,7 +293,7 @@ impl VectorIndex {
         // Serialize the complete write with reset and other publishers. A reset must not remove a
         // temporary generation while it is being written, and only the lock holder may finalize,
         // publish, or collect generation directories.
-        let _write_lock = VectorStoreLock::acquire_exclusive(&self.root)?;
+        let _write_lock = acquire_vector_store_lock(&self.root)?;
         fs::create_dir_all(&self.root)?;
         let generations = self.root.join(GENERATIONS_DIR);
         fs::create_dir_all(&generations)?;
@@ -358,53 +346,8 @@ impl VectorIndex {
         Ok(())
     }
 
-    pub fn exists(dir: &Path) -> Result<bool> {
-        let Some(mut storage) = active_storage(dir)? else {
-            return Ok(false);
-        };
-        loop {
-            let complete = storage.path.join("usearch.index").exists()
-                && storage.path.join("doc_ids.bin").exists()
-                && (storage.generation.is_none() || storage.path.join("meta.json").exists());
-            if complete {
-                return Ok(true);
-            }
-
-            let refreshed = active_storage(dir)?;
-            if refreshed.as_ref().is_some_and(|active| active != &storage) {
-                storage = refreshed.expect("checked above");
-                continue;
-            }
-            if refreshed.is_none() {
-                return Ok(false);
-            }
-            return Err(anyhow!(
-                "active vector generation is incomplete: {}",
-                storage.path.display()
-            ));
-        }
-    }
-
     pub fn inventory(dir: &Path) -> Result<Option<VectorInventory>> {
-        let Some(mut storage) = active_storage(dir)? else {
-            return Ok(None);
-        };
-        loop {
-            match load_inventory(&storage) {
-                Ok(inventory) => return Ok(Some(inventory)),
-                Err(error) => {
-                    let refreshed = active_storage(dir)?;
-                    if refreshed.as_ref().is_some_and(|active| active != &storage) {
-                        storage = refreshed.expect("checked above");
-                        continue;
-                    }
-                    if refreshed.is_none() {
-                        return Ok(None);
-                    }
-                    return Err(error);
-                }
-            }
-        }
+        load_active_inventory(dir, load_inventory)
     }
 
     /// Inventory the active generation and validate the USearch index against its sidecars.
@@ -413,25 +356,7 @@ impl VectorIndex {
     /// ID. Keep the cheap inventory for status reporting; backfill calls this at explicit runs and
     /// continuous-mode verification events where an O(N) repair decision is warranted.
     pub(crate) fn validated_inventory(dir: &Path) -> Result<Option<VectorInventory>> {
-        let Some(mut storage) = active_storage(dir)? else {
-            return Ok(None);
-        };
-        loop {
-            match load_validated_inventory(&storage) {
-                Ok(inventory) => return Ok(Some(inventory)),
-                Err(error) => {
-                    let refreshed = active_storage(dir)?;
-                    if refreshed.as_ref().is_some_and(|active| active != &storage) {
-                        storage = refreshed.expect("checked above");
-                        continue;
-                    }
-                    if refreshed.is_none() {
-                        return Ok(None);
-                    }
-                    return Err(error);
-                }
-            }
-        }
+        load_active_inventory(dir, load_validated_inventory)
     }
 
     pub fn contains(&self, doc_id: u64) -> bool {
@@ -446,20 +371,8 @@ impl VectorIndex {
         self.index.size() == 0
     }
 
-    pub fn doc_id_count(&self) -> usize {
-        self.doc_id_set.len()
-    }
-
-    pub fn doc_ids(&self) -> &HashSet<u64> {
-        &self.doc_id_set
-    }
-
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
-    }
-
-    pub fn needs_backfill(&self) -> bool {
-        self.needs_backfill
     }
 
     #[allow(dead_code)]
@@ -547,35 +460,28 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-impl VectorStoreLock {
-    fn open(root: &Path) -> Result<(fs::File, PathBuf)> {
-        let parent = root
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
-        let root_name = root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("vectors");
-        let path = parent.join(format!(".{root_name}.write.lock"));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("open vector publication lock {}", path.display()))?;
-        Ok((file, path))
-    }
-
-    fn acquire_exclusive(root: &Path) -> Result<Self> {
-        let (file, path) = Self::open(root)?;
-        file.lock()
-            .with_context(|| format!("acquire vector publication lock {}", path.display()))?;
-        Ok(Self { _file: file })
-    }
+fn acquire_vector_store_lock(root: &Path) -> Result<fs::File> {
+    let parent = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("vectors");
+    let path = parent.join(format!(".{root_name}.write.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open vector publication lock {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("acquire vector publication lock {}", path.display()))?;
+    Ok(file)
 }
 
 fn cleanup_inactive_generations(root: &Path) {
@@ -648,6 +554,31 @@ fn load_storage_metadata(storage: &ActiveStorage) -> Result<Option<VectorMetadat
         validate_metadata_layout(metadata, &storage.path)?;
     }
     Ok(metadata)
+}
+
+fn load_active_inventory(
+    root: &Path,
+    load: fn(&ActiveStorage) -> Result<VectorInventory>,
+) -> Result<Option<VectorInventory>> {
+    let Some(mut storage) = active_storage(root)? else {
+        return Ok(None);
+    };
+    loop {
+        match load(&storage) {
+            Ok(inventory) => return Ok(Some(inventory)),
+            Err(error) => {
+                let refreshed = active_storage(root)?;
+                if refreshed.as_ref().is_some_and(|active| active != &storage) {
+                    storage = refreshed.expect("checked above");
+                    continue;
+                }
+                if refreshed.is_none() {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        }
+    }
 }
 
 fn load_inventory(storage: &ActiveStorage) -> Result<VectorInventory> {
@@ -893,12 +824,10 @@ mod tests {
         let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
         idx.add(1, &make_vector(64, 1.0)).unwrap();
         idx.save().unwrap();
-        assert!(VectorIndex::exists(tmp.path()).unwrap());
 
         VectorIndex::reset(tmp.path()).unwrap();
 
         assert!(tmp.path().exists());
-        assert!(!VectorIndex::exists(tmp.path()).unwrap());
         assert!(!tmp.path().join(CURRENT_GENERATION_FILE).exists());
     }
 
@@ -1104,7 +1033,6 @@ mod tests {
             assert!(!idx.contains(1));
             assert_eq!(idx.dimensions(), 64);
             assert_eq!(idx.model(), Some("beta"));
-            assert!(idx.needs_backfill());
         }
 
         let active = VectorIndex::open(tmp.path()).unwrap();

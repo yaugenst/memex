@@ -209,19 +209,6 @@ impl AnalyticsStore {
         Ok(())
     }
 
-    pub fn clear(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM sessions", [])?;
-        Ok(())
-    }
-
-    pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM sessions WHERE source_path = ?1",
-            params![source_path],
-        )?;
-        Ok(())
-    }
-
     pub fn query_sessions(
         &self,
         source: Option<SourceFilter>,
@@ -640,10 +627,6 @@ impl AnalyticsWriter {
             metadata_cache: HashMap::new(),
             git_cache: HashMap::new(),
         })
-    }
-
-    pub fn clear(&self) -> Result<()> {
-        self.store.clear()
     }
 
     pub fn delete_source_path(&mut self, source_path: &str) -> Result<()> {

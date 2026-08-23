@@ -163,7 +163,7 @@ Notes:
 
 Prune missing paths without rediscovering or rebuilding the corpus:
 ```
-memex prune             # safe preview (same as --dry-run)
+memex prune             # safe preview
 memex prune --apply     # prune lexical, analytics, vectors, and state; invalidate partial backfill
 ```
 
