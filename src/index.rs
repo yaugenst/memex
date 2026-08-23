@@ -539,7 +539,7 @@ impl SearchIndex {
         };
         let reader = self.reader()?;
         let searcher = reader.searcher();
-        let limit = searcher.num_docs() as usize;
+        let limit = searcher.search(query.as_ref(), &Count)?;
         if limit == 0 {
             return Ok(Vec::new());
         }

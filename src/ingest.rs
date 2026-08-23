@@ -428,11 +428,9 @@ fn authoritative_roots(options: &PruneOptions) -> Vec<AuthoritativeRoot> {
         );
     }
     if options.include_omp {
-        add_authoritative_root(
-            &mut roots,
-            SourceKind::Omp,
-            crate::sources::omp::agent_root().join("sessions"),
-        );
+        for root in crate::sources::omp::session_roots() {
+            add_authoritative_root(&mut roots, SourceKind::Omp, root);
+        }
     }
     if options.include_openclaw {
         for root in crate::sources::openclaw::state_dirs() {
@@ -1120,8 +1118,9 @@ pub fn ingest_all(
             || !AnalyticsStore::is_ready(&analytics_db));
     if tasks.is_empty() && delete_paths.is_empty() && can_skip_noop_index(paths, index, options)? {
         index.publish_generation_if_uninitialized()?;
+        let published_index = SearchIndex::open_or_create(&paths.index)?;
         if analytics_needs_backfill {
-            backfill_from_index(&analytics_db, index)?;
+            backfill_from_index(&analytics_db, &published_index)?;
         }
         if recovering_pending_ingest {
             state.save(&state_path)?;
@@ -1321,8 +1320,9 @@ pub fn ingest_all(
             ));
         }
     };
+    let published_index = SearchIndex::open_or_create(&paths.index)?;
     if analytics_needs_backfill {
-        backfill_from_index(&analytics_db, index)?;
+        backfill_from_index(&analytics_db, &published_index)?;
     } else {
         AnalyticsStore::open(&analytics_db)?.mark_complete()?;
     }
@@ -1332,7 +1332,13 @@ pub fn ingest_all(
     update_scan_cache(paths, files_scanned, total_bytes)?;
     PendingIngest::clear(&pending_ingest_path(paths))?;
     let records_embedded = if options.embeddings {
-        crate::vector_backfill::run(paths, index, options.model, &options.embed_runtime)?.embedded
+        crate::vector_backfill::run(
+            paths,
+            &published_index,
+            options.model,
+            &options.embed_runtime,
+        )?
+        .embedded
     } else {
         0
     };
@@ -2464,7 +2470,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_ingest_forces_recovery_despite_fresh_complete_indexes() {
+    fn legacy_crash_recovery_publishes_generation_without_touching_vectors() {
         let temporary = tempfile::tempdir().expect("tempdir");
         let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
         {
@@ -2472,6 +2478,36 @@ mod tests {
             let report = ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
             assert_eq!(report.records_added, 1);
         }
+        assert!(!paths.index.join("CURRENT").exists());
+        let source_path = transcript.to_string_lossy().to_string();
+        assert_eq!(
+            index
+                .doc_ids_by_source_path(&source_path)
+                .expect("legacy document IDs"),
+            vec![1]
+        );
+
+        save_vector_store(&paths, "bge", 384);
+        let vector_pointer = fs::read(paths.vectors.join("current.json")).expect("vector pointer");
+
+        let revision = index.revision().expect("legacy revision");
+        let segment_id = revision.segments[0].0.clone();
+        assert_eq!(revision.segments[0].1, None);
+        // The replacement's delete and add consume two opstamps before this commit checkpoint.
+        let orphan_name = format!("{segment_id}.{}.del", revision.opstamp + 2);
+        let orphan_path = paths.index.join(&orphan_name);
+        fs::write(&orphan_path, b"interrupted delete checkpoint").expect("write orphan delete");
+        let managed_path = paths.index.join(".managed.json");
+        let mut managed: HashSet<PathBuf> =
+            serde_json::from_slice(&fs::read(&managed_path).expect("managed files"))
+                .expect("parse managed files");
+        assert!(managed.insert(PathBuf::from(&orphan_name)));
+        fs::write(
+            &managed_path,
+            serde_json::to_vec(&managed).expect("encode managed files"),
+        )
+        .expect("register orphan delete");
+        assert!(orphan_path.exists());
 
         let cache = ScanCache::load(&paths.state.join("scan_cache.json")).expect("scan cache");
         assert!(cache.is_fresh(60));
@@ -2483,7 +2519,6 @@ mod tests {
         let state_path = paths.state.join("ingest.json");
         let state = IngestState::load(&state_path).expect("ingest state");
         let recovery_frontier = state.next_doc_id + 10;
-        let source_path = transcript.to_string_lossy().to_string();
         PendingIngest {
             next_doc_id: recovery_frontier,
             source_paths: vec![source_path.clone()],
@@ -2492,6 +2527,7 @@ mod tests {
         .expect("save pending ingest");
 
         assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+        drop(index);
         let report = {
             let lease = ingest_lease(&paths);
             let recovery_index =
@@ -2501,9 +2537,20 @@ mod tests {
                 .expect("pending ingest must bypass the freshness gate")
         };
 
+        let current = fs::read_to_string(paths.index.join("CURRENT")).expect("CURRENT pointer");
+        assert!(
+            paths
+                .index
+                .join("generations")
+                .join(current.trim())
+                .join("meta.json")
+                .exists()
+        );
+        assert!(!orphan_path.exists());
         let published_index =
             SearchIndex::open_or_create(&paths.index).expect("published recovery generation");
         assert_eq!(report.records_added, 1);
+        assert_eq!(report.records_embedded, 0);
         assert_eq!(published_index.doc_count().expect("document count"), 1);
         assert_eq!(
             published_index
@@ -2521,6 +2568,13 @@ mod tests {
         let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
         assert!(analytics.complete().expect("analytics complete"));
         assert_eq!(analytics.session_count().expect("session count"), 1);
+        assert_eq!(
+            fs::read(paths.vectors.join("current.json")).expect("unchanged vector pointer"),
+            vector_pointer
+        );
+        let vectors = VectorIndex::open(&paths.vectors).expect("unchanged vector generation");
+        assert!(vectors.contains(1));
+        assert!(!vectors.contains(recovery_frontier));
     }
 
     #[test]
@@ -3498,7 +3552,9 @@ mod tests {
     fn noop_ingest_repairs_complete_but_empty_analytics() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-        let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+        drop(save_search_records(&paths, &[record(1, "user", "hello")]));
+        let index =
+            SearchIndex::open_or_create_for_ingest(&paths.index).expect("stage legacy generation");
         let options = ingest_options(false, ModelChoice::BGESmall);
         let analytics_db = analytics_path(&paths.state);
         AnalyticsStore::open(&analytics_db)
@@ -3510,9 +3566,34 @@ mod tests {
         let report = ingest_all(&paths, &index, &options, &lease).expect("repair analytics");
 
         assert_eq!(report.records_added, 0);
+        assert!(paths.index.join("CURRENT").exists());
         let analytics = AnalyticsStore::open(&analytics_db).expect("reopen analytics");
         assert!(analytics.complete().expect("complete"));
         assert_eq!(analytics.session_count().expect("session count"), 1);
+    }
+
+    #[test]
+    fn changed_ingest_backfills_analytics_from_published_generation() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let (paths, _claude_root, _transcript, legacy_index, options) =
+            claude_prune_fixture(&temporary);
+        let mut writer = legacy_index.writer().expect("legacy writer");
+        legacy_index
+            .add_record(&mut writer, &record(99, "user", "legacy"))
+            .expect("legacy record");
+        writer.commit().expect("commit legacy record");
+        drop(writer);
+        drop(legacy_index);
+
+        let index =
+            SearchIndex::open_or_create_for_ingest(&paths.index).expect("stage changed generation");
+        let report =
+            ingest_all(&paths, &index, &options, &ingest_lease(&paths)).expect("changed ingest");
+
+        assert_eq!(report.records_added, 1);
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        assert!(analytics.complete().expect("complete"));
+        assert_eq!(analytics.session_count().expect("session count"), 2);
     }
 
     #[test]
@@ -4030,6 +4111,30 @@ mod tests {
             records
                 .iter()
                 .all(|record| record.source_path == session_file.to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn omp_profile_sessions_are_authoritative_for_pruning() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_home = tmp.path().join("data");
+        let profile_sessions = data_home.join("omp/profiles/inactive/agent/sessions");
+        fs::create_dir_all(&profile_sessions).expect("create profile sessions");
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_DIR", None),
+            ("PI_CONFIG_DIR", Some(std::ffi::OsStr::new("missing-omp"))),
+            ("XDG_DATA_HOME", Some(data_home.as_os_str())),
+        ]);
+        let mut options = ingest_options(false, ModelChoice::default());
+        options.include_omp = true;
+
+        let roots = authoritative_roots(&PruneOptions::from(&options));
+
+        assert!(
+            roots
+                .iter()
+                .any(|root| { root.source == SourceKind::Omp && root.path == profile_sessions })
         );
     }
 

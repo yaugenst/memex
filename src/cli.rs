@@ -1580,9 +1580,10 @@ fn run_index(
 
     let mut report = ingest_all(&paths, &index, &opts, &lease)?;
     if reindex && embeddings {
+        let published_index = SearchIndex::open_or_create(&paths.index)?;
         report.records_embedded = crate::vector_backfill::run_with_lease(
             &paths,
-            &index,
+            &published_index,
             model_choice,
             &opts.embed_runtime,
             embedding_lease.as_ref().expect("reindex embedding lease"),
@@ -4648,6 +4649,10 @@ fn build_systemd_service(
     let mut out = String::new();
     out.push_str("[Unit]\n");
     out.push_str("Description=Memex Index Service\n");
+    if continuous {
+        out.push_str("StartLimitIntervalSec=5min\n");
+        out.push_str("StartLimitBurst=3\n");
+    }
     out.push('\n');
     out.push_str("[Service]\n");
     for (key, value) in env_vars {
@@ -4660,8 +4665,9 @@ fn build_systemd_service(
     out.push_str("Type=");
     if continuous {
         out.push_str("simple\n");
-        out.push_str("Restart=always\n");
-        out.push_str("RestartSec=10\n");
+        out.push_str("Restart=on-failure\n");
+        out.push_str("RestartSec=30s\n");
+        out.push_str("OOMPolicy=stop\n");
     } else {
         out.push_str("oneshot\n");
     }
@@ -5965,6 +5971,18 @@ arguments = {
             "Environment=\"PI_CODING_AGENT_SESSION_DIR=/tmp/pi \\\"sessions\\\" 100%%\"\n"
         ));
         assert!(service.contains("ExecStart=/usr/bin/memex index --no-pi\n"));
+    }
+
+    #[test]
+    fn continuous_systemd_service_caps_failure_restarts() {
+        let service = build_systemd_service("/usr/bin/memex", &[], true, &[]);
+
+        assert!(service.contains(
+            "[Unit]\nDescription=Memex Index Service\nStartLimitIntervalSec=5min\nStartLimitBurst=3\n"
+        ));
+        assert!(service.contains(
+            "[Service]\nType=simple\nRestart=on-failure\nRestartSec=30s\nOOMPolicy=stop\n"
+        ));
     }
 
     #[test]
