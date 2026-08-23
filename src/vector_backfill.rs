@@ -12,7 +12,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const BATCH_SIZE: usize = 256;
+const BATCH_SIZE: usize = 64;
 const NON_TTY_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const EMBED_MAX_CHARS: usize = 8192;
 const BACKFILL_DB: &str = "embed-backfill.sqlite3";
