@@ -151,7 +151,7 @@ Hybrid combines BM25 and vectors with reciprocal-rank fusion. Prefer it when som
 memex search "remote immutable indexes object storage" --hybrid --unique-session --limit 20
 ```
 
-If memex warns that vectors are unavailable and falls back to lexical retrieval, continue if lexical evidence is adequate. Mention `memex embed` only when semantic recall is materially important.
+If vectors are unavailable, semantic and hybrid search fall back to lexical retrieval. Continue if lexical evidence is adequate. Mention `memex embed` only when semantic recall is materially important.
 
 ### Semantic: low lexical overlap
 

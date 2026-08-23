@@ -1293,7 +1293,9 @@ fn search_local(
     auto_index: bool,
 ) -> Result<Vec<(f32, Record)>> {
     if auto_index {
-        ensure_local_index(paths, config)?;
+        let allow_busy_snapshot = spec.cwd.is_none()
+            && spec.project_grouping.unwrap_or_default() == ProjectGrouping::Flat;
+        ensure_local_index(paths, config, allow_busy_snapshot)?;
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut options = spec.query_options();
@@ -1445,7 +1447,11 @@ fn recent_local(
     auto_index: bool,
 ) -> Result<Vec<(f32, Record)>> {
     if auto_index {
-        ensure_local_index(paths, config)?;
+        ensure_local_index(
+            paths,
+            config,
+            project_grouping.unwrap_or_default() == ProjectGrouping::Flat,
+        )?;
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut records: Vec<_> = index
@@ -1493,7 +1499,7 @@ fn apply_project_grouping(
     }
 }
 
-fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
+fn ensure_local_index(paths: &Paths, config: &UserConfig, allow_busy_snapshot: bool) -> Result<()> {
     if config.auto_index_on_search_default() {
         paths.ensure_dirs()?;
         match IngestLease::try_acquire(paths, "RPC auto-index")? {
@@ -1501,7 +1507,9 @@ fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
                 let _ = index_local_with_lease(paths, config, true, &lease)?;
             }
             LeaseAttempt::Busy(Some(holder))
-                if holder.operation != "reindex" && paths.index.join("meta.json").exists() =>
+                if allow_busy_snapshot
+                    && holder.operation != "reindex"
+                    && SearchIndex::exists(&paths.index) =>
             {
                 // Read the last committed lexical index and active vector generation while a
                 // normal incremental ingest or checkpointed backfill is running.
@@ -1926,6 +1934,22 @@ mod tests {
         writer.commit().unwrap();
         writer.wait_merging_threads().unwrap();
         index.publish_generation().unwrap();
+    }
+
+    #[test]
+    fn busy_auto_index_reads_published_generation() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        index.publish_generation().unwrap();
+        drop(index);
+
+        assert!(!paths.index.join("meta.json").exists());
+        assert!(SearchIndex::exists(&paths.index));
+
+        let _lease = IngestLease::acquire(&paths, "index", Duration::from_secs(1)).unwrap();
+        ensure_local_index(&paths, &UserConfig::default(), true).unwrap();
     }
 
     #[test]
