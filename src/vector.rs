@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Component;
@@ -253,40 +254,43 @@ impl VectorIndex {
     }
 
     /// Search until `limit` accepted candidates are found or the vector inventory is exhausted.
-    /// The acceptance result is cached across progressively deeper searches so callers can filter
-    /// stale IDs without repeating lexical lookups.
     pub fn search_filtered(
         &self,
         embedding: &[f32],
         limit: usize,
-        mut accept: impl FnMut(u64) -> Result<bool>,
+        accept: impl FnMut(u64) -> Result<bool>,
     ) -> Result<Vec<(u64, f32)>> {
         if limit == 0 || self.is_empty() {
             return Ok(Vec::new());
         }
-        let total = self.len();
-        let mut requested = limit.min(total).max(1);
-        let mut accepted = HashMap::<u64, bool>::new();
-        loop {
-            let candidates = self.search(embedding, requested)?;
-            for (doc_id, _) in &candidates {
-                if !accepted.contains_key(doc_id) {
-                    accepted.insert(*doc_id, accept(*doc_id)?);
-                }
-            }
-            let results = candidates
-                .into_iter()
-                .filter(|(doc_id, _)| accepted.get(doc_id).copied().unwrap_or(false))
-                .take(limit)
-                .collect::<Vec<_>>();
-            if results.len() >= limit || requested >= total {
-                return Ok(results);
-            }
-            requested = requested
-                .saturating_mul(2)
-                .max(requested.saturating_add(1))
-                .min(total);
+        if embedding.len() != self.dims {
+            return Err(anyhow!(
+                "embedding dimensions mismatch: expected {}, got {}",
+                self.dims,
+                embedding.len()
+            ));
         }
+
+        let accept = RefCell::new(accept);
+        let failure = RefCell::new(None);
+        let matches = self
+            .index
+            .filtered_search(embedding, limit.min(self.len()), |doc_id| {
+                if failure.borrow().is_some() {
+                    return true;
+                }
+                match accept.borrow_mut()(doc_id) {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        *failure.borrow_mut() = Some(error);
+                        true
+                    }
+                }
+            })?;
+        if let Some(error) = failure.into_inner() {
+            return Err(error);
+        }
+        Ok(matches.keys.into_iter().zip(matches.distances).collect())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -933,6 +937,20 @@ mod tests {
 
         assert!(results.is_empty());
         assert_eq!(checked, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn filtered_search_propagates_filter_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        let query = make_vector(4, 1.0);
+        idx.add(1, &query).unwrap();
+
+        let error = idx
+            .search_filtered(&query, 1, |_| Err(anyhow!("filter failed")))
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "filter failed");
     }
 
     #[test]

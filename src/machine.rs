@@ -84,8 +84,22 @@ fn search_filtered_records(
     limit: usize,
     options: &QueryOptions,
 ) -> Result<Vec<(f32, Record)>> {
+    let has_filters = options.project.is_some()
+        || options.role.is_some()
+        || options.tool.is_some()
+        || options.session_id.is_some()
+        || options.session_scope.is_some()
+        || options.source.is_some()
+        || options.since.is_some()
+        || options.until.is_some();
+    let allowed_doc_ids = has_filters
+        .then(|| index.doc_ids_matching_filters(options))
+        .transpose()?;
     let mut accepted_records = HashMap::new();
     let candidates = vector.search_filtered(embedding, limit, |doc_id| {
+        if let Some(allowed_doc_ids) = &allowed_doc_ids {
+            return Ok(allowed_doc_ids.contains(&doc_id));
+        }
         let Some(record) = index.get_by_doc_id(doc_id)? else {
             return Ok(false);
         };
@@ -99,10 +113,13 @@ fn search_filtered_records(
     candidates
         .into_iter()
         .map(|(doc_id, distance)| {
-            accepted_records
-                .remove(&doc_id)
-                .map(|record| (distance, record))
-                .ok_or_else(|| anyhow!("accepted vector record {doc_id} was not cached"))
+            let record = match accepted_records.remove(&doc_id) {
+                Some(record) => record,
+                None => index
+                    .get_by_doc_id(doc_id)?
+                    .ok_or_else(|| anyhow!("accepted vector record {doc_id} was not found"))?,
+            };
+            Ok((distance, record))
         })
         .collect()
 }
