@@ -4,8 +4,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: i64 = 2;
 
@@ -838,11 +838,10 @@ fn claude_worktree_repo_project(cwd: &str) -> Option<String> {
 }
 
 fn git_rev_parse(cwd: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let output = command_output_with_timeout(
+        Command::new("git").args(args).current_dir(cwd),
+        Duration::from_secs(10),
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -852,6 +851,32 @@ fn git_rev_parse(cwd: &str, args: &[&str]) -> Option<String> {
         None
     } else {
         Some(text.to_string())
+    }
+}
+
+fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Option<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -1102,8 +1127,21 @@ pub fn backfill_from_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use crate::types::RecordLinks;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn command_timeout_reaps_child() {
+        let _guard = env_lock();
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+
+        assert!(command_output_with_timeout(&mut command, Duration::from_millis(20)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 
     fn record(project: &str, session_id: &str, source_path: &Path, ts: u64) -> Record {
         Record {
@@ -1449,6 +1487,7 @@ mod tests {
 
     #[test]
     fn repository_grouping_uses_git_common_dir_project() {
+        let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("memex");
         fs::create_dir_all(&repo).expect("repo dir");
