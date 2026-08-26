@@ -100,6 +100,18 @@ memex sessions --source codex --since 2026-08-01 --limit 20 --json-array
 
 `memex sessions` returns `resume_cmd`; use it when the user's goal is navigation or resumption rather than factual retrieval.
 
+### Machine scope
+
+`memex search` uses the configured machine defaults and returns each result's
+originating `machine`. Preserve that provenance and use `--machine` only when
+the request or a coverage diagnosis requires narrower scope. Do not repeat the
+same search manually over SSH.
+
+`memex sessions` remains local-only and has no `--machine` option. Do not treat
+its output as an inventory of every configured machine. Use federated search
+for discovery; use host-specific routing only when exhaustive remote session
+enumeration is required.
+
 ### Freshness
 
 `memex search` may auto-index depending on config; `memex sessions` does not. If the user explicitly asks about work from the last few minutes/hours and the index appears stale, refresh once:
@@ -108,7 +120,9 @@ memex sessions --source codex --since 2026-08-01 --limit 20 --json-array
 memex index
 ```
 
-Do not refresh again in the same retrieval task.
+`memex index` refreshes only the current machine. Do not refresh again in the
+same retrieval task. If another machine is stale or unavailable, report the
+scoped gap unless the user separately asks for remote maintenance.
 
 ## Step 3: Choose Search Modes Deliberately
 
@@ -425,6 +439,8 @@ memex sessions --cwd . --limit 20
 memex sessions --project <name> --since <date> --json-array
 ```
 
+These commands list sessions only from the current machine.
+
 ### Open results and fetch surrounding context
 
 ```bash
@@ -455,6 +471,8 @@ memex embed
 memex stats
 memex index-service status
 ```
+
+These maintenance and status commands operate only on the current machine.
 
 Embeddings are optional. If semantic/hybrid retrieval degrades to lexical but the lexical evidence is sufficient, do not turn the user's historical lookup into an embedding-maintenance task.
 
