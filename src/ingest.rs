@@ -153,12 +153,9 @@ fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize)
 
 fn file_was_replaced(previous: &FileIdentity, current: &FileIdentity) -> bool {
     previous
-        .device
-        .zip(previous.inode)
-        .zip(current.device.zip(current.inode))
-        .is_some_and(|((old_device, old_inode), (new_device, new_inode))| {
-            old_device != new_device || old_inode != new_inode
-        })
+        .inode
+        .zip(current.inode)
+        .is_some_and(|(old, new)| old != new)
         || previous
             .prefix_sha256
             .as_ref()
@@ -3006,6 +3003,23 @@ mod tests {
         assert!(replaced.delete_first);
         assert_eq!(replaced.offset, 0);
         assert!(replaced.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn device_renumbering_does_not_replace_the_same_file() {
+        let previous = FileIdentity {
+            device: Some(1),
+            inode: Some(2),
+            prefix_sha256: Some("same".to_string()),
+            prefix_bytes: 4,
+            modified_ns: Some(3),
+        };
+        let current = FileIdentity {
+            device: Some(4),
+            ..previous.clone()
+        };
+
+        assert!(!file_was_replaced(&previous, &current));
     }
 
     #[test]
