@@ -65,6 +65,24 @@ impl VectorIndex {
         Ok(())
     }
 
+    pub fn remove_ids(dir: &Path, doc_ids: &HashSet<u64>) -> Result<usize> {
+        if doc_ids.is_empty() {
+            return Ok(0);
+        }
+        let Some(storage) = active_storage(dir)? else {
+            return Ok(0);
+        };
+        let mut index = Self::open_active_snapshot(dir, storage)?;
+        let mut removed = 0;
+        for doc_id in doc_ids {
+            removed += usize::from(index.remove(*doc_id)?);
+        }
+        if removed > 0 {
+            index.save()?;
+        }
+        Ok(removed)
+    }
+
     pub fn open_or_create(dir: &Path, dimensions: usize, model: Option<&str>) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let model = model.map(str::to_string);
@@ -185,6 +203,26 @@ impl VectorIndex {
         }
 
         self.index.add(doc_id, embedding)?;
+        Ok(())
+    }
+
+    pub fn remove(&mut self, doc_id: u64) -> Result<bool> {
+        if !self.doc_id_set.remove(&doc_id) {
+            return Ok(false);
+        }
+        self.index.remove(doc_id)?;
+        Ok(true)
+    }
+
+    pub fn retain_ids(&mut self, live_ids: &HashSet<u64>) -> Result<()> {
+        let stale = self
+            .doc_id_set
+            .difference(live_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        for doc_id in stale {
+            self.remove(doc_id)?;
+        }
         Ok(())
     }
 
@@ -620,6 +658,22 @@ mod tests {
 
         assert!(tmp.path().exists());
         assert!(!tmp.path().join(CURRENT_GENERATION_FILE).exists());
+    }
+
+    #[test]
+    fn remove_ids_publishes_only_the_requested_deletions() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.add(2, &make_vector(4, 2.0)).unwrap();
+        idx.save().unwrap();
+
+        let removed = VectorIndex::remove_ids(tmp.path(), &HashSet::from([1, 3])).unwrap();
+
+        assert_eq!(removed, 1);
+        let reopened = VectorIndex::open(tmp.path()).unwrap();
+        assert!(!reopened.contains(1));
+        assert!(reopened.contains(2));
     }
 
     #[test]

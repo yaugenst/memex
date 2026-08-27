@@ -548,26 +548,6 @@ fn apply_path_deletions(
     Ok(records)
 }
 
-fn prepare_pending_ingest_recovery(
-    paths: &Paths,
-    state: &mut IngestState,
-) -> Result<Option<Vec<String>>> {
-    let pending_path = pending_ingest_path(paths);
-    let Some(pending) = PendingIngest::load(&pending_path)
-        .with_context(|| format!("load pending ingest at {}", pending_path.display()))?
-    else {
-        return Ok(None);
-    };
-
-    // Recover through the normal staging generation. Published lexical data remains immutable,
-    // and the marker stays durable until the replacement generation and derived state all land.
-    for source_path in &pending.source_paths {
-        state.files.remove(source_path);
-    }
-    state.next_doc_id = state.next_doc_id.max(pending.next_doc_id);
-    Ok(Some(pending.source_paths))
-}
-
 fn missing_paths_for_options(paths: &Paths, options: &PruneOptions) -> Result<Vec<String>> {
     let state = IngestState::load(&paths.state.join("ingest.json"))?;
     Ok(missing_state_paths(
@@ -1343,19 +1323,6 @@ fn vector_index_covers_embeddable_records(
 
 fn record_needs_embedding(record: &Record) -> bool {
     is_embedding_role(&record.role) && !record.text.is_empty()
-}
-
-fn open_vector_index_for_ingest(
-    vector_dir: &Path,
-    dimensions: usize,
-    model: ModelChoice,
-    replace: bool,
-) -> Result<crate::vector::VectorIndex> {
-    if replace {
-        crate::vector::VectorIndex::empty_replacement(vector_dir, dimensions, Some(model.as_str()))
-    } else {
-        crate::vector::VectorIndex::open_or_create(vector_dir, dimensions, Some(model.as_str()))
-    }
 }
 
 fn writer_loop(

@@ -983,7 +983,7 @@ mod tests {
             dimensions: 4,
             model: Some("test".to_string()),
             doc_ids,
-            vector_count: Some(1024),
+            vector_count: 1024,
             index_bytes: 0,
             ids_bytes: 0,
         };
@@ -1142,9 +1142,7 @@ mod tests {
             fs::read(active_dir.join("doc_ids.bin")).unwrap(),
             ids_before
         );
-        let cheap_inventory = VectorIndex::inventory(&paths.vectors).unwrap().unwrap();
-        assert_eq!(cheap_inventory.doc_ids, HashSet::from([1]));
-        assert_eq!(cheap_inventory.vector_count, 1);
+        assert!(VectorIndex::inventory(&paths.vectors).is_err());
         assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
 
         // A complete checkpoint lets this exercise repair without loading an embedding model.
