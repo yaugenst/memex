@@ -20,6 +20,11 @@ Local instructions for Codex sessions in this clone.
 - Merge local improvements into `yaugenst-flex/personal-main`.
 - Keep commits small and topic-focused.
 
+## Before Committing
+- Run `cargo fmt --check`.
+- Run `cargo clippy -- -D warnings`.
+- Do not commit if either check fails.
+
 ## Upstream Contribution Flow
 When a fix should go upstream:
 1. Start clean from `upstream/main` on a new branch: `yaugenst-flex/fix-<topic>`.
