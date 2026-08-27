@@ -126,6 +126,8 @@ pub struct IngestState {
 pub struct PendingIngest {
     pub next_doc_id: u64,
     pub source_paths: Vec<String>,
+    #[serde(default)]
+    pub vector_publication: bool,
 }
 
 impl Default for IngestState {
@@ -277,6 +279,7 @@ mod tests {
         let pending = PendingIngest {
             next_doc_id: 17,
             source_paths: vec!["session.jsonl".to_string()],
+            vector_publication: true,
         };
 
         pending.save(&path).expect("save pending ingest");
@@ -291,6 +294,15 @@ mod tests {
             PendingIngest::load(&path).expect("load cleared ingest"),
             None
         );
+    }
+
+    #[test]
+    fn legacy_pending_ingest_is_lexical_only() {
+        let pending: PendingIngest =
+            serde_json::from_str(r#"{"next_doc_id":17,"source_paths":[]}"#)
+                .expect("legacy pending ingest");
+
+        assert!(!pending.vector_publication);
     }
 
     #[test]

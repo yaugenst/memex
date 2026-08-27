@@ -568,7 +568,7 @@ fn apply_path_deletions(
 fn prepare_pending_ingest_recovery(
     paths: &Paths,
     state: &mut IngestState,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<PendingIngest>> {
     let pending_path = pending_ingest_path(paths);
     let Some(pending) = PendingIngest::load(&pending_path)
         .with_context(|| format!("load pending ingest at {}", pending_path.display()))?
@@ -583,7 +583,7 @@ fn prepare_pending_ingest_recovery(
     ScanCache::default()
         .save(&paths.state.join("scan_cache.json"))
         .context("invalidate scan cache for pending ingest recovery")?;
-    Ok(Some(pending.source_paths))
+    Ok(Some(pending))
 }
 
 fn missing_paths_for_options(paths: &Paths, options: &PruneOptions) -> Result<Vec<String>> {
@@ -720,17 +720,16 @@ pub fn ingest_all(
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
     let state_path = paths.state.join("ingest.json");
     let mut state = IngestState::load(&state_path)?;
-    let pending_recovery_paths = prepare_pending_ingest_recovery(paths, &mut state)?;
-    let recovering_pending_ingest = pending_recovery_paths.is_some();
-    if index.doc_count()? == 0 && !state.files.is_empty() {
-        let _embedding_lease = IngestLease::acquire_embedding(
-            paths,
-            "reset vectors for empty lexical index",
-            crate::lease::INGEST_LEASE_TIMEOUT,
-        )?;
+    let pending_recovery = prepare_pending_ingest_recovery(paths, &mut state)?;
+    let recovering_pending_ingest = pending_recovery.is_some();
+    let recover_vectors = pending_recovery
+        .as_ref()
+        .is_some_and(|pending| pending.vector_publication);
+    let rebuilding_empty_index = index.doc_count()? == 0 && !state.files.is_empty();
+    if rebuilding_empty_index {
+        // Rebuild lexical state without deleting the active vector generation. Backfill publishes
+        // a complete replacement only after the new lexical generation is durable.
         state.files.clear();
-        crate::vector::VectorIndex::reset(&paths.vectors)?;
-        crate::vector_backfill::reconcile(paths, index)?;
     }
 
     // Index-time exclusion: matched transcripts never enter the index, and
@@ -1096,7 +1095,10 @@ pub fn ingest_all(
         .filter(|task| task.delete_first)
         .map(|task| task.path.to_string_lossy().to_string())
         .collect::<Vec<_>>();
-    let mut delete_paths = pending_recovery_paths.unwrap_or_default();
+    let mut delete_paths = pending_recovery
+        .as_ref()
+        .map(|pending| pending.source_paths.clone())
+        .unwrap_or_default();
     delete_paths.extend(excluded_state_paths);
     delete_paths.extend(excluded_index_paths);
     delete_paths.extend(missing_paths.iter().cloned());
@@ -1123,13 +1125,17 @@ pub fn ingest_all(
     let analytics_needs_backfill = index_has_documents
         && (!AnalyticsStore::is_complete(&analytics_db)
             || !AnalyticsStore::is_ready(&analytics_db));
-    if tasks.is_empty() && delete_paths.is_empty() && can_skip_noop_index(paths, index, options)? {
+    if !recover_vectors
+        && tasks.is_empty()
+        && delete_paths.is_empty()
+        && can_skip_noop_index(paths, index, options)?
+    {
         index.publish_generation_if_uninitialized()?;
         let published_index = SearchIndex::open_or_create(&paths.index)?;
         if analytics_needs_backfill {
             backfill_from_index(&analytics_db, &published_index)?;
         }
-        if recovering_pending_ingest {
+        if recovering_pending_ingest || rebuilding_empty_index {
             state.save(&state_path)?;
         }
         update_scan_cache(paths, files_scanned, total_bytes)?;
@@ -1290,6 +1296,7 @@ pub fn ingest_all(
         let pending = PendingIngest {
             next_doc_id: next_state.next_doc_id,
             source_paths: affected_paths,
+            vector_publication: options.embeddings || recover_vectors,
         };
         let pending_path = pending_ingest_path(paths);
         match pending
@@ -1337,18 +1344,25 @@ pub fn ingest_all(
     state = candidate_state.expect("successful publication has candidate ingest state");
     state.save(&state_path)?;
     update_scan_cache(paths, files_scanned, total_bytes)?;
-    PendingIngest::clear(&pending_ingest_path(paths))?;
-    let records_embedded = if options.embeddings {
-        crate::vector_backfill::run(
-            paths,
-            &published_index,
-            options.model,
-            &options.embed_runtime,
-        )?
-        .embedded
+    let embed_model = if recover_vectors && !options.embeddings {
+        crate::vector::VectorIndex::open(&paths.vectors)
+            .ok()
+            .and_then(|vectors| {
+                vectors
+                    .model()
+                    .and_then(|model| ModelChoice::parse(model).ok())
+            })
+            .unwrap_or(options.model)
+    } else {
+        options.model
+    };
+    let records_embedded = if options.embeddings || recover_vectors {
+        crate::vector_backfill::run(paths, &published_index, embed_model, &options.embed_runtime)?
+            .embedded
     } else {
         0
     };
+    PendingIngest::clear(&pending_ingest_path(paths))?;
 
     Ok(IngestReport {
         records_added,
@@ -2086,6 +2100,50 @@ mod tests {
         vector.save().unwrap();
     }
 
+    #[test]
+    fn empty_lexical_recovery_preserves_active_vectors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("dirs");
+        IngestState {
+            next_doc_id: 10,
+            files: HashMap::from([(
+                "missing.jsonl".to_string(),
+                FileState {
+                    source: Some(SourceKind::Claude),
+                    size: 1,
+                    mtime: 1,
+                    offset: 1,
+                    turn_id: 1,
+                    parser_version: 1,
+                    pending_tool_calls: HashMap::new(),
+                    identity: FileIdentity::default(),
+                },
+            )]),
+        }
+        .save(&paths.state.join("ingest.json"))
+        .expect("stale ingest state");
+        save_vector_store(&paths, "bge", 4);
+        let pointer = fs::read(paths.vectors.join("current.json")).expect("vector pointer");
+        let index = open_search_index(&paths);
+        let options = ingest_options(false, ModelChoice::BGESmall);
+        let lease = ingest_lease(&paths);
+
+        ingest_all(&paths, &index, &options, &lease).expect("recover empty lexical index");
+
+        assert_eq!(
+            fs::read(paths.vectors.join("current.json")).expect("unchanged vector pointer"),
+            pointer
+        );
+        assert!(VectorIndex::open(&paths.vectors).unwrap().contains(1));
+        assert!(
+            IngestState::load(&paths.state.join("ingest.json"))
+                .unwrap()
+                .files
+                .is_empty()
+        );
+    }
+
     fn open_search_index(paths: &Paths) -> SearchIndex {
         fs::create_dir_all(&paths.index).expect("create index dir");
         SearchIndex::open_or_create(&paths.index).expect("open search index")
@@ -2443,6 +2501,7 @@ mod tests {
         PendingIngest {
             next_doc_id: 11,
             source_paths: vec![source_path.clone()],
+            vector_publication: true,
         }
         .save(&pending_ingest_path(&paths))
         .expect("save pending ingest");
@@ -2451,7 +2510,8 @@ mod tests {
             .expect("prepare pending ingest recovery")
             .expect("pending ingest");
 
-        assert_eq!(recovery_paths, vec![source_path.clone()]);
+        assert_eq!(recovery_paths.source_paths, vec![source_path.clone()]);
+        assert!(recovery_paths.vector_publication);
         assert_eq!(state.next_doc_id, 11);
         assert!(!state.files.contains_key(&source_path));
         assert_eq!(index.doc_count().expect("document count"), 2);
@@ -2466,6 +2526,7 @@ mod tests {
             Some(PendingIngest {
                 next_doc_id: 11,
                 source_paths: vec![source_path.clone()],
+                vector_publication: true,
             })
         );
         let options = ingest_options(false, ModelChoice::BGESmall);
@@ -2528,6 +2589,7 @@ mod tests {
         PendingIngest {
             next_doc_id: recovery_frontier,
             source_paths: vec![source_path.clone()],
+            vector_publication: false,
         }
         .save(&pending_ingest_path(&paths))
         .expect("save pending ingest");
@@ -3573,6 +3635,7 @@ mod tests {
         PendingIngest {
             next_doc_id: 2,
             source_paths: vec!["source-1.jsonl".to_string()],
+            vector_publication: false,
         }
         .save(&pending_ingest_path(&paths))
         .expect("save pending ingest");
