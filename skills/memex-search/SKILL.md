@@ -98,19 +98,21 @@ memex sessions --cwd . --limit 10 --json-array
 memex sessions --source codex --since 2026-08-01 --limit 20 --json-array
 ```
 
-`memex sessions` returns `resume_cmd`; use it when the user's goal is navigation or resumption rather than factual retrieval.
+Local `memex sessions` rows may return `resume_cmd`; use it when the user's goal is navigation or resumption rather than factual retrieval. For any row, `machine` plus `session_id` routes hydration through `memex session <session_id> --machine <machine>`.
 
 ### Machine scope
 
-`memex search` uses the configured machine defaults and returns each result's
-originating `machine`. Preserve that provenance and use `--machine` only when
-the request or a coverage diagnosis requires narrower scope. Do not repeat the
-same search manually over SSH.
+`memex search` and `memex sessions` use the configured machine defaults and
+return each result's originating `machine`. Preserve that provenance and use
+repeatable `--machine` only when the request or a coverage diagnosis requires
+narrower scope. Do not repeat the same retrieval manually over SSH.
 
-`memex sessions` remains local-only and has no `--machine` option. Do not treat
-its output as an inventory of every configured machine. Use federated search
-for discovery; use host-specific routing only when exhaustive remote session
-enumeration is required.
+For incremental session discovery, treat `machine`, `source`, `session_id`, and
+`source_path` as the session identity and `last_at` plus `message_count` as its
+update marker. `--since` is inclusive: poll again from the latest returned
+`last_at` and deduplicate repeated rows. Partial machine failures leave
+successful JSON output intact and are reported on stderr; retain that coverage
+gap in downstream reporting.
 
 ### Freshness
 
@@ -437,9 +439,10 @@ Hermes currently contributes primarily usage data; do not assume `--source herme
 memex sessions --limit 20
 memex sessions --cwd . --limit 20
 memex sessions --project <name> --since <date> --json-array
+memex sessions --machine local --machine superbaozidora --json-array
 ```
 
-These commands list sessions only from the current machine.
+These commands query the configured machines unless `--machine` narrows the scope.
 
 ### Open results and fetch surrounding context
 
@@ -506,5 +509,6 @@ Memex provides native support for:
 5. bounded JSONL batch fetching for several trajectory/session pages
 6. stable canonical record IDs and interaction neighborhoods
 7. metadata-only retrieval tracing and JSONL relevance evaluation
+8. queryless federated session enumeration for incremental discovery
 
 Prefer progressive context fetching and explicit query reformulation over treating one global top-k search as sufficient.

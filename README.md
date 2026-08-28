@@ -595,9 +595,17 @@ session start also kicks off a background incremental index.
 The plugin is backed by two new CLI surfaces that work anywhere:
 
 ```bash
-memex sessions --cwd . --limit 5     # JSONL: session_id, cwd, git_root, resume_cmd, ...
+memex sessions --cwd . --limit 5     # Federated JSONL: machine, session_id, last_at, ...
+memex sessions --since 2026-08-28T09:00:00Z --json-array
 memex herdr resume-last --cwd .      # resume the newest session for this repo into a herdr tab
 ```
+
+`memex sessions` queries the configured machines, sorts sessions by their latest indexed update,
+and keeps each machine ID so a caller can hydrate a result with
+`memex session <session_id> --machine <machine>`. Unavailable machines are reported on stderr
+without discarding results from machines that responded. Treat `machine`, `source`, `session_id`,
+and `source_path` as the session identity, and `last_at` plus `message_count` as its update marker.
+`--since` is inclusive, so incremental callers can reuse the latest `last_at` and deduplicate rows.
 
 Plugin config lives at `config.toml` in the plugin's herdr config directory and is re-read on
 every action:

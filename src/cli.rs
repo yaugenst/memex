@@ -8,9 +8,9 @@ use crate::ingest::{
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     LocatedRecord, MAX_HYDRATE_INPUT_BYTES, MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE,
-    MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec, SessionPageRequest, UsageSpec,
-    batch_session_contexts, federated_search, federated_usage, record_by_doc_id,
-    session_page_context,
+    MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec, SessionListSpec, SessionPageRequest, UsageSpec,
+    batch_session_contexts, federated_search, federated_sessions, federated_usage,
+    record_by_doc_id, session_page_context,
 };
 use crate::retrieval::canonical_record_id;
 use crate::retrieval::{ContextOptions, ContextSelector, context_records};
@@ -478,10 +478,11 @@ The input contains at most 32 requests; each page is limited to 500 records."
     /// List indexed sessions with cwd and git metadata (newest first)
     #[command(after_help = "\
 EXAMPLES:
-    memex sessions                        # 20 most recent sessions as JSONL
+    memex sessions                        # 20 most recent sessions across configured machines
     memex sessions --cwd .                # sessions from the current repo
+    memex sessions --since 2026-08-28T09:00:00Z --json-array
     memex sessions --source claude --limit 5
-    memex sessions --json-array")]
+    memex sessions --machine local --json-array")]
     Sessions {
         /// Only sessions whose cwd is this path, lives under it, or whose git root is it
         #[arg(long)]
@@ -498,6 +499,9 @@ EXAMPLES:
         /// Maximum number of sessions
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Query only these machines (repeatable; defaults to configured machines)
+        #[arg(long, value_name = "ID")]
+        machine: Vec<String>,
         /// Emit one JSON array instead of JSON Lines
         #[arg(long)]
         json_array: bool,
@@ -1121,10 +1125,13 @@ pub fn run() -> Result<()> {
             source,
             since,
             limit,
+            machine,
             json_array,
             root,
         } => {
-            run_sessions(cwd, project, source, since, limit, json_array, root)?;
+            run_sessions(
+                cwd, project, source, since, limit, machine, json_array, root,
+            )?;
         }
         Commands::Herdr { action } => match action {
             HerdrCommand::ResumeLast {
@@ -3008,37 +3015,48 @@ fn session_resume_command(
     Some((command, cwd))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sessions(
     cwd: Option<PathBuf>,
     project: Option<String>,
     source: Option<SourceFilter>,
     since: Option<String>,
     limit: usize,
+    machines: Vec<String>,
     json_array: bool,
     root: Option<PathBuf>,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let store = open_analytics_read_only(&paths)?;
-    let since_ms = parse_ts_millis(since)?;
-    let cwd_filter = canonical_cwd_filter(cwd);
-    let rows = store.query_sessions_detailed(
-        source,
-        project.as_deref(),
-        cwd_filter.as_deref(),
-        since_ms,
-        Some(limit),
+    let result = federated_sessions(
+        &paths,
+        &config,
+        &machines,
+        &SessionListSpec {
+            source,
+            project,
+            cwd: canonical_cwd_filter(cwd),
+            since_ms: parse_ts_millis(since)?,
+            limit,
+        },
     )?;
+    for (machine, error) in &result.failures {
+        eprintln!("Warning: machine '{machine}' unavailable: {error}");
+    }
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut items = Vec::new();
-    for row in &rows {
-        let resume_cmd = session_resume_command(&config, row).map(|(command, _)| command);
+    for located in &result.items {
+        let row = &located.session;
+        let resume_cmd = (located.machine == crate::machine::LOCAL_MACHINE_ID)
+            .then(|| session_resume_command(&config, row).map(|(command, _)| command))
+            .flatten();
         let mut value = serde_json::to_value(row)?;
         let object = value
             .as_object_mut()
             .expect("session row serializes to object");
+        object.insert("machine".into(), Value::String(located.machine.clone()));
         object.insert(
             "started_at".into(),
             Value::String(format_ts(row.started_at)),

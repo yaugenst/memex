@@ -133,11 +133,11 @@ exec sh -c "$remote_command --root \"$MEMEX_TEST_REMOTE_ROOT\""
     let mut paths = vec![fake_bin];
     paths.extend(std::env::split_paths(&inherited_path));
     let test_path = std::env::join_paths(paths).expect("construct test PATH");
-    let output = Command::new(binary)
+    let output = Command::new(&binary)
         .args(["search", "needle", "--root"])
         .arg(&coordinator_root)
         .args(["--machine", "remote", "--json-array"])
-        .env("PATH", test_path)
+        .env("PATH", &test_path)
         .env("MEMEX_TEST_REMOTE_ROOT", &remote_root)
         .output()
         .expect("run federated search");
@@ -148,5 +148,28 @@ exec sh -c "$remote_command --root \"$MEMEX_TEST_REMOTE_ROOT\""
         String::from_utf8_lossy(&output.stderr)
     );
     let results: Value = serde_json::from_slice(&output.stdout).expect("JSON search output");
+    assert_eq!(results, Value::Array(Vec::new()));
+
+    let output = Command::new(&binary)
+        .args(["sessions", "--root"])
+        .arg(&coordinator_root)
+        .args([
+            "--machine",
+            "remote",
+            "--since",
+            "2100-01-01",
+            "--json-array",
+        ])
+        .env("PATH", &test_path)
+        .env("MEMEX_TEST_REMOTE_ROOT", &remote_root)
+        .output()
+        .expect("run federated sessions");
+
+    assert!(
+        output.status.success(),
+        "federated sessions failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let results: Value = serde_json::from_slice(&output.stdout).expect("JSON sessions output");
     assert_eq!(results, Value::Array(Vec::new()));
 }
