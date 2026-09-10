@@ -18,11 +18,68 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 3,
+    // Bumped for the agent-file backfill mirror: forces a full re-parse
+    // so unlabeled agent-*.jsonl transcripts reclassify on next index.
+    index: 4,
     usage: 4,
 };
 
-pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
+/// Return the human-facing title Claude stores alongside a conversation.
+///
+/// Title records are metadata rather than transcript messages, so the search
+/// index intentionally does not contain them. The TUI uses this lightweight
+/// reader when it builds the recent-session list.
+pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    let mut custom_title = None;
+    let mut ai_title = None;
+    let mut agent_name = None;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != session_id)
+        {
+            continue;
+        }
+        let Some(entry_type) = value.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = match entry_type {
+            "custom-title" => value
+                .get("customTitle")
+                .or_else(|| value.get("title"))
+                .and_then(Value::as_str),
+            "ai-title" => value.get("aiTitle").and_then(Value::as_str),
+            "agent-name" => value
+                .get("agentName")
+                .or_else(|| value.get("name"))
+                .and_then(Value::as_str),
+            _ => None,
+        }
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string);
+
+        match entry_type {
+            "custom-title" if title.is_some() => custom_title = title,
+            "ai-title" if title.is_some() => ai_title = title,
+            "agent-name" if title.is_some() => agent_name = title,
+            _ => {}
+        }
+    }
+
+    custom_title.or(ai_title).or(agent_name)
+}
+
+pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
+    // `_include_agents` is a retired opt-in kept only for CLI compatibility:
+    // agent transcripts are always indexed now, matching every other source.
+    // Consumers hide them from default views via `conversation_kind`.
     let mut files = Vec::new();
     for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
         if !entry.file_type().is_file()
@@ -35,12 +92,14 @@ pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
         let under_subagents = entry.path().ancestors().any(|ancestor| {
             ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents")
         });
-        if is_agent && !include_agents {
+        if under_subagents && !is_agent {
+            // Workflow journals and other non-transcript files.
             continue;
         }
-        if under_subagents && (!include_agents || !is_agent) {
-            continue;
-        }
+        // Standard sessions live at most two levels below root
+        // (`<project>/<session>.jsonl`); only agent transcripts nest
+        // deeper, under a `subagents/` directory (see `is_subagent_path`).
+        // Anything deeper outside `subagents/` is not a session file.
         let relative_depth = entry
             .path()
             .strip_prefix(root)
@@ -58,32 +117,8 @@ pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
     Ok(files)
 }
 
-pub fn default_usage_roots() -> Vec<PathBuf> {
-    vec![
-        super::common::home().join(".claude/projects"),
-        super::common::home().join(".config/claude/projects"),
-    ]
-}
-
 pub fn usage_files() -> Vec<PathBuf> {
-    let roots = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(|root| {
-            root.to_string_lossy()
-                .split(',')
-                .map(expand_usage_root)
-                .collect()
-        })
-        .unwrap_or_else(default_usage_roots);
-    super::common::jsonl_files(roots)
-}
-
-fn expand_usage_root(path: &str) -> PathBuf {
-    let path = PathBuf::from(path.trim());
-    if path.file_name().and_then(|name| name.to_str()) == Some("projects") {
-        path
-    } else {
-        path.join("projects")
-    }
+    super::common::jsonl_files(crate::config::default_claude_sources())
 }
 
 pub fn session_id_from_path(path: &Path) -> String {
@@ -632,6 +667,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                     dedupe_confidence: if exact_dedupe { "exact" } else { "heuristic" },
                     conservative_undercount: false,
                     cache_chain_excluded: false,
+                    permission_review: false,
                     sidechain: value
                         .get("isSidechain")
                         .and_then(|value| value.as_bool())
@@ -741,11 +777,12 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn discovery_includes_subagents_only_when_requested() {
+    fn discovery_always_includes_agent_transcripts() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("main.jsonl"), "{}\n").unwrap();
         fs::write(temp.path().join("agent-child.jsonl"), "{}\n").unwrap();
-        assert_eq!(discover(temp.path(), false).unwrap().len(), 1);
+        // The retired opt-in flag no longer gates anything.
+        assert_eq!(discover(temp.path(), false).unwrap().len(), 2);
         assert_eq!(discover(temp.path(), true).unwrap().len(), 2);
     }
 
@@ -757,7 +794,7 @@ mod tests {
         fs::write(subagents.join("agent-child.jsonl"), "{}\n").unwrap();
         fs::write(subagents.join("journal.jsonl"), "{}\n").unwrap();
 
-        let files = discover(temp.path(), true).unwrap();
+        let files = discover(temp.path(), false).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(
             files[0].path.file_name().and_then(|name| name.to_str()),
@@ -786,6 +823,26 @@ mod tests {
     }
 
     #[test]
+    fn session_title_prefers_custom_title_over_ai_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"ai-title\",\"sessionId\":\"session-1\",\"aiTitle\":\"Generated title\"}\n",
+                "{\"type\":\"custom-title\",\"sessionId\":\"session-1\",\"customTitle\":\"My title\"}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_title(&path, "session-1").as_deref(),
+            Some("My title")
+        );
+        assert_eq!(session_title(&path, "another-session"), None);
+    }
+
+    #[test]
     fn usage_preserves_the_full_cwd_and_does_not_invent_a_fallback() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session.jsonl");
@@ -803,18 +860,6 @@ mod tests {
         let events = parse_usage_file(&path).unwrap();
         assert_eq!(events[0].project.as_deref(), Some("/Users/nico/Code/memex"));
         assert_eq!(events[1].project, None);
-    }
-
-    #[test]
-    fn usage_root_accepts_config_and_already_expanded_projects_paths() {
-        assert_eq!(
-            expand_usage_root("/tmp/claude"),
-            PathBuf::from("/tmp/claude/projects")
-        );
-        assert_eq!(
-            expand_usage_root("/tmp/claude/projects"),
-            PathBuf::from("/tmp/claude/projects")
-        );
     }
 
     #[test]

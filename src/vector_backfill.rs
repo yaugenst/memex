@@ -1037,7 +1037,7 @@ mod tests {
             .add_record(&mut writer, &test_record(2, "deleted.jsonl"))
             .unwrap();
         writer.commit().unwrap();
-        drop(writer);
+        writer.wait_merging_threads().unwrap();
 
         let mut store = BackfillStore::open(backfill_path(&paths)).unwrap();
         store.prepare("test", 4, 2, 0).unwrap();
@@ -1072,7 +1072,7 @@ mod tests {
             .add_record(&mut writer, &test_record(1, "one.jsonl"))
             .unwrap();
         writer.commit().unwrap();
-        drop(writer);
+        writer.wait_merging_threads().unwrap();
         assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
 
         let mut active = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
@@ -1086,7 +1086,7 @@ mod tests {
             .add_record(&mut writer, &test_record(2, "two.jsonl"))
             .unwrap();
         writer.commit().unwrap();
-        drop(writer);
+        writer.wait_merging_threads().unwrap();
         assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
 
         active.add(2, &vec![0.2; 384]).unwrap();
@@ -1096,7 +1096,7 @@ mod tests {
         let mut writer = index.writer().unwrap();
         index.delete_by_source_path(&mut writer, "one.jsonl");
         writer.commit().unwrap();
-        drop(writer);
+        writer.wait_merging_threads().unwrap();
         assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
     }
 
@@ -1111,7 +1111,7 @@ mod tests {
             .add_record(&mut writer, &test_record(1, "one.jsonl"))
             .unwrap();
         writer.commit().unwrap();
-        drop(writer);
+        writer.wait_merging_threads().unwrap();
 
         let mut active = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
         active.add(1, &vec![0.1; 384]).unwrap();
@@ -1194,7 +1194,7 @@ mod tests {
             .add_record(&mut writer, &test_record(2, "two.jsonl"))
             .unwrap();
         writer.commit().unwrap();
-        drop(writer);
+        writer.wait_merging_threads().unwrap();
 
         let mut active = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
         active.add(1, &vec![0.1; 384]).unwrap();

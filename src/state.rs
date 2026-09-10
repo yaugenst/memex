@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -7,6 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileIdentity {
+    /// SQLite commits can change only the WAL while the main file stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite_wal: Option<SqliteWalIdentity>,
     /// Stable filesystem identity when the platform exposes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<u64>,
@@ -22,6 +25,37 @@ pub struct FileIdentity {
     /// Nanosecond-resolution modification marker for detecting same-size rewrites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SqliteWalIdentity {
+    pub exists: bool,
+    pub size: u64,
+    pub modified_ns: Option<i64>,
+}
+
+impl SqliteWalIdentity {
+    pub fn read(database: &Path) -> Self {
+        let mut wal = database.as_os_str().to_os_string();
+        wal.push("-wal");
+        let Ok(metadata) = fs::metadata(Path::new(&wal)) else {
+            return Self::default();
+        };
+        // Opening a checkpointed WAL-mode database can create an empty WAL.
+        // Its creation/removal contains no commits and must not cause a reparse loop.
+        if metadata.len() == 0 {
+            return Self::default();
+        }
+        Self {
+            exists: true,
+            size: metadata.len(),
+            modified_ns: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,20 +146,39 @@ impl ScanCache {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpencodeDatabaseState {
+    pub parser_version: u32,
+    pub event_rowid: i64,
+    pub event_id: Option<String>,
+    pub owned_session_ids: HashSet<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestState {
     pub next_doc_id: u64,
     pub files: HashMap<String, FileState>,
+    #[serde(default)]
+    pub opencode_databases: HashMap<String, OpencodeDatabaseState>,
 }
 
-/// Durable intent for an ingest batch that may have crossed one or both publication boundaries.
+/// A precise source/session target for replacement and deletion work.
+#[derive(Debug, Clone, Hash, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionScope {
+    pub source_path: String,
+    pub session_id: String,
+}
+
+/// Durable intent for an ingest batch that may have crossed one publication boundary.
 ///
-/// Tantivy and SQLite cannot commit atomically together. While this marker exists, the listed
-/// source paths must be removed from both stores and reparsed before their file state is trusted.
+/// Tantivy and SQLite cannot commit atomically. While this marker exists, the listed source
+/// paths must be removed from both stores and reparsed before their ingest state is trusted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingIngest {
     pub next_doc_id: u64,
     pub source_paths: Vec<String>,
+    #[serde(default)]
+    pub session_scopes: Vec<SessionScope>,
     #[serde(default)]
     pub vector_publication: bool,
 }
@@ -135,6 +188,7 @@ impl Default for IngestState {
         Self {
             next_doc_id: 1,
             files: HashMap::new(),
+            opencode_databases: HashMap::new(),
         }
     }
 }
@@ -179,7 +233,7 @@ impl PendingIngest {
     }
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let parent = parent_directory(path)?;
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
@@ -229,6 +283,7 @@ mod tests {
         let state = IngestState {
             next_doc_id: 42,
             files: HashMap::new(),
+            opencode_databases: HashMap::new(),
         };
         state.save(&path).expect("save state");
 
@@ -279,6 +334,7 @@ mod tests {
         let pending = PendingIngest {
             next_doc_id: 17,
             source_paths: vec!["session.jsonl".to_string()],
+            session_scopes: Vec::new(),
             vector_publication: true,
         };
 
@@ -297,12 +353,32 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pending_ingest_is_lexical_only() {
+    fn pending_ingest_without_vector_flag_is_lexical_only() {
         let pending: PendingIngest =
-            serde_json::from_str(r#"{"next_doc_id":17,"source_paths":[]}"#)
-                .expect("legacy pending ingest");
+            serde_json::from_str(r#"{"next_doc_id":17,"source_paths":["session.jsonl"]}"#)
+                .expect("load legacy pending ingest");
 
         assert!(!pending.vector_publication);
+    }
+
+    #[test]
+    fn ingest_state_without_opencode_databases_remains_compatible() {
+        let state: IngestState =
+            serde_json::from_str(r#"{"next_doc_id":9,"files":{}}"#).expect("legacy state");
+        assert_eq!(state.next_doc_id, 9);
+        assert!(state.opencode_databases.is_empty());
+
+        let database = OpencodeDatabaseState {
+            parser_version: 1,
+            event_rowid: 12,
+            event_id: Some("event".to_string()),
+            owned_session_ids: HashSet::from(["session".to_string()]),
+        };
+        let round_trip = serde_json::to_string(&database).expect("serialize database state");
+        assert_eq!(
+            serde_json::from_str::<OpencodeDatabaseState>(&round_trip).unwrap(),
+            database
+        );
     }
 
     #[test]

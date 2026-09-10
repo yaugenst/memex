@@ -1,19 +1,27 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
-use crate::config::{Paths, UserConfig, default_claude_source};
+use crate::config::{Paths, UserConfig, default_claude_sources};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::{IndexRevision, QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{
-    IngestOptions, PruneOptions, ingest_all, preview_missing_paths, prune_missing_paths,
+    IngestOptions, PruneOptions, ingest_all, ingest_dirty, preview_missing_paths,
+    prune_missing_paths,
 };
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
-    LocatedRecord, MAX_HYDRATE_INPUT_BYTES, MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE,
-    MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec, SessionListSpec, SessionPageRequest, UsageSpec,
-    batch_session_contexts, federated_search, federated_sessions, federated_usage,
-    record_by_doc_id, session_page_context,
+    BoundedRecord, LocatedMemoryHit, LocatedRecord, MAX_HYDRATE_INPUT_BYTES,
+    MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
+    SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_search,
+    federated_sessions, federated_usage, read_context, read_memory, read_record,
+    read_session_pages, session_page_context,
 };
+use crate::memory::{MemoryFreshness, MemoryStore};
+use crate::memory_search::{
+    MAX_MEMORY_READ_CHARS, MemoryReadRequest, MemoryReadValue, MemorySearchMode,
+    MemorySearchOptions, embed_memory, gc_memory_vectors,
+};
+use crate::read_budget::{ContentPage, DEFAULT_MAX_CHARS, ReadBudget, ReadField};
 use crate::retrieval::canonical_record_id;
-use crate::retrieval::{ContextOptions, ContextSelector, context_records};
+use crate::retrieval::{ContextOptions, ContextSelector};
 use crate::retrieval_eval::{
     EvaluationDataset, RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace,
     fuse_ranked_queries, mean_reciprocal_rank, ndcg_at_k, recall_at_k, unique_sessions_at_k,
@@ -26,23 +34,33 @@ use crate::tui;
 use crate::types::{RecordLinks, SourceFilter};
 use crate::usage::{CostMode, UsageQuery, scan_usage};
 use crate::vector::VectorIndex;
+use crate::watch::WatchMode;
+use crate::watch::{WatchService, watch_roots};
 use anyhow::{Context, Result, anyhow};
 use chrono::SecondsFormat;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::RegexBuilder;
+use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 use std::time::Instant;
+use toml_edit::{DocumentMut, Item as TomlItem, value};
+
+mod surface;
+use surface::{
+    CliSearchMode, DaemonMcpArgs, DebugCommand, IndexCommand, IndexSource, OutputArgs,
+    OutputFormat, OutputOptions, SessionCommand, WebCommand,
+};
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -50,7 +68,8 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, and Hermes",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
     memex                           # Browse sessions interactively
@@ -61,6 +80,12 @@ LEARN MORE:
     memex <command> --help          # Detailed help for each command"
 )]
 pub struct Cli {
+    /// Never prompt or open the TUI (agents may use this even with a PTY)
+    #[arg(long, global = true)]
+    non_interactive: bool,
+    /// Skip release availability checks; does not disable stale-skill warnings
+    #[arg(long, global = true)]
+    no_update_check: bool,
     /// Defaults to the interactive TUI when no command is given
     #[command(subcommand)]
     command: Option<Commands>,
@@ -68,130 +93,138 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 struct IndexArgs {
-    /// Path to Claude projects directory [default: ~/.claude/projects]
-    #[arg(long)]
+    /// Path to Claude projects directory [default: CLAUDE_CONFIG_DIR or ~/.claude/projects]
+    #[arg(
+        long = "claude-path",
+        alias = "source",
+        value_name = "PATH",
+        help_heading = "Sources"
+    )]
     source: Option<PathBuf>,
-    /// Include agent subprocess conversations (Claude Code subagents)
-    #[arg(long)]
+    /// Index only these providers (repeatable); exclusions take precedence
+    #[arg(long, value_enum, value_name = "SOURCE", help_heading = "Sources")]
+    only_source: Vec<IndexSource>,
+    /// Skip these providers (repeatable)
+    #[arg(long, value_enum, value_name = "SOURCE", help_heading = "Sources")]
+    exclude_source: Vec<IndexSource>,
+    /// Deprecated no-op (kept for compatibility): agent subprocess
+    /// conversations are always indexed now; filter them at query time
+    #[arg(long, hide = true)]
     include_agents: bool,
     /// Index plaintext reasoning as BM25-only records (encrypted/redacted reasoning is always dropped)
-    #[arg(long)]
+    #[arg(long, help_heading = "Sources")]
     include_reasoning: bool,
     /// Index Codex sessions from ~/.codex [default: true]
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, hide = true)]
     codex: bool,
     /// Skip indexing Codex sessions
-    #[arg(long = "no-codex", default_value_t = false)]
+    #[arg(long = "no-codex", default_value_t = false, hide = true)]
     no_codex: bool,
     /// Index Opencode sessions from ~/.local/share/opencode [default: true]
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, hide = true)]
     opencode: bool,
     /// Skip indexing Opencode sessions
-    #[arg(long = "no-opencode", default_value_t = false)]
+    #[arg(long = "no-opencode", default_value_t = false, hide = true)]
     no_opencode: bool,
     /// Index Cursor agent transcripts from ~/.cursor/projects [default: true]
-    #[arg(long = "no-cursor", action = clap::ArgAction::SetFalse, default_value_t = true)]
+    #[arg(long = "no-cursor", action = clap::ArgAction::SetFalse, default_value_t = true, hide = true)]
     cursor: bool,
     /// Index Pi sessions from ~/.pi/agent/sessions or $PI_CODING_AGENT_DIR/sessions [default: true]
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, hide = true)]
     pi: bool,
     /// Skip indexing Pi sessions
-    #[arg(long = "no-pi", default_value_t = false)]
+    #[arg(long = "no-pi", default_value_t = false, hide = true)]
     no_pi: bool,
     /// Index Oh My Pi sessions from ~/.omp/agent/sessions [default: true]
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, hide = true)]
     omp: bool,
     /// Skip indexing Oh My Pi sessions
-    #[arg(long = "no-omp", default_value_t = false)]
+    #[arg(long = "no-omp", default_value_t = false, hide = true)]
     no_omp: bool,
     /// Index OpenClaw sessions from ~/.openclaw or ~/.clawdbot [default: true]
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, hide = true)]
     openclaw: bool,
     /// Skip indexing OpenClaw sessions
-    #[arg(long = "no-openclaw", default_value_t = false)]
+    #[arg(long = "no-openclaw", default_value_t = false, hide = true)]
     no_openclaw: bool,
     /// Index GitHub Copilot CLI sessions from ~/.copilot [default: true]
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, hide = true)]
     copilot: bool,
     /// Skip indexing GitHub Copilot CLI sessions
-    #[arg(long = "no-copilot", default_value_t = false)]
+    #[arg(long = "no-copilot", default_value_t = false, hide = true)]
     no_copilot: bool,
     /// Index Grok sessions from ~/.grok/sessions [default: true]
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, hide = true)]
     grok: bool,
     /// Skip indexing Grok sessions
-    #[arg(long = "no-grok", default_value_t = false)]
+    #[arg(long = "no-grok", default_value_t = false, hide = true)]
     no_grok: bool,
+    /// Index Jcode sessions from ~/.jcode/sessions [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    jcode: bool,
+    /// Skip indexing Jcode sessions
+    #[arg(long = "no-jcode", default_value_t = false, hide = true)]
+    no_jcode: bool,
+    /// Index Muse sessions from ~/.local/share/muse/sessions [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    muse: bool,
+    /// Skip indexing Muse sessions
+    #[arg(long = "no-muse", default_value_t = false, hide = true)]
+    no_muse: bool,
+    /// Index Antigravity conversations from ~/.gemini [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    antigravity: bool,
+    /// Skip indexing Antigravity conversations
+    #[arg(long = "no-antigravity", default_value_t = false, hide = true)]
+    no_antigravity: bool,
     /// Generate embeddings for semantic search during indexing
-    #[arg(long)]
+    #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
     /// Skip embedding generation (overrides config default)
-    #[arg(long)]
+    #[arg(long, help_heading = "Embeddings")]
     no_embeddings: bool,
     /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
-    #[arg(long)]
+    #[arg(long, help_heading = "Embeddings")]
     model: Option<String>,
     /// Path to memex data directory [default: ~/.memex]
-    #[arg(long)]
+    #[arg(long, help_heading = "Storage")]
     root: Option<PathBuf>,
     /// Print aggregate parser diagnostics without transcript content
-    #[arg(long)]
+    #[arg(long, help_heading = "Diagnostics")]
     diagnostics: bool,
     /// Exclude transcripts whose source path matches this glob (repeatable).
     /// Matched transcripts are never indexed. Also configurable via
     /// `exclude_paths` in ~/.memex/config.toml.
-    #[arg(long = "exclude", value_name = "GLOB")]
+    #[arg(long = "exclude", value_name = "GLOB", help_heading = "Sources")]
     exclude: Vec<String>,
-    /// Do not remove indexed paths that disappeared from successfully scanned source roots
+    /// Keep records whose source files were removed
     #[arg(long)]
     no_prune: bool,
-}
-
-#[derive(Args, Clone, Default)]
-struct PruneArgs {
-    /// Path to Claude projects directory [default: ~/.claude/projects]
-    #[arg(long)]
-    source: Option<PathBuf>,
-    /// Include missing Claude Code subagent transcript paths
-    #[arg(long)]
-    include_agents: bool,
-    /// Skip pruning Codex paths
-    #[arg(long = "no-codex")]
-    no_codex: bool,
-    /// Skip pruning OpenCode paths
-    #[arg(long = "no-opencode")]
-    no_opencode: bool,
-    /// Skip pruning Cursor paths
-    #[arg(long = "no-cursor")]
-    no_cursor: bool,
-    /// Skip pruning Pi paths
-    #[arg(long = "no-pi")]
-    no_pi: bool,
-    /// Skip pruning Oh My Pi paths
-    #[arg(long = "no-omp")]
-    no_omp: bool,
-    /// Skip pruning OpenClaw paths
-    #[arg(long = "no-openclaw")]
-    no_openclaw: bool,
-    /// Skip pruning GitHub Copilot CLI paths
-    #[arg(long = "no-copilot")]
-    no_copilot: bool,
-    /// Path to memex data directory [default: ~/.memex]
-    #[arg(long)]
-    root: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, and Grok conversation history
-    #[command(after_help = "\
+    #[command(hide = true)]
+    MigrateV019 {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Index local agent history, or maintain the index
+    #[command(
+        args_conflicts_with_subcommands = true,
+        after_help = "\
 EXAMPLES:
     memex index                         # Index all supported local history
     memex index --embeddings            # Also generate embeddings for semantic search
-    memex index --include-agents        # Include Claude Code subagent conversations
-    memex index --source ~/custom/path  # Use custom Claude projects directory")]
+    memex index --exclude '<glob>'        # Skip paths matching a glob
+    memex index --claude-path ~/custom/path  # Use custom Claude projects directory"
+    )]
     Index {
+        #[command(subcommand)]
+        action: Option<IndexCommand>,
         #[command(flatten)]
         index: IndexArgs,
         #[arg(long, hide = true)]
@@ -203,17 +236,28 @@ EXAMPLES:
             hide = true
         )]
         watch_interval: u64,
+        /// Refresh strategy for watch mode: filesystem events (default) or legacy polling
+        #[arg(long, value_enum, hide = true)]
+        watch_mode: Option<WatchMode>,
         #[arg(long, hide = true)]
         web_ui: bool,
         #[arg(long, hide = true, value_name = "ADDRESS")]
         web_listen: Option<String>,
+        #[arg(long, hide = true, conflicts_with = "no_mcp")]
+        mcp: bool,
+        #[arg(long, hide = true, conflicts_with = "mcp_listen")]
+        no_mcp: bool,
+        #[arg(long, hide = true)]
+        mcp_listen: Option<std::net::SocketAddr>,
     },
     /// Delete existing index and rebuild from scratch
+    #[command(hide = true)]
     Reindex {
         #[command(flatten)]
         index: IndexArgs,
     },
     /// Reclaim unreachable immutable index generations without rebuilding
+    #[command(hide = true)]
     IndexGc {
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
@@ -221,11 +265,12 @@ EXAMPLES:
         /// Report what would be removed without changing the index
         #[arg(long)]
         dry_run: bool,
-        /// Confirm the index service and all Memex readers are stopped
+        /// Confirm the daemon and all Memex readers are stopped
         #[arg(long)]
         offline: bool,
     },
     /// Generate embeddings for semantic search (requires existing index)
+    #[command(hide = true)]
     Embed {
         /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
         #[arg(long)]
@@ -250,13 +295,15 @@ EXAMPLES:
         #[arg(long, conflicts_with = "dry_run")]
         apply: bool,
     },
-    /// Search indexed conversation history
+    /// Search indexed conversation history and memory
     #[command(after_help = "\
 EXAMPLES:
     memex search \"error handling\"
+    memex search \"release checklist\" --content memories
+    memex search \"authentication decision\" --content all
     memex search \"API design\" --source claude --limit 50
-    memex search \"auth\" --since 2024-01-01T00:00:00Z --semantic
-    memex search \"bug\" --fields score,session_id,snippet --json-array
+    memex search \"auth\" --since 2024-01-01T00:00:00Z --mode semantic
+    memex search \"bug\" --fields score,session_id,snippet --format json
 
 TIMESTAMP FORMAT:
     RFC3339: 2024-01-15T10:30:00Z or 2024-01-15T10:30:00-05:00
@@ -264,83 +311,102 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches
+    kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches
+    memory_id, content_version, section_ref, title, heading, cwd, mtime_ms, event_dates, start_line, end_line, document_kind, refs, freshness, changed_since_search
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
     parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
     Search {
         /// Search query (keywords or natural language for semantic search)
         query: String,
+        /// Content corpus to search (conversation history by default)
+        #[arg(long, value_enum, default_value_t = SearchContent::Conversations, help_heading = "Search")]
+        content: SearchContent,
         /// Additional independent query view to fuse with reciprocal-rank fusion (repeatable)
-        #[arg(long = "query", value_name = "QUERY")]
+        #[arg(long = "query", value_name = "QUERY", help_heading = "Tuning")]
         additional_queries: Vec<String>,
         /// Restrict results to sessions from this working directory/repository
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help_heading = "Filters")]
         cwd: Option<PathBuf>,
         /// Filter by project name
-        #[arg(long)]
+        #[arg(long, help_heading = "Filters")]
         project: Option<String>,
         /// Filter by role (user, assistant, tool_use, tool_result)
-        #[arg(long)]
+        #[arg(long, help_heading = "Filters")]
         role: Option<String>,
         /// Filter by tool name (e.g., Read, Edit, Bash)
-        #[arg(long)]
+        #[arg(long, help_heading = "Filters")]
         tool: Option<String>,
         /// Filter by session ID
-        #[arg(long)]
+        #[arg(long, help_heading = "Filters")]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, or hermes
-        #[arg(long)]
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        #[arg(long, help_heading = "Filters")]
         source: Option<SourceFilter>,
+        /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
+        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular, help_heading = "Filters")]
+        origin: SessionOrigin,
+        /// Retrieval mode (default: lexical)
+        #[arg(long, value_enum, conflicts_with_all = ["semantic", "hybrid"], help_heading = "Search")]
+        mode: Option<CliSearchMode>,
         /// Use semantic (embedding-based) search instead of keyword search
-        #[arg(long)]
+        #[arg(long, hide = true)]
         semantic: bool,
         /// Use hybrid search combining BM25 keyword and semantic scores
-        #[arg(long)]
+        #[arg(long, hide = true)]
         hybrid: bool,
         /// Minimum score threshold to include in results
-        #[arg(long)]
+        #[arg(long, help_heading = "Tuning")]
         min_score: Option<f32>,
         /// Weight for recency boost (0 = no boost, higher = more recent preferred)
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value_t = 1.0, help_heading = "Tuning")]
         recency_weight: f32,
         /// Half-life in days for recency decay (lower = faster decay)
-        #[arg(long, default_value_t = 30.0)]
+        #[arg(long, default_value_t = 30.0, help_heading = "Tuning")]
         recency_half_life_days: f32,
         /// Only include results after this timestamp (RFC3339 or unix seconds/ms)
-        #[arg(long, value_name = "TIMESTAMP")]
+        #[arg(long, value_name = "TIMESTAMP", help_heading = "Filters")]
         since: Option<String>,
         /// Only include results before this timestamp (RFC3339 or unix seconds/ms)
-        #[arg(long, value_name = "TIMESTAMP")]
+        #[arg(long, value_name = "TIMESTAMP", help_heading = "Filters")]
         until: Option<String>,
         /// Maximum number of results to return
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = 20, help_heading = "Results")]
         limit: usize,
         /// Limit results per session (useful for getting variety)
-        #[arg(long = "top-n-per-session", value_name = "N")]
+        #[arg(long = "top-n-per-session", value_name = "N", help_heading = "Results")]
         top_n_per_session: Option<usize>,
         /// Return at most one result per session (shorthand for --top-n-per-session 1)
-        #[arg(long)]
+        #[arg(long, help_heading = "Results")]
         unique_session: bool,
         /// Output results as a single JSON array instead of newline-delimited JSON
-        #[arg(long)]
+        #[arg(long, hide = true)]
         json_array: bool,
+        /// Search output encoding (JSONL by default)
+        #[arg(long, value_enum, default_value = "jsonl", conflicts_with_all = ["json_array", "verbose"], help_heading = "Output")]
+        format: SearchFormat,
+        /// Pretty-print JSON (requires --format json)
+        #[arg(long, help_heading = "Output")]
+        pretty: bool,
         /// Comma-separated list of fields to include in output
-        #[arg(long, value_name = "FIELDS")]
+        #[arg(long, value_name = "FIELDS", help_heading = "Output")]
         fields: Option<String>,
+        /// Include full record text and all metadata (legacy search output)
+        #[arg(long, conflicts_with = "fields", help_heading = "Output")]
+        full: bool,
         /// Sort results by score or timestamp
-        #[arg(long, value_enum, default_value = "score")]
+        #[arg(long, value_enum, default_value = "score", help_heading = "Results")]
         sort: SortBy,
         /// Show verbose output with inline text preview
-        #[arg(short, long)]
+        #[arg(short, long, hide = true)]
         verbose: bool,
         /// Path to memex data directory [default: ~/.memex]
-        #[arg(long)]
+        #[arg(long, help_heading = "Scope")]
         root: Option<PathBuf>,
         /// Machine to search (repeatable). Defaults to multi_machine.default or all configured machines.
-        #[arg(long, value_name = "ID")]
+        #[arg(long, value_name = "ID", help_heading = "Scope")]
         machine: Vec<String>,
         /// Persist a metadata-only retrieval trace and print its ID to stderr
-        #[arg(long)]
+        #[arg(long, help_heading = "Tuning")]
         trace: bool,
     },
     /// Interactive terminal UI for browsing sessions
@@ -356,11 +422,16 @@ OUTPUT FIELDS (--fields):
         root: Option<PathBuf>,
     },
     /// Serve the local conversation browser
-    #[command(after_help = "\
+    #[command(
+        args_conflicts_with_subcommands = true,
+        after_help = "\
 EXAMPLES:
     memex web
-    memex web --listen 127.0.0.1:8080")]
+    memex web --listen 127.0.0.1:8080"
+    )]
     Web {
+        #[command(subcommand)]
+        action: Option<WebCommand>,
         /// Address and port to bind
         #[arg(long, default_value = crate::web::DEFAULT_LISTEN)]
         listen: String,
@@ -368,71 +439,114 @@ EXAMPLES:
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Run indexing as a background service via launchd (macOS only)
+    /// Manage the Memex daemon: indexing, web UI, and MCP
+    #[command(name = "daemon", aliases = ["service", "index-service"])]
     IndexService {
         #[command(subcommand)]
         action: IndexServiceCommand,
     },
-    /// Display all messages from a specific session
+    /// Read a session, or batch-read session pages
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Session {
-        /// Session ID (from search results or TUI)
-        session_id: String,
+        #[command(subcommand)]
+        action: Option<SessionCommand>,
+        /// Session ID (use -- before an ID named batch or help)
+        #[arg(required = true)]
+        session_id: Option<String>,
         /// Originating machine for federated search results
         #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
         machine: String,
-        /// Restrict hydration to this source transcript path
+        /// Read only this source transcript path
         #[arg(long)]
         source_path: Option<String>,
         /// Number of records to skip before the page
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        /// Return at most this many records (maximum 500)
+        /// Return at most this many records (default 50, maximum 500; --full defaults to all)
         #[arg(long)]
         limit: Option<usize>,
         /// Show human-readable output with timestamps and role labels
-        #[arg(short, long)]
+        #[arg(short, long, hide = true)]
         verbose: bool,
+        #[command(flatten)]
+        read: ReadArgs,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
-    /// Display a single document by its internal ID
+    /// Read a record or memory document by stable ID
     Show {
         /// Document ID (from search results)
-        doc_id: u64,
+        #[arg(required_unless_present_any = ["record_id", "memory_id"], conflicts_with_all = ["record_id", "memory_id"])]
+        doc_id: Option<u64>,
+        /// Stable canonical record ID from search output
+        #[arg(long, conflicts_with = "memory_id")]
+        record_id: Option<String>,
+        /// Stable memory document ID from memory search output
+        #[arg(long)]
+        memory_id: Option<String>,
+        /// Read one section of a memory document
+        #[arg(long, requires = "memory_id")]
+        section: Option<String>,
+        /// Version returned by search; reports if the document changed before this read
+        #[arg(long, requires = "memory_id")]
+        content_version: Option<String>,
+        /// Select a content field to continue reading
+        #[arg(long, value_enum, conflicts_with = "memory_id")]
+        field: Option<ReadField>,
+        /// Unicode character offset within the selected record field or memory document/section
+        #[arg(long, default_value_t = 0)]
+        offset_chars: usize,
         /// Originating machine for federated search results
         #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
         machine: String,
         /// Pretty-print JSON output
-        #[arg(short, long)]
+        #[arg(short, long, hide = true)]
         verbose: bool,
+        #[command(flatten)]
+        read: ReadArgs,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Hydrate bounded session pages from JSONL requests (stdin when omitted)
     #[command(
         name = "hydrate",
-        visible_alias = "hydrate-batch",
+        alias = "hydrate-batch",
+        hide = true,
         after_help = "\
 REQUEST FORMAT (one JSON object per line):
     {\"machine\":\"mini\",\"session_id\":\"abc\",\"source_path\":\"/tmp/session.jsonl\",\"offset\":0,\"limit\":100}
 
 EXAMPLES:
-    memex hydrate requests.jsonl
-    cat requests.jsonl | memex hydrate
+    memex session batch requests.jsonl
+    cat requests.jsonl | memex session batch
 
 The input contains at most 32 requests; each page is limited to 500 records."
     )]
     Hydrate {
         /// JSONL request file; omit or use '-' to read stdin
         input: Option<PathBuf>,
+        #[command(flatten)]
+        read: ReadArgs,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
-    /// Return a bounded context neighborhood around a record, document, or native event ID
+    /// Read surrounding records and linked interactions
     Context {
+        /// Originating machine for the anchor
+        #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
+        machine: String,
+        /// Skip this many records in the selected neighborhood
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Stable canonical record ID
         #[arg(long, conflicts_with_all = ["doc_id", "event_id"])]
         record_id: Option<String>,
@@ -458,13 +572,23 @@ The input contains at most 32 requests; each page is limited to 500 records."
         #[arg(long)]
         expand_interactions: bool,
         /// Pretty-print the JSON result
-        #[arg(short, long)]
+        #[arg(short, long, hide = true)]
         verbose: bool,
+        #[command(flatten)]
+        read: ReadArgs,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Developer diagnostics and retrieval evaluation
+    Debug {
+        #[command(subcommand)]
+        action: DebugCommand,
     },
     /// Run retrieval queries from a JSONL evaluation dataset
+    #[command(hide = true)]
     EvalRetrieval {
         /// JSONL evaluation dataset path
         dataset: PathBuf,
@@ -475,22 +599,58 @@ The input contains at most 32 requests; each page is limited to 500 records."
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// List this machine and enabled configured peers (without connecting)
+    Machines {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// List every indexed project with session count and latest activity
+    Projects {
+        /// Filter by source
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Read one machine (defaults to local; ignores configured search defaults)
+        #[arg(long)]
+        machine: Option<String>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// List indexed sessions with cwd and git metadata (newest first)
     #[command(after_help = "\
 EXAMPLES:
-    memex sessions                        # 20 most recent sessions across configured machines
+    memex sessions                        # 20 most recent sessions as JSONL
     memex sessions --cwd .                # sessions from the current repo
-    memex sessions --since 2026-08-28T09:00:00Z --json-array
     memex sessions --source claude --limit 5
-    memex sessions --machine local --json-array")]
+    memex sessions --format json")]
     Sessions {
+        /// Return one exact count object instead of session rows (unavailable totals are null)
+        #[arg(long)]
+        count: bool,
+        /// Count conversations matching this lexical query; requires --count
+        #[arg(long, requires = "count", conflicts_with = "cwd")]
+        query: Option<String>,
+        /// Query these machines (repeatable; defaults to configured machines)
+        #[arg(long)]
+        machine: Vec<String>,
+        /// Match this exact session ID
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Match this exact indexed source path
+        #[arg(long)]
+        source_path: Option<String>,
         /// Only sessions whose cwd is this path, lives under it, or whose git root is it
         #[arg(long)]
         cwd: Option<PathBuf>,
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -499,15 +659,20 @@ EXAMPLES:
         /// Maximum number of sessions
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Query only these machines (repeatable; defaults to configured machines)
-        #[arg(long, value_name = "ID")]
-        machine: Vec<String>,
+        /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
+        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
+        origin: SessionOrigin,
+        /// Only show interactive sessions (alias for --origin interactive)
+        #[arg(long, conflicts_with = "origin", hide = true)]
+        interactive_only: bool,
         /// Emit one JSON array instead of JSON Lines
-        #[arg(long)]
+        #[arg(long, hide = true)]
         json_array: bool,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Herdr plugin helpers (used by herdr/plugin.sh)
     #[command(hide = true)]
@@ -516,6 +681,7 @@ EXAMPLES:
         action: HerdrCommand,
     },
     /// Show index statistics (document count, vector count, storage paths)
+    #[command(hide = true)]
     Stats {
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
@@ -526,11 +692,14 @@ EXAMPLES:
 EXAMPLES:
     memex usage
     memex usage --source codex --since 2026-07-01
-    memex usage --json")]
+    memex usage --format json")]
     Usage {
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
         #[arg(long)]
         source: Option<SourceFilter>,
+        /// Session origin; all includes permission-review usage
+        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
+        origin: SessionOrigin,
         /// Only include events on or after this date/timestamp
         #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
         since: Option<String>,
@@ -538,10 +707,10 @@ EXAMPLES:
         #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
         until: Option<String>,
         /// Emit the report as JSON
-        #[arg(long)]
+        #[arg(long, hide = true)]
         json: bool,
         /// Include normalized request-level events in JSON output
-        #[arg(long, requires = "json")]
+        #[arg(long)]
         events: bool,
         /// Cost source: stored source cost, automatic fallback, or API-rate repricing
         #[arg(long, value_enum, default_value = "auto")]
@@ -552,6 +721,8 @@ EXAMPLES:
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Rebuild the SQLite analytics cache from the existing Tantivy index
     #[command(hide = true)]
@@ -579,9 +750,12 @@ EXAMPLES:
         #[arg(short, long)]
         force: bool,
     },
-    /// Update memex to the latest version
+    /// Update memex and refresh existing memex-search skill copies
+    #[command(
+        after_help = "Use --yes for agents and scripts, including shells with a PTY.\nWithout --yes, update requires a terminal and asks for confirmation.\nExisting skill copies are replaced; missing copies are not installed."
+    )]
     Update {
-        /// Skip confirmation prompt
+        /// Update without prompting (for agents and scripts)
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -641,6 +815,35 @@ EXAMPLES:
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Run the Model Context Protocol server (Streamable HTTP by default)
+    Mcp {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "http")]
+        transport: McpTransport,
+        /// HTTP socket address (default: [mcp].listen or 127.0.0.1:5363)
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+        /// Additional accepted HTTP Host authority; repeat for multiple hosts
+        #[arg(long)]
+        allowed_host: Vec<String>,
+        /// Accepted browser Origin; repeat for multiple origins
+        #[arg(long)]
+        allowed_origin: Vec<String>,
+        /// Public HTTPS origin enabling built-in OAuth (e.g. https://memex.example.com)
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Revoke all OAuth grants in this data directory and exit
+        #[arg(long)]
+        revoke_all: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum McpTransport {
+    Http,
+    Stdio,
 }
 
 #[derive(Debug, Subcommand)]
@@ -692,7 +895,7 @@ enum HerdrCommand {
         /// Refuse when no resumable session exists in --cwd instead of using another project
         #[arg(long)]
         strict_cwd: bool,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -752,9 +955,202 @@ impl From<TransferMode> for CoreTransferMode {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize, JsonSchema,
+)]
+#[value(rename_all = "kebab-case")]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SessionOrigin {
+    /// Ordinary sessions, including subagents, without permission reviews.
+    #[default]
+    Regular,
+    Interactive,
+    Subagent,
+    /// Every session, including permission reviews.
+    All,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum McpSearchMode {
+    #[default]
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize, JsonSchema)]
+#[value(rename_all = "kebab-case")]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SearchContent {
+    #[default]
+    Conversations,
+    Memories,
+    All,
+}
+
+impl From<McpSearchMode> for SearchMode {
+    fn from(value: McpSearchMode) -> Self {
+        match value {
+            McpSearchMode::Lexical => SearchMode::Lexical,
+            McpSearchMode::Semantic => SearchMode::Semantic,
+            McpSearchMode::Hybrid => SearchMode::Hybrid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum McpSearchSort {
+    #[default]
+    Score,
+    Ts,
+}
+
+impl From<McpSearchSort> for SortBy {
+    fn from(value: McpSearchSort) -> Self {
+        match value {
+            McpSearchSort::Score => SortBy::Score,
+            McpSearchSort::Ts => SortBy::Ts,
+        }
+    }
+}
+
+fn default_mcp_limit() -> usize {
+    20
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_recency_weight() -> f32 {
+    1.0
+}
+
+fn default_recency_half_life_days() -> f32 {
+    30.0
+}
+
+/// Parameters for the MCP search tool. Results always use Memex's compact,
+/// bounded search projection; complete transcript text is available through
+/// the bounded read tools.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchRequest {
+    /// Keywords or natural-language query.
+    pub(crate) query: String,
+    /// Search conversations, memories, or both. Defaults to conversations.
+    #[serde(default)]
+    pub(crate) content: SearchContent,
+    /// Additional query views fused with reciprocal-rank fusion.
+    #[serde(default)]
+    pub(crate) additional_queries: Vec<String>,
+    /// Restrict results to sessions from this directory or repository.
+    pub(crate) cwd: Option<String>,
+    /// Repository/project grouping to search.
+    pub(crate) project: Option<String>,
+    /// Record role such as user, assistant, tool_use, or tool_result.
+    pub(crate) role: Option<String>,
+    /// Tool name such as Read, Edit, or Bash.
+    pub(crate) tool: Option<String>,
+    /// Exact session ID.
+    pub(crate) session: Option<String>,
+    /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
+    pub(crate) source: Option<String>,
+    /// Session origin: regular (default) excludes permission reviews; all includes them. Interactive and subagent select ordinary session subsets.
+    #[serde(default)]
+    pub(crate) origin: SessionOrigin,
+    /// Lexical, semantic, or hybrid retrieval.
+    #[serde(default)]
+    pub(crate) mode: McpSearchMode,
+    /// Earliest timestamp (RFC3339, date, unix seconds, or unix milliseconds).
+    pub(crate) since: Option<String>,
+    /// Latest timestamp (RFC3339, unix seconds, or unix milliseconds).
+    pub(crate) until: Option<String>,
+    /// Maximum returned results (1-500).
+    #[serde(default = "default_mcp_limit")]
+    pub(crate) limit: usize,
+    /// Maximum results from any one session.
+    pub(crate) top_n_per_session: Option<usize>,
+    /// Return at most one result per session unless top_n_per_session is set.
+    #[serde(default = "default_true")]
+    pub(crate) unique_session: bool,
+    /// Sort by retrieval score or record timestamp.
+    #[serde(default)]
+    pub(crate) sort: McpSearchSort,
+    /// Drop results below this retrieval score.
+    pub(crate) min_score: Option<f32>,
+    /// Strength of the recency boost (0 disables it).
+    #[serde(default = "default_recency_weight")]
+    pub(crate) recency_weight: f32,
+    /// Half-life in days for recency decay.
+    #[serde(default = "default_recency_half_life_days")]
+    pub(crate) recency_half_life_days: f32,
+    /// Machine IDs to search. Empty uses the configured defaults.
+    #[serde(default)]
+    pub(crate) machines: Vec<String>,
+}
+
+/// Parameters for the MCP session-listing tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionsRequest {
+    /// Match this exact session ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    /// Match this exact indexed source path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_path: Option<String>,
+    /// Restrict sessions to this directory or repository.
+    pub(crate) cwd: Option<String>,
+    /// Repository/project grouping to list.
+    pub(crate) project: Option<String>,
+    /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
+    pub(crate) source: Option<String>,
+    /// Earliest activity timestamp (RFC3339, date, unix seconds, or unix milliseconds).
+    pub(crate) since: Option<String>,
+    /// Session origin: regular (default) excludes permission reviews; all includes them. Interactive and subagent select ordinary session subsets.
+    #[serde(default)]
+    pub(crate) origin: SessionOrigin,
+    /// Maximum returned sessions (1-500).
+    #[serde(default = "default_mcp_limit")]
+    pub(crate) limit: usize,
+}
+
+impl From<SessionOrigin> for crate::analytics::SessionKindFilter {
+    fn from(value: SessionOrigin) -> Self {
+        match value {
+            SessionOrigin::Interactive => crate::analytics::SessionKindFilter::Primary,
+            SessionOrigin::Subagent => crate::analytics::SessionKindFilter::Subagent,
+            SessionOrigin::Regular => crate::analytics::SessionKindFilter::Regular,
+            SessionOrigin::All => crate::analytics::SessionKindFilter::All,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum IndexServiceCommand {
-    /// Enable automatic background indexing (launchd on macOS, systemd on Linux)
+    /// Run the configured daemon in the foreground
+    Run {
+        #[command(flatten)]
+        index: IndexArgs,
+        /// Serve the browser (also configurable with index_service_web_ui)
+        #[arg(long)]
+        web_ui: bool,
+        /// Browser listener (implies --web-ui)
+        #[arg(long)]
+        web_listen: Option<String>,
+        /// Seconds between index refreshes (default: config or 30)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_interval: Option<u64>,
+        /// Refresh strategy: filesystem events (default) or legacy polling
+        #[arg(long, value_enum)]
+        watch_mode: Option<WatchMode>,
+        #[command(flatten)]
+        mcp: DaemonMcpArgs,
+    },
+    /// Enable the background daemon (launchd on macOS, systemd on Linux)
     Enable {
         #[command(flatten)]
         index: IndexArgs,
@@ -767,6 +1163,9 @@ enum IndexServiceCommand {
         /// Seconds between index checks in continuous mode [default: 30]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         poll_interval: Option<u64>,
+        /// Refresh strategy for continuous mode: filesystem events (default) or legacy polling
+        #[arg(long, value_enum)]
+        watch_mode: Option<WatchMode>,
         /// Seconds between invocations in interval mode [default: 3600]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         interval: Option<u64>,
@@ -788,8 +1187,10 @@ enum IndexServiceCommand {
         /// Path to systemd user directory (Linux only) [default: ~/.config/systemd/user]
         #[arg(long)]
         systemd_dir: Option<PathBuf>,
+        #[command(flatten)]
+        mcp: DaemonMcpArgs,
     },
-    /// Regenerate and restart the background indexing service using current config
+    /// Regenerate and restart the daemon using current config
     Restart {
         #[command(flatten)]
         index: IndexArgs,
@@ -802,6 +1203,9 @@ enum IndexServiceCommand {
         /// Seconds between index checks in continuous mode [default: 30]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         poll_interval: Option<u64>,
+        /// Refresh strategy for continuous mode: filesystem events (default) or legacy polling
+        #[arg(long, value_enum)]
+        watch_mode: Option<WatchMode>,
         /// Seconds between invocations in interval mode [default: 3600]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         interval: Option<u64>,
@@ -823,9 +1227,14 @@ enum IndexServiceCommand {
         /// Path to systemd user directory (Linux only) [default: ~/.config/systemd/user]
         #[arg(long)]
         systemd_dir: Option<PathBuf>,
+        #[command(flatten)]
+        mcp: DaemonMcpArgs,
     },
     /// Open the authenticated Web UI in the default browser
+    #[command(hide = true)]
     Open {
+        #[arg(long, hide = true)]
+        print_url: bool,
         /// Web UI address and port [default: config or 127.0.0.1:6363]
         #[arg(long, value_name = "ADDRESS")]
         listen: Option<String>,
@@ -833,7 +1242,7 @@ enum IndexServiceCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Show the registered service state and Web UI status
+    /// Show daemon, web UI, and MCP status
     Status {
         /// Service label/name [default: com.memex.index (macOS) or memex-index (Linux)]
         #[arg(long)]
@@ -848,7 +1257,7 @@ enum IndexServiceCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Disable and remove the background indexing service
+    /// Disable and remove the background daemon
     Disable {
         /// Service label/name [default: com.memex.index (macOS) or memex-index (Linux)]
         #[arg(long)]
@@ -867,36 +1276,91 @@ enum IndexServiceCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let interactive = interaction_allowed(
+        cli.non_interactive,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+        agent_or_ci_environment(),
+    );
+    let check_updates = !cli.no_update_check;
+    if cli.command.is_none() && !interactive {
+        if check_updates {
+            print_update_notice(available_update().as_deref());
+        }
+        warn_if_skill_outdated();
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
     // Bare `memex` opens the TUI home screen.
-    let command = cli.command.unwrap_or(Commands::Tui {
-        query: None,
-        project: None,
-        root: None,
-    });
+    let command = cli
+        .command
+        .unwrap_or(Commands::Tui {
+            query: None,
+            project: None,
+            root: None,
+        })
+        .canonicalize();
+    if !interactive
+        && matches!(
+            command,
+            Commands::Setup { .. }
+                | Commands::Skill {
+                    command: SkillCommand::Install { target: None }
+                }
+        )
+    {
+        return Err(anyhow!(
+            "skill installation requires a destination without interactive selection; use `memex skill install --target shared`, `--target claude`, or `--target all`"
+        ));
+    }
     let should_check = !matches!(
         command,
         Commands::Tui { .. }
             | Commands::Update { .. }
+            | Commands::Skill { .. }
             | Commands::Rpc { .. }
+            | Commands::Mcp { .. }
             | Commands::Herdr { .. }
     );
-    if should_check {
-        check_for_update_async(None);
+    if should_check && check_updates {
+        print_update_notice(available_update().as_deref());
+    }
+    if matches!(command, Commands::Search { .. }) {
+        warn_if_skill_outdated();
     }
     match command {
+        Commands::MigrateV019 { root, dry_run } => {
+            let report = crate::migration::migrate_v019(&Paths::new(root)?, dry_run)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Commands::Index {
+            action: _,
             index,
             watch,
             watch_interval,
+            watch_mode,
             web_ui,
             web_listen,
+            mcp,
+            no_mcp,
+            mcp_listen,
         } => {
-            if watch {
+            if watch || watch_mode.is_some() {
                 let listen = (web_ui || web_listen.is_some())
                     .then(|| web_listen.unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string()));
-                run_index_loop(&index, watch_interval, listen)?;
-            } else if web_ui || web_listen.is_some() {
-                return Err(anyhow!("--web-ui requires --watch"));
+                let config = UserConfig::load(&Paths::new(index.root.clone())?)?;
+                let mcp = DaemonMcpArgs {
+                    mcp,
+                    no_mcp,
+                    mcp_listen,
+                }
+                .resolve(&config);
+                let mode = watch_mode.unwrap_or(WatchMode::Events);
+                run_index_loop(&index, mode, watch_interval, listen, mcp)?;
+            } else if web_ui || web_listen.is_some() || mcp || no_mcp || mcp_listen.is_some() {
+                return Err(anyhow!("server options require `memex daemon run`"));
             } else {
                 run_index_args(&index, false, false)?;
             }
@@ -921,6 +1385,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Search {
             query,
+            content,
             additional_queries,
             cwd,
             project,
@@ -928,8 +1393,10 @@ pub fn run() -> Result<()> {
             tool,
             session,
             source,
+            origin,
             semantic,
             hybrid,
+            mode,
             min_score,
             recency_weight,
             recency_half_life_days,
@@ -939,7 +1406,10 @@ pub fn run() -> Result<()> {
             top_n_per_session,
             unique_session,
             json_array,
+            format,
+            pretty,
             fields,
+            full,
             sort,
             verbose,
             root,
@@ -948,6 +1418,7 @@ pub fn run() -> Result<()> {
         } => {
             run_search(
                 query,
+                content,
                 additional_queries,
                 cwd,
                 project,
@@ -955,8 +1426,9 @@ pub fn run() -> Result<()> {
                 tool,
                 session,
                 source,
-                semantic,
-                hybrid,
+                origin,
+                mode.map_or(semantic, |mode| mode == CliSearchMode::Semantic),
+                mode.map_or(hybrid, |mode| mode == CliSearchMode::Hybrid),
                 min_score,
                 recency_weight,
                 recency_half_life_days,
@@ -966,7 +1438,10 @@ pub fn run() -> Result<()> {
                 top_n_per_session,
                 unique_session,
                 json_array,
+                format,
+                pretty,
                 fields,
+                full,
                 sort,
                 verbose,
                 root,
@@ -979,19 +1454,61 @@ pub fn run() -> Result<()> {
             project,
             root,
         } => {
-            let (update_tx, update_rx) = std::sync::mpsc::channel();
-            check_for_update_async(Some(update_tx));
-            tui::run(root, Some(update_rx), query, project)?;
+            if !interactive {
+                return Err(anyhow!(
+                    "TUI requires an interactive human terminal; use `memex search` or `memex sessions` for agent/script output"
+                ));
+            }
+            let latest = check_updates.then(available_update).flatten();
+            if let Some(latest) = latest.as_deref() {
+                print_update_notice(Some(latest));
+                if confirm_update()? {
+                    perform_update(Some(latest))?;
+                    println!("Update finished. Run `memex` again to start the installed version.");
+                    return Ok(());
+                }
+            }
+            let update_rx = latest.map(|latest| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(format!("update: v{latest} (memex update)"));
+                rx
+            });
+            tui::run(root, update_rx, query, project)?;
         }
-        Commands::Web { listen, root } => {
+        Commands::Web { listen, root, .. } => {
             crate::web::serve(root, &listen)?;
         }
         Commands::IndexService { action } => match action {
+            IndexServiceCommand::Run {
+                index,
+                web_ui,
+                web_listen,
+                poll_interval,
+                watch_mode,
+                mcp,
+            } => {
+                let config = UserConfig::load(&Paths::new(index.root.clone())?)?;
+                let web = (web_ui || web_listen.is_some() || config.index_service_web_ui_default())
+                    .then(|| {
+                        web_listen
+                            .or_else(|| config.index_service_web_listen.clone())
+                            .unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string())
+                    });
+                let mode = watch_mode.unwrap_or(config.index_service_watch_mode()?);
+                let interval = poll_interval.unwrap_or(match mode {
+                    WatchMode::Events => config.index_service_resync_interval(),
+                    WatchMode::Poll => config.index_service_poll_interval(),
+                });
+                anyhow::ensure!(interval > 0, "poll interval must be positive");
+                run_index_loop(&index, mode, interval, web, mcp.resolve(&config))?;
+            }
             IndexServiceCommand::Enable {
                 index,
+                mcp,
                 label,
                 continuous,
                 poll_interval,
+                watch_mode,
                 interval,
                 web_ui,
                 web_listen,
@@ -1002,9 +1519,11 @@ pub fn run() -> Result<()> {
             } => {
                 run_index_service_enable(
                     &index,
+                    mcp,
                     label,
                     continuous,
                     poll_interval,
+                    watch_mode,
                     interval,
                     web_ui,
                     web_listen,
@@ -1016,9 +1535,11 @@ pub fn run() -> Result<()> {
             }
             IndexServiceCommand::Restart {
                 index,
+                mcp,
                 label,
                 continuous,
                 poll_interval,
+                watch_mode,
                 interval,
                 web_ui,
                 web_listen,
@@ -1029,9 +1550,11 @@ pub fn run() -> Result<()> {
             } => {
                 run_index_service_enable(
                     &index,
+                    mcp,
                     label,
                     continuous,
                     poll_interval,
+                    watch_mode,
                     interval,
                     web_ui,
                     web_listen,
@@ -1049,8 +1572,12 @@ pub fn run() -> Result<()> {
             } => {
                 run_index_service_status(label, plist, systemd_dir, root)?;
             }
-            IndexServiceCommand::Open { listen, root } => {
-                run_index_service_open(listen, root)?;
+            IndexServiceCommand::Open {
+                listen,
+                root,
+                print_url,
+            } => {
+                run_index_service_open(listen, root, print_url)?;
             }
             IndexServiceCommand::Disable {
                 label,
@@ -1062,36 +1589,98 @@ pub fn run() -> Result<()> {
             }
         },
         Commands::Session {
+            action: _,
             session_id,
             machine,
             source_path,
             offset,
             limit,
             verbose,
+            output,
+            read,
             root,
         } => {
-            run_session(
-                session_id,
+            run_session(SessionRunArgs {
+                session_id: session_id.context("provide a session ID")?,
                 machine,
                 source_path,
                 offset,
                 limit,
-                verbose,
+                output: output.resolve(
+                    OutputFormat::Jsonl,
+                    verbose.then_some(OutputFormat::Text),
+                    false,
+                )?,
+                read,
                 root,
-            )?;
+            })?;
         }
         Commands::Show {
             doc_id,
+            record_id,
+            memory_id,
+            section,
+            content_version,
+            field,
+            offset_chars,
             machine,
             verbose,
+            output,
+            read,
             root,
         } => {
-            run_show(doc_id, machine, verbose, root)?;
+            let output = output.resolve(OutputFormat::Json, None, verbose)?;
+            if let Some(memory_id) = memory_id {
+                run_show_memory(MemoryShowRunArgs {
+                    memory_id,
+                    section,
+                    content_version,
+                    offset_chars,
+                    machine,
+                    output,
+                    read,
+                    root,
+                })?;
+            } else {
+                if offset_chars != 0 && field.is_none() {
+                    return Err(anyhow!("--offset-chars requires --field for record reads"));
+                }
+                let selector = match (doc_id, record_id) {
+                    (Some(id), None) => ContextSelector::doc_id(id),
+                    (None, Some(id)) => ContextSelector::record_id(id),
+                    _ => {
+                        return Err(anyhow!(
+                            "provide a document ID, --record-id, or --memory-id"
+                        ));
+                    }
+                };
+                run_show(ShowRunArgs {
+                    selector,
+                    field,
+                    offset_chars,
+                    machine,
+                    output,
+                    read,
+                    root,
+                })?;
+            }
         }
-        Commands::Hydrate { input, root } => {
-            run_hydrate(input, root)?;
+        Commands::Hydrate {
+            input,
+            read,
+            root,
+            output,
+        } => {
+            run_hydrate(
+                input,
+                read,
+                root,
+                output.resolve(OutputFormat::Jsonl, None, false)?,
+            )?;
         }
         Commands::Context {
+            machine,
+            offset,
             record_id,
             doc_id,
             event_id,
@@ -1101,9 +1690,13 @@ pub fn run() -> Result<()> {
             after,
             expand_interactions,
             verbose,
+            output,
+            read,
             root,
         } => {
             run_context(ContextRunArgs {
+                machine,
+                offset,
                 record_id,
                 doc_id,
                 event_id,
@@ -1112,25 +1705,120 @@ pub fn run() -> Result<()> {
                 before,
                 after,
                 expand_interactions,
-                verbose,
+                output: output.resolve(OutputFormat::Json, None, verbose)?,
+                read,
                 root,
             })?;
         }
-        Commands::EvalRetrieval { dataset, k, root } => {
+        Commands::Debug {
+            action: DebugCommand::EvalRetrieval { dataset, k, root },
+        }
+        | Commands::EvalRetrieval { dataset, k, root } => {
             run_eval_retrieval(dataset, k, root)?;
         }
+        Commands::Machines { root, output } => {
+            let paths = Paths::new(root)?;
+            let config = UserConfig::load(&paths)?;
+            output
+                .resolve(OutputFormat::Jsonl, None, false)?
+                .print_values(crate::machine::configured_machine_summaries(&config)?)?;
+        }
+        Commands::Projects {
+            source,
+            machine,
+            root,
+            output,
+        } => {
+            let paths = Paths::new(root)?;
+            let mut items = if let Some(id) = machine
+                .as_deref()
+                .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
+            {
+                let config = UserConfig::load(&paths)?;
+                crate::machine::remote_project_summaries(&config, id, source)?
+            } else {
+                collect_projects(&paths, source)?
+            };
+            if let Some(machine) = machine {
+                for item in &mut items {
+                    item["machine"] = Value::String(machine.clone());
+                }
+            }
+            output
+                .resolve(OutputFormat::Jsonl, None, false)?
+                .print_values(items)?;
+        }
         Commands::Sessions {
+            count,
+            query,
+            machine,
+            session_id,
+            source_path,
             cwd,
             project,
             source,
             since,
             limit,
-            machine,
+            origin,
+            interactive_only,
             json_array,
+            output,
             root,
         } => {
+            let origin = if interactive_only {
+                SessionOrigin::Interactive
+            } else {
+                origin
+            };
+            if count {
+                let paths = Paths::new(root)?;
+                let request = SessionsRequest {
+                    session_id,
+                    source_path,
+                    cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
+                    project,
+                    source: source.map(|value| value.as_str().to_string()),
+                    since,
+                    limit,
+                    origin,
+                };
+                anyhow::ensure!(
+                    machine.len() <= 1,
+                    "session counts accept at most one machine"
+                );
+                let result = if let Some(id) = machine
+                    .first()
+                    .map(String::as_str)
+                    .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
+                {
+                    crate::machine::remote_session_count(
+                        &UserConfig::load(&paths)?,
+                        id,
+                        request,
+                        query,
+                    )?
+                } else {
+                    collect_session_count(&paths, request, query)?
+                };
+                println!("{}", serde_json::to_string(&result)?);
+                return Ok(());
+            }
             run_sessions(
-                cwd, project, source, since, limit, machine, json_array, root,
+                session_id,
+                source_path,
+                cwd,
+                project,
+                source,
+                since,
+                limit,
+                origin,
+                output.resolve(
+                    OutputFormat::Jsonl,
+                    json_array.then_some(OutputFormat::Json),
+                    false,
+                )?,
+                root,
+                machine,
             )?;
         }
         Commands::Herdr { action } => match action {
@@ -1155,9 +1843,11 @@ pub fn run() -> Result<()> {
         }
         Commands::Usage {
             source,
+            origin,
             since,
             until,
             json,
+            output,
             events,
             cost,
             root,
@@ -1165,9 +1855,14 @@ pub fn run() -> Result<()> {
         } => {
             run_usage(UsageCommandOptions {
                 source,
+                origin,
                 since,
                 until,
-                json,
+                output: output.resolve(
+                    OutputFormat::Text,
+                    json.then_some(OutputFormat::Json),
+                    json,
+                )?,
                 include_events: events,
                 cost_mode: cost,
                 root,
@@ -1189,7 +1884,18 @@ pub fn run() -> Result<()> {
             run_skill_install(None, force.then_some(SkillWriteMode::Replace))?;
         }
         Commands::Update { yes } => {
-            run_update(yes)?;
+            if !yes {
+                if !interactive {
+                    return Err(anyhow!(
+                        "update requires confirmation; use `memex update --yes` for a noninteractive update of memex and installed skills"
+                    ));
+                }
+                if !confirm_update()? {
+                    println!("Update cancelled.");
+                    return Ok(());
+                }
+            }
+            perform_update(None)?;
         }
         Commands::Share {
             session_id,
@@ -1212,61 +1918,40 @@ pub fn run() -> Result<()> {
         Commands::Rpc { root } => {
             crate::machine::run_rpc_stdio(root)?;
         }
+        Commands::Mcp {
+            root,
+            transport,
+            listen,
+            allowed_host,
+            allowed_origin,
+            public_url,
+            revoke_all,
+        } => {
+            if revoke_all {
+                let count = crate::mcp::revoke_all(root)?;
+                println!("Revoked {count} OAuth grants");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                transport == McpTransport::Http || public_url.is_none(),
+                "--public-url requires the HTTP transport"
+            );
+            let http = if transport == McpTransport::Http {
+                let config = UserConfig::load(&Paths::new(root.clone())?)?;
+                Some(surface::mcp_http_options(
+                    &config,
+                    listen,
+                    allowed_host,
+                    allowed_origin,
+                    public_url,
+                ))
+            } else {
+                None
+            };
+            crate::mcp::run(root, http)?;
+        }
     }
     Ok(())
-}
-
-fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<String>) -> Result<()> {
-    let paths = Paths::new(index.root.clone())?;
-    let mut lexical = index.clone();
-    lexical.embeddings = false;
-    lexical.no_embeddings = true;
-    let shutdown = watch_shutdown_flag()?;
-    let mut worker = EmbeddingWorker::default();
-    let mut worker_spec = None;
-    let mut vector_work = VectorWorkState::default();
-
-    let _web_thread = initialize_index_loop(
-        || {
-            run_index_cycle(
-                index,
-                &lexical,
-                &paths,
-                &mut worker,
-                &mut worker_spec,
-                &mut vector_work,
-            )
-        },
-        || {
-            web_listen
-                .as_deref()
-                .map(|listen| crate::web::spawn(index.root.clone(), listen))
-                .transpose()
-        },
-    )?;
-    let interval = Duration::from_secs(interval_secs);
-    while wait_for_next_index_cycle(interval, &shutdown) {
-        run_index_cycle(
-            index,
-            &lexical,
-            &paths,
-            &mut worker,
-            &mut worker_spec,
-            &mut vector_work,
-        )?;
-        std::io::stdout().flush().ok();
-    }
-    worker.stop()?;
-    Ok(())
-}
-
-fn initialize_index_loop<T>(
-    index_once: impl FnOnce() -> Result<()>,
-    start_web: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    let web = start_web()?;
-    index_once()?;
-    Ok(web)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1292,9 +1977,8 @@ fn load_embed_worker_spec(index: &IndexArgs, paths: &Paths) -> Result<Option<Emb
     }))
 }
 
-fn run_index_cycle(
+fn service_embedding_worker(
     index: &IndexArgs,
-    lexical: &IndexArgs,
     paths: &Paths,
     worker: &mut EmbeddingWorker<SystemChild>,
     active_spec: &mut Option<EmbedWorkerSpec>,
@@ -1314,7 +1998,6 @@ fn run_index_cycle(
         vector_work.verify = true;
     }
 
-    run_index_args(lexical, false, true)?;
     let search_index = SearchIndex::open_or_create(&paths.index)?;
     vector_work.observe_lexical_revision(search_index.revision()?);
     let external_embedding = !worker.is_running() && crate::lease::is_embedding_held(paths);
@@ -1485,78 +2168,332 @@ fn wait_for_next_index_cycle(interval: Duration, shutdown: &AtomicBool) -> bool 
     !shutdown.load(AtomicOrdering::Relaxed)
 }
 
-fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
-    run_index(
-        index.source.clone(),
-        index.include_agents,
-        index.include_reasoning,
-        index.codex && !index.no_codex,
-        index.opencode && !index.no_opencode,
-        index.cursor,
-        index.pi && !index.no_pi,
-        index.omp && !index.no_omp,
-        index.openclaw && !index.no_openclaw,
-        index.copilot && !index.no_copilot,
-        index.grok && !index.no_grok,
-        index.embeddings,
-        index.no_embeddings,
-        index.model.clone(),
-        index.root.clone(),
-        index.exclude.clone(),
-        reindex,
-        continuous,
-        index.diagnostics,
-        !index.no_prune,
-    )
+fn run_index_loop(
+    index: &IndexArgs,
+    mode: WatchMode,
+    interval_secs: u64,
+    web_listen: Option<String>,
+    mcp: Option<crate::mcp::HttpOptions>,
+) -> Result<()> {
+    if mode == WatchMode::Poll {
+        run_poll_loop(index, interval_secs, web_listen, mcp)
+    } else {
+        run_event_loop(index, Duration::from_secs(interval_secs), web_listen, mcp)
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_index(
-    source: Option<PathBuf>,
-    include_agents: bool,
-    include_reasoning: bool,
-    codex: bool,
-    opencode: bool,
-    cursor: bool,
-    pi: bool,
-    omp: bool,
-    openclaw: bool,
-    copilot: bool,
-    grok: bool,
-    embeddings_flag: bool,
-    no_embeddings: bool,
-    model: Option<String>,
-    root: Option<PathBuf>,
-    mut excludes: Vec<String>,
-    reindex: bool,
-    continuous: bool,
-    print_diagnostics: bool,
-    prune_missing: bool,
+fn run_poll_loop(
+    index: &IndexArgs,
+    interval_secs: u64,
+    web_listen: Option<String>,
+    mcp: Option<crate::mcp::HttpOptions>,
 ) -> Result<()> {
-    let paths = Paths::new(root)?;
-    let config = UserConfig::load(&paths)?;
+    let paths = Paths::new(index.root.clone())?;
+    let embedding_index = index;
+    let mut lexical = index.clone();
+    lexical.embeddings = false;
+    lexical.no_embeddings = true;
+    let index = &lexical;
+    let shutdown = watch_shutdown_flag()?;
+    let mut worker = EmbeddingWorker::default();
+    let mut worker_spec = None;
+    let mut vector_work = VectorWorkState::default();
 
+    #[cfg(unix)]
+    let _native_server = match crate::native::spawn(index.root.clone()) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            eprintln!("native app socket unavailable: {error:#}");
+            None
+        }
+    };
+    let mcp_server = mcp
+        .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
+        .transpose()?;
+    let _web_thread = initialize_index_loop(
+        || run_index_args(index, false, true),
+        || {
+            web_listen
+                .as_deref()
+                .map(|listen| crate::web::spawn(index.root.clone(), listen))
+                .transpose()
+        },
+    )?;
+    while !shutdown.load(AtomicOrdering::Relaxed) {
+        service_embedding_worker(
+            embedding_index,
+            &paths,
+            &mut worker,
+            &mut worker_spec,
+            &mut vector_work,
+        )?;
+
+        if let Some(server) = &mcp_server {
+            if !server.wait_timeout(Duration::from_secs(interval_secs))? {
+                return Ok(());
+            }
+        } else {
+            if !wait_for_next_index_cycle(Duration::from_secs(interval_secs), &shutdown) {
+                break;
+            }
+        }
+        run_index_args(index, false, true)?;
+        std::io::stdout().flush().ok();
+    }
+    worker.stop()?;
+    Ok(())
+}
+
+fn initialize_index_loop<T>(
+    index_once: impl FnOnce() -> Result<()>,
+    start_web: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let web = start_web()?;
+    index_once()?;
+    Ok(web)
+}
+
+/// Event-driven daemon loop: the watcher is armed before the initial scan so
+/// nothing falls in the gap, then every debounced batch (or the periodic
+/// resync) runs the normal incremental ingest. On ingest failure the hints
+/// are kept and retried; the resync timer bounds staleness no matter what.
+fn run_event_loop(
+    index: &IndexArgs,
+    resync: Duration,
+    web_listen: Option<String>,
+    mcp: Option<crate::mcp::HttpOptions>,
+) -> Result<()> {
+    let embedding_index = index;
+    let mut lexical = index.clone();
+    lexical.embeddings = false;
+    lexical.no_embeddings = true;
+    let index = &lexical;
+    let shutdown = watch_shutdown_flag()?;
+    let mut worker = EmbeddingWorker::default();
+    let mut worker_spec = None;
+    let mut vector_work = VectorWorkState::default();
+
+    use crate::watch::{
+        FireCause, HOT_SWEEP_INTERVAL, HOT_WINDOW, WatchConfig, WatchService, dirty_needs_ingest,
+        watch_excluder, watch_roots,
+    };
+
+    let paths = Paths::new(index.root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let options = build_ingest_options(index, &config)?;
+    let mut service = WatchService::new(
+        watch_roots(&options),
+        watch_excluder(&options)?,
+        WatchConfig {
+            resync_interval: resync,
+            ..WatchConfig::default()
+        },
+    )?;
+    eprintln!(
+        "watch: events mode ({} watched roots, {} pending, resync every {}s)",
+        service.watched_roots().len(),
+        service.pending_roots().len(),
+        resync.as_secs(),
+    );
+
+    let mcp_server = mcp
+        .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
+        .transpose()?;
+    let _web_thread = initialize_index_loop(
+        || run_index_args(index, false, true),
+        || {
+            web_listen
+                .as_deref()
+                .map(|listen| crate::web::spawn(index.root.clone(), listen))
+                .transpose()
+        },
+    )?;
+
+    service.mark_complete(FireCause::Resync);
+    let mut last_sweep = Instant::now();
+    while !shutdown.load(AtomicOrdering::Relaxed) {
+        service_embedding_worker(
+            embedding_index,
+            &paths,
+            &mut worker,
+            &mut worker_spec,
+            &mut vector_work,
+        )?;
+
+        match service.poll() {
+            Some(FireCause::Resync) => {
+                if let Err(error) = refresh_watch_roots(&mut service, index) {
+                    eprintln!("watch: root refresh failed: {error:#}");
+                }
+                match run_index_args(index, false, true) {
+                    Ok(()) => {
+                        service.mark_complete(FireCause::Resync);
+                        log_watch_stats(&service);
+                    }
+                    Err(error) => eprintln!("watch: resync ingest failed, retrying: {error:#}"),
+                }
+            }
+            Some(FireCause::Dirty) => {
+                let dirty = service.dirty_paths();
+                match dirty_needs_ingest(&paths, &dirty) {
+                    Ok(false) => service.mark_skipped(),
+                    Ok(true) => match run_index_selection(index, false, true, Some(&dirty)) {
+                        Ok(full_scan) => {
+                            if full_scan
+                                && let Err(error) = refresh_watch_roots(&mut service, index)
+                            {
+                                eprintln!("watch: root refresh failed: {error:#}");
+                            }
+                            service.mark_complete(if full_scan {
+                                FireCause::Resync
+                            } else {
+                                FireCause::Dirty
+                            });
+                            log_watch_stats(&service);
+                        }
+                        Err(error) => {
+                            eprintln!("watch: ingest failed, retrying: {error:#}");
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
+                        if run_index_args(index, false, true).is_ok() {
+                            service.mark_complete(FireCause::Resync);
+                            log_watch_stats(&service);
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        // FSEvents defers modify events for held-open files and agents stream
+        // transcripts through one open fd, so re-stat recently active files on
+        // macOS. inotify reports every write, making this unnecessary there.
+        if cfg!(target_os = "macos") && last_sweep.elapsed() >= HOT_SWEEP_INTERVAL {
+            last_sweep = Instant::now();
+            match service.hot_sweep_dirty(&paths, HOT_WINDOW) {
+                Ok(changed) if !changed.is_empty() => service.note_dirty(changed),
+                Ok(_) => {}
+                Err(error) => eprintln!("watch: hot sweep failed: {error:#}"),
+            }
+        }
+        if let Some(server) = &mcp_server
+            && !server.wait_timeout(Duration::from_millis(0))?
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        std::io::stdout().flush().ok();
+    }
+    worker.stop()?;
+    Ok(())
+}
+
+/// Re-resolve watch roots (cheap; call on resync) so newly installed agent
+/// backends are picked up without a daemon restart.
+fn refresh_watch_roots(service: &mut WatchService, index: &IndexArgs) -> Result<()> {
+    let paths = Paths::new(index.root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let options = build_ingest_options(index, &config)?;
+    service.ensure_roots(watch_roots(&options));
+    Ok(())
+}
+
+fn log_watch_stats(service: &WatchService) {
+    let stats = service.stats();
+    eprintln!(
+        "watch: events={} filtered={} fires_dirty={} fires_resync={} noop_skips={} \
+         errors={} resync_req={} hot_sweeps={} hot_hits={}",
+        stats.events_total,
+        stats.events_filtered,
+        stats.fires_dirty,
+        stats.fires_resync,
+        stats.noop_skips,
+        stats.watcher_errors,
+        stats.resync_requests,
+        stats.hot_sweeps,
+        stats.hot_hits,
+    );
+}
+fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
+    run_index(index, reindex, continuous)
+}
+
+/// Resolve the ingest projection from CLI flags plus config. Shared by the
+/// one-shot indexer and the event-driven daemon (which needs the same source
+/// set to compute its watch roots).
+fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<IngestOptions> {
     // Config exclusions apply to every index run; CLI --exclude adds one-off patterns.
+    let mut excludes = index.exclude.clone();
     excludes.extend(config.exclude_path_patterns());
 
     // Model priority: CLI flag > config file > env var > default
-    let model_choice = config.resolve_model(model)?;
+    let model_choice = config.resolve_model(index.model.clone())?;
     let embed_runtime = config.resolve_embed_runtime()?;
     let tool_content_limits = config.indexed_tool_content_limits()?;
-    let include_reasoning = include_reasoning || config.include_reasoning_default();
+    let include_reasoning = index.include_reasoning || config.include_reasoning_default();
     let embeddings = resolve_flag(
         config.embeddings_default(),
-        embeddings_flag,
-        no_embeddings,
+        index.embeddings,
+        index.no_embeddings,
         "embeddings",
     )?;
+    Ok(IngestOptions {
+        claude_sources: if index.source_enabled(IndexSource::Claude) {
+            index
+                .source
+                .clone()
+                .map(|source| vec![source])
+                .unwrap_or_else(default_claude_sources)
+        } else {
+            Vec::new()
+        },
+        include_agents: index.include_agents,
+        include_reasoning,
+        include_codex: index.source_enabled(IndexSource::Codex),
+        include_opencode: index.source_enabled(IndexSource::Opencode),
+        include_cursor: index.source_enabled(IndexSource::Cursor),
+        include_pi: index.source_enabled(IndexSource::Pi),
+        include_omp: index.source_enabled(IndexSource::Omp),
+        include_openclaw: index.source_enabled(IndexSource::Openclaw),
+        include_copilot: index.source_enabled(IndexSource::Copilot),
+        include_grok: index.source_enabled(IndexSource::Grok),
+        include_jcode: index.source_enabled(IndexSource::Jcode),
+        include_muse: index.source_enabled(IndexSource::Muse),
+        include_antigravity: index.source_enabled(IndexSource::Antigravity),
+        exclude_patterns: excludes,
+        embeddings,
+        backfill_embeddings: false,
+        prune_missing: !index.no_prune,
+        model: model_choice,
+        embed_runtime,
+        tool_content_limits,
+    })
+}
+
+fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
+    run_index_selection(index, reindex, continuous, None).map(|_| ())
+}
+
+/// Return whether discovery covered all sources, so only reconciliation
+/// resets the full-scan timer in the event-driven daemon.
+fn run_index_selection(
+    index: &IndexArgs,
+    reindex: bool,
+    continuous: bool,
+    dirty: Option<&HashSet<PathBuf>>,
+) -> Result<bool> {
+    let paths = Paths::new(index.root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let opts = build_ingest_options(index, &config)?;
+    let print_diagnostics = index.diagnostics;
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
-    let embedding_lease = reindex
+    let _embedding_lease = reindex
         .then(|| IngestLease::acquire_embedding(&paths, "reindex", INGEST_LEASE_TIMEOUT))
         .transpose()?;
-    if reindex && paths.root.exists() {
-        std::fs::remove_dir_all(&paths.root)?;
+    if reindex {
+        reset_reindex_artifacts(&paths)?;
     }
     paths.ensure_dirs()?;
     let index = if continuous {
@@ -1565,38 +2502,12 @@ fn run_index(
         SearchIndex::open_or_create_for_ingest(&paths.index)?
     };
 
-    let opts = IngestOptions {
-        claude_source: source.unwrap_or_else(default_claude_source),
-        include_agents,
-        include_reasoning,
-        include_codex: codex,
-        include_opencode: opencode,
-        include_cursor: cursor,
-        include_pi: pi,
-        include_omp: omp,
-        include_openclaw: openclaw,
-        include_copilot: copilot,
-        include_grok: grok,
-        exclude_patterns: excludes,
-        embeddings: embeddings && !reindex,
-        prune_missing,
-        model: model_choice,
-        embed_runtime,
-        tool_content_limits,
+    let (report, full_scan) = if let Some(dirty) = dirty {
+        let result = ingest_dirty(&paths, &index, &opts, &lease, dirty)?;
+        (result.report, result.full_scan)
+    } else {
+        (ingest_all(&paths, &index, &opts, &lease)?, true)
     };
-
-    let mut report = ingest_all(&paths, &index, &opts, &lease)?;
-    if reindex && embeddings {
-        let published_index = SearchIndex::open_or_create(&paths.index)?;
-        report.records_embedded = crate::vector_backfill::run_with_lease(
-            &paths,
-            &published_index,
-            model_choice,
-            &opts.embed_runtime,
-            embedding_lease.as_ref().expect("reindex embedding lease"),
-        )?
-        .embedded;
-    }
     if report.records_embedded > 0 {
         println!(
             "indexed {} records, embedded {} across {} files (skipped {})",
@@ -1617,99 +2528,83 @@ fn run_index(
             serde_json::to_string_pretty(&report.diagnostics)?
         );
     }
-    if report.files_pruned > 0 || report.records_pruned > 0 {
-        println!(
-            "removed {} stale or replaced records ({} missing paths)",
-            report.records_pruned, report.files_pruned
-        );
+    Ok(full_scan)
+}
+
+fn reset_reindex_artifacts(paths: &Paths) -> Result<()> {
+    remove_generated_path(&paths.index)?;
+    remove_generated_path(&paths.vectors)?;
+    remove_generated_path(&paths.root.join("memory"))?;
+
+    for name in [
+        "embed-backfill.sqlite3",
+        "embed-backfill.sqlite3-wal",
+        "embed-backfill.sqlite3-shm",
+        "ingest.json",
+        "ingest.pending.json",
+        "scan_cache.json",
+        "analytics.sqlite",
+        "analytics.sqlite-wal",
+        "analytics.sqlite-shm",
+        "analytics.sqlite-journal",
+        "usage-cache.sqlite3",
+        "usage-cache.sqlite3-wal",
+        "usage-cache.sqlite3-shm",
+        "usage-cache.sqlite3-journal",
+    ] {
+        let path = paths.state.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove reindex artifact {}", path.display()));
+            }
+        }
     }
     Ok(())
 }
 
-fn run_prune(args: PruneArgs, apply: bool) -> Result<()> {
-    let paths = Paths::new(args.root)?;
-    if !SearchIndex::exists(&paths.index) {
-        return Err(anyhow!(
-            "memex index not found at {}; run `memex index` first",
-            paths.index.display()
-        ));
-    }
-    let options = PruneOptions {
-        claude_source: args.source.unwrap_or_else(default_claude_source),
-        include_agents: args.include_agents,
-        include_codex: !args.no_codex,
-        include_opencode: !args.no_opencode,
-        include_cursor: !args.no_cursor,
-        include_pi: !args.no_pi,
-        include_omp: !args.no_omp,
-        include_openclaw: !args.no_openclaw,
-        include_copilot: !args.no_copilot,
+fn remove_generated_path(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
-    let report = if apply {
-        let ingest_lease = IngestLease::acquire(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
-        let embedding_lease =
-            IngestLease::acquire_embedding(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
-        let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
-        let report =
-            prune_missing_paths(&paths, &index, &options, &ingest_lease, &embedding_lease)?;
-        if !report.source_paths.is_empty() {
-            index.publish_generation()?;
-        }
-        report
+    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
     } else {
-        let index = SearchIndex::open_or_create(&paths.index)?;
-        preview_missing_paths(&paths, &index, &options)?
+        std::fs::remove_file(path)
     };
-    if report.source_paths.is_empty() {
-        println!("no missing indexed paths found beneath readable source roots");
-        return Ok(());
-    }
-
-    if apply {
-        println!(
-            "pruned {} records from {} missing paths:",
-            report.records,
-            report.source_paths.len()
-        );
-    } else {
-        println!(
-            "would prune {} records from {} missing paths:",
-            report.records,
-            report.source_paths.len()
-        );
-    }
-    for source_path in report.source_paths {
-        println!("  {source_path}");
-    }
-    if !apply {
-        println!("rerun with --apply to delete these records without rebuilding the corpus");
-    }
-    Ok(())
+    result.with_context(|| format!("remove reindex artifact {}", path.display()))
 }
 
 fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<()> {
     if !dry_run && !offline {
         return Err(anyhow!(
-            "index GC requires offline confirmation; stop the Memex index service and all Memex \
+            "index GC requires offline confirmation; stop the Memex daemon and all Memex \
              readers, then rerun with `--offline` (or use `--dry-run`)"
         ));
     }
     let paths = Paths::new(root)?;
     let _lease = IngestLease::acquire(&paths, "index-gc", INGEST_LEASE_TIMEOUT)?;
     let report = SearchIndex::garbage_collect_generations_offline(&paths.index, dry_run)?;
+    let memory_generations = gc_memory_vectors(&paths, dry_run)?;
     if report.dry_run {
         println!(
-            "would remove {} unreachable generations, {} abandoned generation work directories, and {} legacy index files; no rebuild required",
+            "would remove {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; no rebuild required",
             report.generations_removed,
             report.abandoned_workdirs_removed,
-            report.legacy_files_removed
+            report.legacy_files_removed,
+            memory_generations
         );
     } else {
         println!(
-            "removed {} unreachable generations, {} abandoned generation work directories, and {} legacy index files; retained the committed index without rebuilding",
+            "removed {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; retained the committed indexes without rebuilding",
             report.generations_removed,
             report.abandoned_workdirs_removed,
-            report.legacy_files_removed
+            report.legacy_files_removed,
+            memory_generations
         );
     }
     Ok(())
@@ -1723,6 +2618,8 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let embed_runtime = config.resolve_embed_runtime()?;
     let index = SearchIndex::open_or_create(&paths.index)?;
     let report = crate::vector_backfill::run(&paths, &index, model_choice, &embed_runtime)?;
+    let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
+    println!("embedded {memory_embedded} memory section vectors");
     println!(
         "embedded {} vectors ({} total, {} resumed from checkpoints)",
         report.embedded, report.total, report.resumed
@@ -1733,6 +2630,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_search(
     query: String,
+    content: SearchContent,
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
@@ -1740,6 +2638,7 @@ fn run_search(
     tool: Option<String>,
     session: Option<String>,
     source: Option<SourceFilter>,
+    origin: SessionOrigin,
     semantic: bool,
     hybrid: bool,
     min_score: Option<f32>,
@@ -1751,17 +2650,705 @@ fn run_search(
     top_n_per_session: Option<usize>,
     unique_session: bool,
     json_array: bool,
+    format: SearchFormat,
+    pretty: bool,
     fields: Option<String>,
+    full: bool,
     sort: SortBy,
     verbose: bool,
     root: Option<PathBuf>,
     machines: Vec<String>,
     trace: bool,
 ) -> Result<()> {
+    let format = if json_array && !verbose {
+        SearchFormat::Json
+    } else {
+        format
+    };
+    if pretty && (verbose || format != SearchFormat::Json) {
+        return Err(anyhow!("--pretty requires --format json"));
+    }
     let trace_started = Instant::now();
     let trace_started_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let mode = if hybrid {
+        SearchMode::Hybrid
+    } else if semantic {
+        SearchMode::Semantic
+    } else {
+        SearchMode::Lexical
+    };
+    if content != SearchContent::Conversations {
+        return run_search_with_memories(MemorySurfaceSearchArgs {
+            query,
+            additional_queries,
+            cwd,
+            project,
+            role,
+            tool,
+            session,
+            source,
+            origin,
+            mode,
+            min_score,
+            recency_weight,
+            recency_half_life_days,
+            since,
+            until,
+            limit,
+            top_n_per_session,
+            unique_session,
+            fields: search_fields(fields, full)?,
+            sort,
+            format,
+            pretty,
+            root,
+            machines,
+            content,
+            trace,
+        });
+    }
+    let mut collected = collect_search(SearchCollectRequest {
+        query,
+        additional_queries,
+        cwd,
+        project,
+        role,
+        tool,
+        session,
+        source,
+        origin,
+        mode,
+        min_score,
+        recency_weight,
+        recency_half_life_days,
+        since,
+        until,
+        limit,
+        top_n_per_session,
+        unique_session,
+        fields: search_fields(fields, full)?,
+        sort,
+        verbose,
+        format: if json_array && !verbose {
+            SearchFormat::Json
+        } else {
+            format
+        },
+        root,
+        machines,
+    })?;
+    collected.render.pretty = pretty;
+    for failure in &collected.failures {
+        if let Some((machine, error)) = failure.split_once(": ") {
+            eprintln!("Warning: machine '{machine}' unavailable: {error}");
+        } else {
+            eprintln!("Warning: machine unavailable: {failure}");
+        }
+    }
+    if trace {
+        let mode_label = match (mode, collected.queries.len() > 1) {
+            (SearchMode::Lexical, false) => "lexical",
+            (SearchMode::Semantic, false) => "semantic",
+            (SearchMode::Hybrid, false) => "hybrid",
+            (SearchMode::Lexical, true) => "lexical-rrf",
+            (SearchMode::Semantic, true) => "semantic-rrf",
+            (SearchMode::Hybrid, true) => "hybrid-rrf",
+        };
+        write_retrieval_trace(TraceWriteArgs {
+            paths: &collected.paths,
+            queries: &collected.queries,
+            query_candidate_counts: &collected.query_candidate_counts,
+            cwd: collected.cwd.clone(),
+            results: &collected.results,
+            mode: mode_label,
+            machines: &collected.selected_machines,
+            failures: &collected.failures,
+            started: trace_started,
+            started_at_ms: trace_started_at_ms,
+        })?;
+    }
+    render_located_results(collected.results, &collected.render)
+}
+
+struct MemorySurfaceSearchArgs {
+    query: String,
+    additional_queries: Vec<String>,
+    cwd: Option<PathBuf>,
+    project: Option<String>,
+    role: Option<String>,
+    tool: Option<String>,
+    session: Option<String>,
+    source: Option<SourceFilter>,
+    origin: SessionOrigin,
+    mode: SearchMode,
+    min_score: Option<f32>,
+    recency_weight: f32,
+    recency_half_life_days: f32,
+    since: Option<String>,
+    until: Option<String>,
+    limit: usize,
+    top_n_per_session: Option<usize>,
+    unique_session: bool,
+    fields: Option<HashSet<String>>,
+    sort: SortBy,
+    format: SearchFormat,
+    pretty: bool,
+    root: Option<PathBuf>,
+    machines: Vec<String>,
+    content: SearchContent,
+    trace: bool,
+}
+
+enum UnifiedSearchResult {
+    Conversation(LocatedRecord),
+    Memory(LocatedMemoryHit),
+}
+
+impl UnifiedSearchResult {
+    fn score(&self) -> f32 {
+        match self {
+            Self::Conversation(result) => result.score,
+            Self::Memory(result) => result.hit.score,
+        }
+    }
+
+    fn set_score(&mut self, score: f32) {
+        match self {
+            Self::Conversation(result) => result.score = score,
+            Self::Memory(result) => result.hit.score = score,
+        }
+    }
+
+    fn timestamp(&self) -> u64 {
+        match self {
+            Self::Conversation(result) => result.record.ts,
+            Self::Memory(result) => result.hit.mtime_ms,
+        }
+    }
+
+    fn tie_key(&self) -> (&str, &str) {
+        match self {
+            Self::Conversation(result) => (&result.machine, &result.record.session_id),
+            Self::Memory(result) => (&result.machine, &result.hit.section_ref),
+        }
+    }
+}
+
+fn run_search_with_memories(args: MemorySurfaceSearchArgs) -> Result<()> {
+    let format = args.format;
+    let pretty = args.pretty;
+    let (values, failures, _) = collect_search_with_memories(args)?;
+    for failure in &failures {
+        eprintln!("Warning: machine unavailable: {failure}");
+    }
+    render_unified_search(values, format, pretty)
+}
+
+fn collect_search_with_memories(
+    args: MemorySurfaceSearchArgs,
+) -> Result<(Vec<Value>, Vec<String>, Vec<String>)> {
+    let MemorySurfaceSearchArgs {
+        query,
+        additional_queries,
+        cwd,
+        project,
+        role,
+        tool,
+        session,
+        source,
+        origin,
+        mode,
+        min_score,
+        recency_weight,
+        recency_half_life_days,
+        since,
+        until,
+        limit,
+        top_n_per_session,
+        unique_session,
+        fields,
+        sort,
+        format,
+        pretty,
+        root,
+        machines,
+        content,
+        trace,
+    } = args;
+    if limit == 0 || limit > 500 {
+        return Err(anyhow!("limit must be between 1 and 500"));
+    }
+    let conversation_only_filters = role.is_some()
+        || tool.is_some()
+        || session.is_some()
+        || !matches!(origin, SessionOrigin::Regular | SessionOrigin::All);
+    if content == SearchContent::Memories && conversation_only_filters {
+        return Err(anyhow!(
+            "--role, --tool, --session, and --origin filter conversations; use --content conversations or all"
+        ));
+    }
+    if trace {
+        return Err(anyhow!(
+            "retrieval traces currently record conversation searches only"
+        ));
+    }
+
+    let paths = Paths::new(root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let memory_cwd = canonical_cwd_filter(cwd.clone()).map(PathBuf::from);
+    let mut failures = Vec::new();
+    let include_conversations = content == SearchContent::All;
+    let include_memories = !conversation_only_filters;
+    let mut conversation_results = Vec::new();
+    if include_conversations {
+        let collected = collect_search(SearchCollectRequest {
+            query: query.clone(),
+            additional_queries: additional_queries.clone(),
+            cwd: cwd.clone(),
+            project: project.clone(),
+            role,
+            tool,
+            session,
+            source,
+            origin,
+            mode,
+            min_score,
+            recency_weight,
+            recency_half_life_days,
+            since: since.clone(),
+            until: until.clone(),
+            limit,
+            top_n_per_session,
+            unique_session,
+            fields: fields.clone(),
+            sort,
+            verbose: false,
+            format: SearchFormat::Json,
+            root: root.clone(),
+            machines: machines.clone(),
+        })?;
+        failures.extend(collected.failures);
+        conversation_results = collected.results;
+    }
+
+    let mut memory_results = Vec::new();
+    if include_memories {
+        let memory_mode = match mode {
+            SearchMode::Lexical => MemorySearchMode::Lexical,
+            SearchMode::Semantic => MemorySearchMode::Semantic,
+            SearchMode::Hybrid => MemorySearchMode::Hybrid,
+        };
+        let max_per_document = if unique_session && top_n_per_session.is_none() {
+            1
+        } else {
+            top_n_per_session.unwrap_or(2)
+        };
+        let options = MemorySearchOptions {
+            query: query.clone(),
+            additional_queries,
+            mode: memory_mode,
+            project,
+            cwd: memory_cwd,
+            source: source.and_then(|value| crate::types::SourceKind::from_label(value.as_str())),
+            since: parse_ts_millis(since)?,
+            until: parse_ts_millis(until)?,
+            min_score,
+            recency_weight,
+            recency_half_life_days,
+            limit,
+            max_per_document: max_per_document.min(limit),
+            sort_by_timestamp: sort == SortBy::Ts,
+            include_text: fields.as_ref().is_none_or(|fields| fields.contains("text")),
+        };
+        options.validate()?;
+        let federated = federated_memory_search(
+            &paths,
+            &config,
+            &machines,
+            &options,
+            content == SearchContent::Memories,
+        )?;
+        for (machine, error) in federated.failures {
+            failures.push(format!("{machine}: {error}"));
+        }
+        memory_results = federated.items;
+        if content == SearchContent::Memories && memory_results.is_empty() && !failures.is_empty() {
+            return Err(anyhow!("memory search failed: {}", failures.join("; ")));
+        }
+    }
+
+    let mut results = if content == SearchContent::Memories {
+        memory_results
+            .into_iter()
+            .map(UnifiedSearchResult::Memory)
+            .collect::<Vec<_>>()
+    } else {
+        // Scores from independent conversation and memory indexes are not comparable. Rank each
+        // corpus with reciprocal-rank fusion before merging them.
+        let mut merged = Vec::with_capacity(conversation_results.len() + memory_results.len());
+        for (rank, result) in conversation_results.into_iter().enumerate() {
+            let mut result = UnifiedSearchResult::Conversation(result);
+            result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
+            merged.push(result);
+        }
+        for (rank, result) in memory_results.into_iter().enumerate() {
+            let mut result = UnifiedSearchResult::Memory(result);
+            result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
+            merged.push(result);
+        }
+        merged.sort_by(|left, right| {
+            let order = if sort == SortBy::Ts {
+                right.timestamp().cmp(&left.timestamp())
+            } else {
+                right.score().total_cmp(&left.score())
+            };
+            order.then_with(|| left.tie_key().cmp(&right.tie_key()))
+        });
+        merged.truncate(limit);
+        merged
+    };
+    results.truncate(limit);
+    let mut values = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            UnifiedSearchResult::Conversation(result) => {
+                let mut projected = project_located_results(
+                    vec![result],
+                    &RenderOptions {
+                        verbose: false,
+                        pretty,
+                        matchers: build_matchers(&query)?,
+                        format,
+                        fields: fields.clone(),
+                        sort,
+                        min_score: None,
+                        top_n_per_session: None,
+                        limit: 1,
+                        kind_filter: crate::analytics::SessionKindFilter::All,
+                    },
+                )?;
+                if content == SearchContent::All
+                    && fields.as_ref().is_none_or(|set| set.contains("kind"))
+                {
+                    projected[0]["kind"] = Value::from("conversation");
+                }
+                values.extend(projected);
+            }
+            UnifiedSearchResult::Memory(result) => {
+                let mut projected = project_memory_result(result, &fields)?;
+                if content == SearchContent::All
+                    && fields.as_ref().is_none_or(|set| set.contains("kind"))
+                {
+                    projected["kind"] = Value::from("memory");
+                }
+                values.push(projected);
+            }
+        }
+    }
+    let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
+    Ok((values, failures, selected_machines))
+}
+
+fn project_memory_result(
+    result: LocatedMemoryHit,
+    fields: &Option<HashSet<String>>,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(result)?;
+    if let Some(fields) = fields {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("memory search result was not an object"))?;
+        object.retain(|key, _| fields.contains(key));
+    }
+    Ok(value)
+}
+
+fn render_unified_search(values: Vec<Value>, format: SearchFormat, pretty: bool) -> Result<()> {
+    match format {
+        SearchFormat::Jsonl => {
+            for value in values {
+                println!("{}", serde_json::to_string(&value)?);
+            }
+        }
+        SearchFormat::Json => print_json(&Value::Array(values), pretty)?,
+        SearchFormat::Toon => println!(
+            "{}",
+            toon_format::encode_default(&serde_json::json!({"results": values}))?
+        ),
+        SearchFormat::Text => {
+            for value in values {
+                let score = value
+                    .get("score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default();
+                let machine = value
+                    .get("machine")
+                    .and_then(Value::as_str)
+                    .unwrap_or("local");
+                let kind = value
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        if value.get("memory_id").is_some() {
+                            "memory"
+                        } else {
+                            "conversation"
+                        }
+                    });
+                let identity = value
+                    .get("memory_id")
+                    .or_else(|| value.get("record_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let snippet = value.get("snippet").and_then(Value::as_str).unwrap_or("");
+                println!("[{score:.3}] {machine} {kind} {identity} {snippet}");
+            }
+        }
+    }
+    Ok(())
+}
+
+struct SearchCollectRequest {
+    query: String,
+    additional_queries: Vec<String>,
+    cwd: Option<PathBuf>,
+    project: Option<String>,
+    role: Option<String>,
+    tool: Option<String>,
+    session: Option<String>,
+    source: Option<SourceFilter>,
+    origin: SessionOrigin,
+    mode: SearchMode,
+    min_score: Option<f32>,
+    recency_weight: f32,
+    recency_half_life_days: f32,
+    since: Option<String>,
+    until: Option<String>,
+    limit: usize,
+    top_n_per_session: Option<usize>,
+    unique_session: bool,
+    fields: Option<HashSet<String>>,
+    sort: SortBy,
+    verbose: bool,
+    format: SearchFormat,
+    root: Option<PathBuf>,
+    machines: Vec<String>,
+}
+
+struct SearchCollection {
+    paths: Paths,
+    queries: Vec<String>,
+    query_candidate_counts: Vec<usize>,
+    cwd: Option<String>,
+    results: Vec<LocatedRecord>,
+    render: RenderOptions,
+    selected_machines: Vec<String>,
+    failures: Vec<String>,
+}
+
+/// Native reads share CLI retrieval and projection, with local auto-index disabled.
+#[cfg(unix)]
+pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation) -> Result<Value> {
+    use crate::native::{Operation, Unavailable};
+    let config = UserConfig::load(paths)?;
+    let check_index = |machine: &str| -> Result<()> {
+        if machine == crate::machine::LOCAL_MACHINE_ID && !SearchIndex::exists(&paths.index) {
+            return Err(Unavailable("search index unavailable").into());
+        }
+        Ok(())
+    };
+    let check_analytics = |machine: &str| -> Result<()> {
+        if machine == crate::machine::LOCAL_MACHINE_ID && !analytics_path(&paths.state).exists() {
+            return Err(Unavailable("analytics cache unavailable").into());
+        }
+        Ok(())
+    };
+    let tag = |mut items: Vec<Value>, machine: String| {
+        for item in &mut items {
+            item["machine"] = Value::String(machine.clone());
+        }
+        Value::Array(items)
+    };
+    match operation {
+        Operation::Hello {} => unreachable!("hello is handled by the transport"),
+        Operation::Machines {} => Ok(Value::Array(crate::machine::configured_machine_summaries(
+            &config,
+        )?)),
+        Operation::Projects { machine } => {
+            check_analytics(&machine)?;
+            let items = if machine == crate::machine::LOCAL_MACHINE_ID {
+                collect_projects(paths, None)?
+            } else {
+                crate::machine::remote_project_summaries(&config, &machine, None)?
+            };
+            Ok(tag(items, machine))
+        }
+        Operation::Sessions { machine, filters } => {
+            anyhow::ensure!(filters.limit > 0, "session list limit must be positive");
+            if filters.limit > 100_000 {
+                return Err(Unavailable("session list exceeds native transport capacity").into());
+            }
+            check_analytics(&machine)?;
+            let items = if machine == crate::machine::LOCAL_MACHINE_ID {
+                collect_sessions(
+                    filters.session_id,
+                    filters.source_path,
+                    filters.cwd.map(PathBuf::from),
+                    filters.project,
+                    parse_source_filter(filters.source)?,
+                    filters.since,
+                    filters.limit,
+                    filters.origin,
+                    Some(paths.root.clone()),
+                )?
+            } else {
+                crate::machine::remote_sessions(&config, &machine, filters)?
+            };
+            Ok(tag(items, machine))
+        }
+        Operation::Count {
+            machine,
+            filters,
+            query,
+        } => {
+            if query.as_ref().is_some_and(|q| !q.trim().is_empty()) {
+                check_index(&machine)?;
+            } else {
+                check_analytics(&machine)?;
+            }
+            let count = if machine == crate::machine::LOCAL_MACHINE_ID {
+                collect_session_count(paths, filters, query)?
+            } else {
+                crate::machine::remote_session_count(&config, &machine, filters, query)?
+            };
+            Ok(serde_json::to_value(count)?)
+        }
+        Operation::Search {
+            machine,
+            query,
+            project,
+            source,
+            since,
+            origin,
+            limit,
+        } => {
+            anyhow::ensure!(limit > 0, "search limit must be positive");
+            if limit > 100_000 {
+                return Err(Unavailable("search exceeds native transport capacity").into());
+            }
+            check_index(&machine)?;
+            let collected = collect_search_with_auto_index(
+                SearchCollectRequest {
+                    query,
+                    additional_queries: Vec::new(),
+                    cwd: None,
+                    project,
+                    role: None,
+                    tool: None,
+                    session: None,
+                    source: parse_source_filter(source)?,
+                    origin,
+                    mode: SearchMode::Lexical,
+                    min_score: None,
+                    recency_weight: 1.0,
+                    recency_half_life_days: 30.0,
+                    since,
+                    until: None,
+                    limit,
+                    top_n_per_session: None,
+                    unique_session: true,
+                    fields: search_fields(
+                        Some(
+                            "source,session_id,source_path,project,snippet,ts,machine,record_id"
+                                .into(),
+                        ),
+                        false,
+                    )?,
+                    sort: SortBy::Score,
+                    verbose: false,
+                    format: SearchFormat::Json,
+                    root: Some(paths.root.clone()),
+                    machines: vec![machine],
+                },
+                false,
+            )?;
+            // Like the CLI, failures of every selected machine are errors; partial
+            // federation is not possible for the native app's single selection.
+            Ok(Value::Array(project_located_results(
+                collected.results,
+                &collected.render,
+            )?))
+        }
+        Operation::Session {
+            machine,
+            session_id,
+            source_path,
+            offset,
+            limit,
+            max_chars,
+        } => {
+            check_index(&machine)?;
+            let (records, page) = collect_session_page(
+                paths,
+                &config,
+                &machine,
+                &session_id,
+                &source_path,
+                offset,
+                Some(limit),
+                &ReadArgs {
+                    full: max_chars.is_none(),
+                    max_chars,
+                },
+            )?;
+            let mut items = records
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if let Some((total, next_offset)) = page {
+                items.push(serde_json::json!({"type":"page", "machine":machine, "session_id":session_id, "source_path":source_path, "offset":offset, "total":total, "next_offset":next_offset}));
+            }
+            Ok(tag(items, machine))
+        }
+    }
+}
+
+fn collect_search(request: SearchCollectRequest) -> Result<SearchCollection> {
+    collect_search_with_auto_index(request, true)
+}
+
+fn collect_search_with_auto_index(
+    request: SearchCollectRequest,
+    auto_index_local: bool,
+) -> Result<SearchCollection> {
+    let SearchCollectRequest {
+        query,
+        additional_queries,
+        cwd,
+        project,
+        role,
+        tool,
+        session,
+        source,
+        origin,
+        mode,
+        min_score,
+        recency_weight,
+        recency_half_life_days,
+        since,
+        until,
+        limit,
+        top_n_per_session,
+        unique_session,
+        fields,
+        sort,
+        verbose,
+        format,
+        root,
+        machines,
+    } = request;
     let mut queries = vec![query];
-    queries.extend(additional_queries.clone());
+    queries.extend(additional_queries);
     let mut seen_queries = HashSet::new();
     queries.retain(|query| {
         let query = query.trim();
@@ -1786,119 +3373,141 @@ fn run_search(
         until: parse_ts_millis(until)?,
         limit,
     };
-    let matchers = build_matchers(&options.query)?;
-    let fields = parse_fields(fields)?;
+    let matchers = queries
+        .iter()
+        .map(|query| build_matchers(query))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let top_n_per_session = if unique_session && top_n_per_session.is_none() {
         Some(1)
     } else {
         top_n_per_session
     };
+    let kind_filter: crate::analytics::SessionKindFilter = origin.into();
     let render = RenderOptions {
         verbose,
+        pretty: false,
         matchers,
-        json_array: json_array && !verbose,
+        format,
         fields,
         sort,
         min_score,
         top_n_per_session,
         limit,
+        kind_filter,
     };
 
-    let candidate_limit = if queries.len() > 1
+    // Origin filtering applies after retrieval, so a fixed overfetch can
+    // still starve when wanted-kind matches rank below the cap. Re-run with
+    // a wider cap (bounded) until the filtered list is full or retrieval
+    // stops offering more candidates.
+    let origin_filtered = kind_filter != crate::analytics::SessionKindFilter::All;
+    let mut candidate_limit = if queries.len() > 1
         || top_n_per_session.is_some()
         || options.source.is_some()
         || cwd.is_some()
+        || origin_filtered
     {
         (limit * 5).max(limit + 10)
     } else {
         limit
     };
-    let mode = if hybrid {
-        SearchMode::Hybrid
-    } else if semantic {
-        SearchMode::Semantic
-    } else {
-        SearchMode::Lexical
-    };
     let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
-    let mut ranked_queries = Vec::with_capacity(queries.len());
-    let mut query_candidate_counts = Vec::with_capacity(queries.len());
     let mut failures = Vec::new();
     let mut seen_failures = HashSet::new();
-    for (query_index, query) in queries.iter().enumerate() {
-        let spec = SearchSpec {
-            query: query.clone(),
-            project: options.project.clone(),
-            role: options.role.clone(),
-            tool: options.tool.clone(),
-            session_id: options.session_id.clone(),
-            session_scope: None,
-            cwd: cwd.clone(),
-            source: options.source,
-            since: options.since,
-            until: options.until,
-            limit: candidate_limit,
-            mode,
-            recency_weight,
-            recency_half_life_days,
-            min_score,
-            project_grouping: None,
-        };
-        let federated =
-            federated_search(&paths, &config, &selected_machines, &spec, query_index == 0)?;
-        query_candidate_counts.push(federated.candidate_count);
-        for (machine, error) in federated.failures {
-            let message = format!("{machine}: {error}");
-            if seen_failures.insert(message.clone()) {
-                eprintln!("Warning: machine '{machine}' unavailable: {error}");
-                failures.push(message);
+    let mut ranked_queries;
+    let mut query_candidate_counts;
+    let mut results;
+    let mut round = 0;
+    loop {
+        ranked_queries = Vec::with_capacity(queries.len());
+        query_candidate_counts = Vec::with_capacity(queries.len());
+        let mut round_capped = false;
+        for (query_index, query) in queries.iter().enumerate() {
+            let spec = SearchSpec {
+                query: query.clone(),
+                project: options.project.clone(),
+                role: options.role.clone(),
+                tool: options.tool.clone(),
+                session_id: options.session_id.clone(),
+                session_scope: None,
+                cwd: cwd.clone(),
+                source: options.source,
+                since: options.since,
+                until: options.until,
+                limit: candidate_limit,
+                mode,
+                recency_weight,
+                recency_half_life_days,
+                min_score,
+                project_grouping: None,
+            };
+            let federated = federated_search(
+                &paths,
+                &config,
+                &selected_machines,
+                &spec,
+                auto_index_local && query_index == 0,
+            )?;
+            round_capped = round_capped || federated.candidate_count > federated.items.len();
+            query_candidate_counts.push(federated.candidate_count);
+            for (machine, error) in federated.failures {
+                let message = format!("{machine}: {error}");
+                if seen_failures.insert(message.clone()) {
+                    failures.push(message);
+                }
             }
+            ranked_queries.push(federated.items);
         }
-        ranked_queries.push(federated.items);
-    }
-    let mut results = if ranked_queries.len() == 1 {
-        ranked_queries.pop().unwrap_or_default()
-    } else {
-        fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
-    };
-    let mut merged_render = render.clone();
-    merged_render.min_score = None;
-    results = apply_post_processing_located(results, &merged_render);
-    if trace {
-        let mode_label = match (mode, queries.len() > 1) {
-            (SearchMode::Lexical, false) => "lexical",
-            (SearchMode::Semantic, false) => "semantic",
-            (SearchMode::Hybrid, false) => "hybrid",
-            (SearchMode::Lexical, true) => "lexical-rrf",
-            (SearchMode::Semantic, true) => "semantic-rrf",
-            (SearchMode::Hybrid, true) => "hybrid-rrf",
+        let fused = if ranked_queries.len() == 1 {
+            ranked_queries.pop().unwrap_or_default()
+        } else {
+            fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
         };
-        write_retrieval_trace(TraceWriteArgs {
-            paths: &paths,
-            queries: &queries,
-            query_candidate_counts: &query_candidate_counts,
-            cwd,
-            results: &results,
-            mode: mode_label,
-            machines: &selected_machines,
-            failures: &failures,
-            started: trace_started,
-            started_at_ms: trace_started_at_ms,
-        })?;
+        let stored_kinds = stored_session_kinds(&paths, &fused, origin_filtered);
+        let mut merged_render = render.clone();
+        merged_render.min_score = None;
+        results = apply_post_processing_located(fused, &merged_render, &stored_kinds);
+        round += 1;
+        if !origin_filtered || results.len() >= render.limit || !round_capped || round >= 3 {
+            break;
+        }
+        candidate_limit = candidate_limit.saturating_mul(5);
     }
-    render_located_results(results, &render)
+    Ok(SearchCollection {
+        paths,
+        queries,
+        query_candidate_counts,
+        cwd,
+        results,
+        render,
+        selected_machines,
+        failures,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SearchFormat {
+    Jsonl,
+    Json,
+    Toon,
+    Text,
 }
 
 #[derive(Clone)]
 struct RenderOptions {
     verbose: bool,
+    pretty: bool,
     matchers: Vec<regex::Regex>,
-    json_array: bool,
+    format: SearchFormat,
     fields: Option<HashSet<String>>,
     sort: SortBy,
     min_score: Option<f32>,
     top_n_per_session: Option<usize>,
     limit: usize,
+    kind_filter: crate::analytics::SessionKindFilter,
 }
 
 #[derive(Serialize)]
@@ -1930,7 +3539,7 @@ struct SearchHit {
 }
 
 fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -> Result<()> {
-    if render.verbose {
+    if render.verbose || render.format == SearchFormat::Text {
         for LocatedRecord {
             machine,
             score,
@@ -1938,7 +3547,7 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
         } in results
         {
             let ts = format_ts(record.ts);
-            let text = summarize(&record.text, 200);
+            let text = match_preview(&record.text, &render.matchers, 200);
             println!(
                 "[{score:.3}] {} {} {} {} {} {} {}",
                 machine, ts, record.doc_id, record.project, record.role, record.session_id, text
@@ -1947,6 +3556,27 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
         return Ok(());
     }
 
+    let output = project_located_results(results, render)?;
+    match render.format {
+        SearchFormat::Jsonl => {
+            for value in output {
+                println!("{}", serde_json::to_string(&value)?);
+            }
+        }
+        SearchFormat::Json => print_json(&Value::Array(output), render.pretty)?,
+        SearchFormat::Text => unreachable!("text rendered above"),
+        SearchFormat::Toon => println!(
+            "{}",
+            toon_format::encode_default(&serde_json::json!({"results": output}))?
+        ),
+    }
+    Ok(())
+}
+
+fn project_located_results(
+    results: Vec<LocatedRecord>,
+    render: &RenderOptions,
+) -> Result<Vec<Value>> {
     let mut output = Vec::new();
     for LocatedRecord {
         machine,
@@ -1961,7 +3591,7 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
         let wants_matches = wants_field(&render.fields, "matches");
         let wants_text = wants_field(&render.fields, "text");
         let snippet = if wants_snippet {
-            summarize(text_ref, 400)
+            match_preview(text_ref, &render.matchers, 400)
         } else {
             String::new()
         };
@@ -2085,17 +3715,139 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
                 links: record.links,
             })?
         };
-        if render.json_array {
-            output.push(value);
-        } else {
-            println!("{}", serde_json::to_string(&value)?);
-        }
+        output.push(value);
     }
+    Ok(output)
+}
 
-    if render.json_array {
-        println!("{}", serde_json::to_string(&output)?);
+pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Result<Value> {
+    validate_mcp_search_request(&request)?;
+    let source = parse_source_filter(request.source)?;
+    if request.content != SearchContent::Conversations {
+        let (results, failures, selected_machines) =
+            collect_search_with_memories(MemorySurfaceSearchArgs {
+                query: request.query,
+                additional_queries: request.additional_queries,
+                cwd: request.cwd.map(PathBuf::from),
+                project: request.project,
+                role: request.role,
+                tool: request.tool,
+                session: request.session,
+                source,
+                origin: request.origin,
+                mode: request.mode.into(),
+                min_score: request.min_score,
+                recency_weight: request.recency_weight,
+                recency_half_life_days: request.recency_half_life_days,
+                since: request.since,
+                until: request.until,
+                limit: request.limit,
+                top_n_per_session: request.top_n_per_session,
+                unique_session: request.unique_session,
+                fields: search_fields(None, false)?,
+                sort: request.sort.into(),
+                format: SearchFormat::Json,
+                pretty: false,
+                root,
+                machines: request.machines,
+                content: request.content,
+                trace: false,
+            })?;
+        return Ok(serde_json::json!({
+            "results": results,
+            "failures": failures,
+            "selected_machines": selected_machines,
+        }));
+    }
+    let collected = collect_search(SearchCollectRequest {
+        query: request.query,
+        additional_queries: request.additional_queries,
+        cwd: request.cwd.map(PathBuf::from),
+        project: request.project,
+        role: request.role,
+        tool: request.tool,
+        session: request.session,
+        source,
+        origin: request.origin,
+        mode: request.mode.into(),
+        min_score: request.min_score,
+        recency_weight: request.recency_weight,
+        recency_half_life_days: request.recency_half_life_days,
+        since: request.since,
+        until: request.until,
+        limit: request.limit,
+        top_n_per_session: request.top_n_per_session,
+        unique_session: request.unique_session,
+        fields: search_fields(None, false)?,
+        sort: request.sort.into(),
+        verbose: false,
+        format: SearchFormat::Json,
+        root,
+        machines: request.machines,
+    })?;
+    let SearchCollection {
+        results,
+        render,
+        selected_machines,
+        failures,
+        ..
+    } = collected;
+    let results = project_located_results(results, &render)?;
+    Ok(serde_json::json!({
+        "results": results,
+        "failures": failures,
+        "selected_machines": selected_machines,
+    }))
+}
+
+fn validate_mcp_search_request(request: &SearchRequest) -> Result<()> {
+    validate_mcp_limit(request.limit)?;
+    let query_count = 1usize.saturating_add(request.additional_queries.len());
+    if query_count > 8 {
+        return Err(anyhow!("search accepts at most 8 queries"));
+    }
+    let query_chars = std::iter::once(&request.query)
+        .chain(request.additional_queries.iter())
+        .map(|query| query.chars().count())
+        .sum::<usize>();
+    if query_chars > 16_000 {
+        return Err(anyhow!(
+            "search query text exceeds the 16000 character limit"
+        ));
+    }
+    if request
+        .top_n_per_session
+        .is_some_and(|value| !(1..=500).contains(&value))
+    {
+        return Err(anyhow!("top_n_per_session must be between 1 and 500"));
+    }
+    if request.min_score.is_some_and(|value| !value.is_finite()) {
+        return Err(anyhow!("min_score must be finite"));
+    }
+    if !request.recency_weight.is_finite() || request.recency_weight < 0.0 {
+        return Err(anyhow!("recency_weight must be finite and non-negative"));
+    }
+    if !request.recency_half_life_days.is_finite() || request.recency_half_life_days <= 0.0 {
+        return Err(anyhow!(
+            "recency_half_life_days must be finite and greater than zero"
+        ));
     }
     Ok(())
+}
+
+fn validate_mcp_limit(limit: usize) -> Result<()> {
+    if !(1..=500).contains(&limit) {
+        return Err(anyhow!("limit must be between 1 and 500"));
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_source_filter(source: Option<String>) -> Result<Option<SourceFilter>> {
+    source
+        .map(|source| {
+            SourceFilter::from_str(&source, true).map_err(|_| anyhow!("unknown source '{source}'"))
+        })
+        .transpose()
 }
 
 fn insert_optional_field(
@@ -2111,7 +3863,29 @@ fn insert_optional_field(
     }
 }
 
+#[derive(Debug, Clone, Args)]
+struct ReadArgs {
+    /// Maximum Unicode characters across text/tool input/tool output (default 16000; metadata excluded)
+    #[arg(long, conflicts_with = "full")]
+    max_chars: Option<usize>,
+    /// Return complete content without a character budget
+    #[arg(long)]
+    full: bool,
+}
+
+impl ReadArgs {
+    fn budget(&self) -> Result<ReadBudget> {
+        ReadBudget::new(if self.full {
+            None
+        } else {
+            Some(self.max_chars.unwrap_or(DEFAULT_MAX_CHARS))
+        })
+    }
+}
+
 struct ContextRunArgs {
+    machine: String,
+    offset: usize,
     record_id: Option<String>,
     doc_id: Option<u64>,
     event_id: Option<String>,
@@ -2120,12 +3894,15 @@ struct ContextRunArgs {
     before: usize,
     after: usize,
     expand_interactions: bool,
-    verbose: bool,
+    output: OutputOptions,
+    read: ReadArgs,
     root: Option<PathBuf>,
 }
 
 fn run_context(args: ContextRunArgs) -> Result<()> {
     let ContextRunArgs {
+        machine,
+        offset,
         record_id,
         doc_id,
         event_id,
@@ -2134,9 +3911,11 @@ fn run_context(args: ContextRunArgs) -> Result<()> {
         before,
         after,
         expand_interactions,
-        verbose,
+        output,
+        read,
         root,
     } = args;
+    let budget = read.budget()?;
     let selector = match (record_id, doc_id, event_id) {
         (Some(id), None, None) => ContextSelector::record_id(id),
         (None, Some(id), None) => ContextSelector::doc_id(id),
@@ -2149,21 +3928,34 @@ fn run_context(args: ContextRunArgs) -> Result<()> {
     };
     let source = source.and_then(|value| crate::types::SourceKind::from_label(value.as_str()));
     let paths = Paths::new(root)?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
-    let result = context_records(
-        &index,
+    let config = UserConfig::load(&paths)?;
+    let result = read_context(
+        &paths,
+        &config,
+        &machine,
         &selector.with_scope(session, source),
         ContextOptions {
             before,
             after,
             expand_interactions,
         },
+        offset,
+        budget.remaining(),
     )?;
-    if verbose {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        println!("{}", serde_json::to_string(&result)?);
-    }
+    let mut value = serde_json::to_value(result)?;
+    value["machine"] = Value::from(machine);
+    output.print_value(&value)
+}
+
+fn print_json(value: &Value, pretty: bool) -> Result<()> {
+    println!(
+        "{}",
+        if pretty {
+            serde_json::to_string_pretty(value)?
+        } else {
+            serde_json::to_string(value)?
+        }
+    );
     Ok(())
 }
 
@@ -2183,6 +3975,7 @@ struct HydrateRecordOutput {
     #[serde(flatten)]
     record: crate::types::Record,
     record_id: String,
+    content: ContentPage,
 }
 
 #[derive(Debug, Serialize)]
@@ -2206,7 +3999,13 @@ struct HydrateErrorOutput {
     error: String,
 }
 
-fn run_hydrate(input: Option<PathBuf>, root: Option<PathBuf>) -> Result<()> {
+fn run_hydrate(
+    input: Option<PathBuf>,
+    read: ReadArgs,
+    root: Option<PathBuf>,
+    output: OutputOptions,
+) -> Result<()> {
+    let budget = read.budget()?;
     let mut contents = String::new();
     let mut reader: Box<dyn Read> = match input {
         Some(path) if path.to_string_lossy() != "-" => Box::new(std::fs::File::open(path)?),
@@ -2218,7 +4017,7 @@ fn run_hydrate(input: Option<PathBuf>, root: Option<PathBuf>) -> Result<()> {
         .read_to_string(&mut contents)?;
     if contents.len() > MAX_HYDRATE_INPUT_BYTES {
         return Err(anyhow!(
-            "hydrate input exceeds maximum size of {MAX_HYDRATE_INPUT_BYTES} bytes"
+            "session batch input exceeds maximum size of {MAX_HYDRATE_INPUT_BYTES} bytes"
         ));
     }
     let mut requests = Vec::new();
@@ -2228,22 +4027,22 @@ fn run_hydrate(input: Option<PathBuf>, root: Option<PathBuf>) -> Result<()> {
         }
         if raw.len() > MAX_HYDRATE_LINE_BYTES {
             return Err(anyhow!(
-                "hydrate request line {} exceeds maximum size of {} bytes",
+                "session batch request line {} exceeds maximum size of {} bytes",
                 line + 1,
                 MAX_HYDRATE_LINE_BYTES
             ));
         }
         let request = serde_json::from_str::<HydrateRequest>(raw)
-            .with_context(|| format!("parse hydrate request line {}", line + 1))?;
+            .with_context(|| format!("parse session batch request line {}", line + 1))?;
         if request.session_id.is_empty() {
             return Err(anyhow!(
-                "hydrate request line {} has an empty session_id",
+                "session batch request line {} has an empty session_id",
                 line + 1
             ));
         }
         if request.limit == 0 || request.limit > MAX_SESSION_PAGE_SIZE {
             return Err(anyhow!(
-                "hydrate request line {} limit must be between 1 and {}",
+                "session batch request line {} limit must be between 1 and {}",
                 line + 1,
                 MAX_SESSION_PAGE_SIZE
             ));
@@ -2251,83 +4050,123 @@ fn run_hydrate(input: Option<PathBuf>, root: Option<PathBuf>) -> Result<()> {
         requests.push(request);
     }
     if requests.is_empty() {
-        return Err(anyhow!("hydrate input is empty"));
+        return Err(anyhow!("session batch input is empty"));
     }
     if requests.len() > MAX_SESSION_BATCH_SIZE {
         return Err(anyhow!(
-            "hydrate accepts at most {MAX_SESSION_BATCH_SIZE} requests"
+            "session batch accepts at most {MAX_SESSION_BATCH_SIZE} requests"
         ));
     }
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let mut grouped: HashMap<String, Vec<(usize, SessionPageRequest)>> = HashMap::new();
-    for (index, request) in requests.into_iter().enumerate() {
-        let machine = request
-            .machine
-            .unwrap_or_else(|| crate::machine::LOCAL_MACHINE_ID.to_string());
-        grouped.entry(machine).or_default().push((
-            index,
-            SessionPageRequest {
-                session_id: request.session_id,
-                source_path: request.source_path,
-                offset: request.offset,
-                limit: request.limit,
-            },
-        ));
-    }
-    let total_requests = grouped.values().map(Vec::len).sum();
-    let mut output: Vec<Option<Value>> = vec![None; total_requests];
-    for (machine, batch) in grouped {
-        let page_requests: Vec<_> = batch.iter().map(|(_, request)| request.clone()).collect();
-        match batch_session_contexts(&paths, &config, &machine, &page_requests) {
-            Ok(contexts) => {
-                for ((original_index, _), context) in batch.into_iter().zip(contexts) {
-                    output[original_index] = Some(hydrate_success_value(&machine, context)?);
+    // Contiguous batches preserve input order while allowing the peer to enforce
+    // the remaining command budget before sending record bodies over SSH.
+    let requests: Vec<_> = requests
+        .into_iter()
+        .map(|request| {
+            (
+                request
+                    .machine
+                    .unwrap_or_else(|| crate::machine::LOCAL_MACHINE_ID.to_string()),
+                SessionPageRequest {
+                    session_id: request.session_id,
+                    source_path: request.source_path,
+                    offset: request.offset,
+                    limit: request.limit,
+                },
+            )
+        })
+        .collect();
+    let mut writer = output.writer();
+    let mut remaining = budget.remaining();
+    let mut position = 0;
+    while position < requests.len() {
+        let machine = &requests[position].0;
+        let end = position
+            + requests[position..]
+                .iter()
+                .take_while(|(id, _)| id == machine)
+                .count();
+        let batch: Vec<_> = requests[position..end]
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect();
+        match read_session_pages(&paths, &config, machine, &batch, remaining) {
+            Ok(pages) => {
+                for page in pages {
+                    writer.write(hydrate_page_value(machine, page, &mut remaining)?)?;
                 }
             }
-            Err(batch_error) => {
-                eprintln!("Warning: hydrate machine '{machine}' failed: {batch_error}");
-                for (original_index, request) in batch {
-                    let value = if machine == crate::machine::LOCAL_MACHINE_ID {
-                        match session_page_context(&paths, &config, &machine, &request) {
-                            Ok(context) => hydrate_success_value(&machine, context)?,
+            Err(error) => {
+                eprintln!("Warning: session batch machine '{machine}' failed: {error}");
+                for request in &batch {
+                    if machine == crate::machine::LOCAL_MACHINE_ID {
+                        match read_session_pages(
+                            &paths,
+                            &config,
+                            machine,
+                            std::slice::from_ref(request),
+                            remaining,
+                        ) {
+                            Ok(pages) => {
+                                for page in pages {
+                                    writer.write(hydrate_page_value(
+                                        machine,
+                                        page,
+                                        &mut remaining,
+                                    )?)?;
+                                }
+                                continue;
+                            }
                             Err(error) => {
-                                hydrate_error_value(&machine, &request, &error.to_string())?
+                                writer.write(hydrate_error_value(
+                                    machine,
+                                    request,
+                                    &error.to_string(),
+                                )?)?;
+                                continue;
                             }
                         }
-                    } else {
-                        hydrate_error_value(&machine, &request, &batch_error.to_string())?
-                    };
-                    output[original_index] = Some(value);
+                    }
+                    writer.write(hydrate_error_value(machine, request, &error.to_string())?)?;
                 }
             }
         }
+        position = end;
     }
-    for value in output {
-        let value = value.ok_or_else(|| anyhow!("hydrate response missing for request"))?;
-        println!("{}", value);
-    }
-    Ok(())
+    writer.finish()
 }
 
-fn hydrate_success_value(
+fn hydrate_page_value(
     machine: &str,
-    context: crate::machine::SessionPageContext,
+    page: crate::machine::BoundedSessionPage,
+    remaining: &mut Option<usize>,
 ) -> Result<Value> {
+    let returned: usize = page
+        .records
+        .iter()
+        .map(|record| record.content.returned_chars)
+        .sum();
+    if let Some(remaining) = remaining {
+        *remaining = remaining
+            .checked_sub(returned)
+            .ok_or_else(|| anyhow!("hydrate response exceeds remaining character budget"))?;
+    }
     Ok(serde_json::to_value(HydrateOutput {
         machine: machine.to_string(),
-        session_id: context.session_id,
-        source_path: context.source_path,
-        cwd: context.cwd,
-        offset: context.offset,
-        total: context.total,
-        next_offset: context.next_offset,
-        records: context
+        session_id: page.session_id,
+        source_path: page.source_path,
+        cwd: page.cwd,
+        offset: page.offset,
+        total: page.total,
+        next_offset: page.next_offset,
+        records: page
             .records
             .into_iter()
-            .map(|record| HydrateRecordOutput {
-                record_id: canonical_record_id(&record),
-                record,
+            .map(|item| HydrateRecordOutput {
+                record: item.record,
+                record_id: item.record_id,
+                content: item.content,
             })
             .collect(),
     })?)
@@ -2420,80 +4259,259 @@ fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) ->
     Ok(())
 }
 
-fn run_session(
+struct SessionRunArgs {
     session_id: String,
     machine: String,
     source_path: Option<String>,
     offset: usize,
     limit: Option<usize>,
-    verbose: bool,
+    output: OutputOptions,
+    read: ReadArgs,
     root: Option<PathBuf>,
-) -> Result<()> {
+}
+
+type CollectedSessionPage = (Vec<BoundedRecord>, Option<(usize, Option<usize>)>);
+
+#[allow(clippy::too_many_arguments)]
+fn collect_session_page(
+    paths: &Paths,
+    config: &UserConfig,
+    machine: &str,
+    session_id: &str,
+    source_path: &str,
+    offset: usize,
+    limit: Option<usize>,
+    read: &ReadArgs,
+) -> Result<CollectedSessionPage> {
+    let mut budget = read.budget()?;
     if session_id.is_empty() {
         return Err(anyhow!("session_id must not be empty"));
     }
+    if read.full {
+        let records = hydrate_session_records(
+            paths,
+            config,
+            machine,
+            session_id,
+            source_path,
+            offset,
+            limit,
+        )?
+        .into_iter()
+        .map(|mut record| {
+            let record_id = canonical_record_id(&record);
+            let content = budget.apply(&mut record, None, 0)?;
+            Ok(BoundedRecord {
+                record_id,
+                record,
+                content,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+        Ok((records, None))
+    } else {
+        let request = SessionPageRequest {
+            session_id: session_id.to_owned(),
+            source_path: source_path.to_owned(),
+            offset,
+            limit: limit.unwrap_or(50),
+        };
+        let mut pages = read_session_pages(paths, config, machine, &[request], budget.remaining())?;
+        let page = pages
+            .pop()
+            .ok_or_else(|| anyhow!("session response missing page"))?;
+        Ok((page.records, Some((page.total, page.next_offset))))
+    }
+}
+
+fn run_session(args: SessionRunArgs) -> Result<()> {
+    let SessionRunArgs {
+        session_id,
+        machine,
+        source_path,
+        offset,
+        limit,
+        output,
+        read,
+        root,
+    } = args;
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let records = hydrate_session_records(
+    let source_path = source_path.unwrap_or_default();
+    let (records, page) = collect_session_page(
         &paths,
         &config,
         &machine,
         &session_id,
-        source_path.as_deref().unwrap_or_default(),
+        &source_path,
         offset,
         limit,
+        &read,
     )?;
-    if verbose {
-        for record in records {
-            let ts = format_ts(record.ts);
-            println!("{ts} {}", record.role);
-            if record.text.is_empty() {
-                println!("  <empty>");
-                continue;
-            }
-            for line in record.text.lines() {
+    let text = output.format == OutputFormat::Text;
+    let mut writer = output.writer();
+    for item in records {
+        if text {
+            println!("{} {}", format_ts(item.record.ts), item.record.role);
+            for line in item.record.text.lines() {
                 println!("  {line}");
             }
+            for (name, value) in [
+                ("tool_input", &item.record.tool_input),
+                ("tool_output", &item.record.tool_output),
+            ] {
+                if let Some(value) = value {
+                    println!("  {name}: {value}");
+                }
+            }
+            if item.content.truncated {
+                println!(
+                    "  continuation: {}",
+                    serde_json::to_string(
+                        &serde_json::json!({"machine": machine, "record_id": item.record_id, "content": item.content})
+                    )?
+                );
+            }
+        } else {
+            let mut value = serde_json::to_value(item)?;
+            value["machine"] = Value::from(machine.clone());
+            writer.write(value)?;
         }
-        return Ok(());
     }
-    for record in records {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "machine": &machine,
-                "record_id": canonical_record_id(&record),
-                "record": record,
-            }))?
-        );
+    if let Some((total, next_offset)) = page {
+        let value = serde_json::json!({ "type": "page", "machine": machine, "session_id": session_id, "source_path": source_path, "offset": offset, "total": total, "next_offset": next_offset });
+        if text {
+            println!("page: {value}");
+        } else {
+            writer.write(value)?;
+        }
+    }
+    if !text {
+        writer.finish()?;
     }
     Ok(())
 }
 
-fn run_show(doc_id: u64, machine: String, verbose: bool, root: Option<PathBuf>) -> Result<()> {
+struct ShowRunArgs {
+    selector: ContextSelector,
+    field: Option<ReadField>,
+    offset_chars: usize,
+    machine: String,
+    output: OutputOptions,
+    read: ReadArgs,
+    root: Option<PathBuf>,
+}
+
+struct MemoryShowRunArgs {
+    memory_id: String,
+    section: Option<String>,
+    content_version: Option<String>,
+    offset_chars: usize,
+    machine: String,
+    output: OutputOptions,
+    read: ReadArgs,
+    root: Option<PathBuf>,
+}
+
+fn run_show_memory(args: MemoryShowRunArgs) -> Result<()> {
+    let paths = Paths::new(args.root)?;
+    let config = UserConfig::load(&paths)?;
+    if args
+        .read
+        .max_chars
+        .is_some_and(|max_chars| max_chars > MAX_MEMORY_READ_CHARS)
+    {
+        return Err(anyhow!(
+            "memory --max-chars cannot exceed {MAX_MEMORY_READ_CHARS}"
+        ));
+    }
+    let request = MemoryReadRequest {
+        memory_id: args.memory_id,
+        section_ref: args.section,
+        content_version: args.content_version,
+        offset_chars: args.offset_chars,
+        max_chars: args.read.max_chars.unwrap_or(DEFAULT_MAX_CHARS),
+    };
+    let result = if args.read.full {
+        read_full_memory(&paths, &config, &args.machine, &request)?
+    } else {
+        read_memory(&paths, &config, &args.machine, &request)?
+    };
+    let mut value = serde_json::to_value(result)?;
+    value["machine"] = Value::from(args.machine);
+    args.output.print_value(&value)
+}
+
+fn read_full_memory(
+    paths: &Paths,
+    config: &UserConfig,
+    machine: &str,
+    original: &MemoryReadRequest,
+) -> Result<MemoryReadValue> {
+    const MAX_VERSION_RESTARTS: usize = 2;
+    for attempt in 0..=MAX_VERSION_RESTARTS {
+        let mut request = original.clone();
+        request.max_chars = MAX_MEMORY_READ_CHARS;
+        let mut first = read_memory(paths, config, machine, &request)?;
+        let version = first.content_version.clone();
+        let mut text = first.text.clone();
+        let mut next = first.next_offset_chars;
+        let mut changed_mid_read = false;
+        while let Some(offset_chars) = next {
+            request.section_ref = first.section_ref.clone();
+            request.content_version = Some(version.clone());
+            request.offset_chars = offset_chars;
+            let page = read_memory(paths, config, machine, &request)?;
+            if page.changed_since_search || page.content_version != version {
+                changed_mid_read = true;
+                break;
+            }
+            text.push_str(&page.text);
+            next = page.next_offset_chars;
+        }
+        if changed_mid_read {
+            if attempt == MAX_VERSION_RESTARTS {
+                return Err(anyhow!(
+                    "memory changed repeatedly while reading; search again and retry with the new content_version"
+                ));
+            }
+            continue;
+        }
+        first.text = text;
+        first.content.returned_chars = first.text.chars().count();
+        first.content.truncated = false;
+        first.content.continuations.clear();
+        first.next_offset_chars = None;
+        return Ok(first);
+    }
+    unreachable!("bounded memory read retry loop always returns")
+}
+
+fn run_show(args: ShowRunArgs) -> Result<()> {
+    let ShowRunArgs {
+        selector,
+        field,
+        offset_chars,
+        machine,
+        output,
+        read,
+        root,
+    } = args;
+    let budget = read.budget()?;
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let record = record_by_doc_id(&paths, &config, &machine, doc_id)?;
-    if verbose {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "machine": &machine,
-                "record_id": canonical_record_id(&record),
-                "record": record,
-            }))?
-        );
-        return Ok(());
-    }
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "machine": &machine,
-            "record_id": canonical_record_id(&record),
-            "record": record,
-        }))?
-    );
-    Ok(())
+    let record = read_record(
+        &paths,
+        &config,
+        &machine,
+        &selector,
+        field,
+        offset_chars,
+        budget.remaining(),
+    )?;
+    let mut value = serde_json::to_value(record)?;
+    value["machine"] = Value::from(machine);
+    output.print_value(&value)
 }
 
 fn hydrate_session_records(
@@ -2537,37 +4555,40 @@ fn hydrate_session_records(
 fn run_stats(root: Option<PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
+    let memory = MemoryStore::new(paths.root.join("memory/documents.json")).load()?;
+    let memory_sections = memory
+        .documents
+        .iter()
+        .map(|document| document.sections.len())
+        .sum::<usize>();
+    let stale_memories = memory
+        .documents
+        .iter()
+        .filter(|document| matches!(document.freshness, MemoryFreshness::Stale { .. }))
+        .count();
     println!("index: {}", paths.index.display());
     println!("documents: {}", index.doc_count()?);
     println!("segments: {}", index.segment_count()?);
-    let index_bytes = observed_directory_size(&paths.index);
     println!(
-        "index storage: {} ({} bytes)",
-        crate::progress::format_bytes(index_bytes),
-        index_bytes
+        "index storage: {} bytes",
+        observed_directory_size(&paths.index)
     );
-    print_vector_stats(&paths.vectors)?;
     if let Some(status) = crate::vector_backfill::status(&paths)? {
         println!("{}", status.line());
     }
+    println!("memory documents: {}", memory.documents.len());
+    println!("memory sections: {memory_sections}");
+    println!("stale memory documents: {stale_memories}");
+    print_vector_stats(&paths.vectors)?;
     Ok(())
-}
-
-fn observed_directory_size(path: &std::path::Path) -> u64 {
-    walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.len())
-        .sum()
 }
 
 struct UsageCommandOptions {
     source: Option<SourceFilter>,
+    origin: SessionOrigin,
     since: Option<String>,
     until: Option<String>,
-    json: bool,
+    output: OutputOptions,
     include_events: bool,
     cost_mode: CostMode,
     root: Option<PathBuf>,
@@ -2577,14 +4598,18 @@ struct UsageCommandOptions {
 fn run_usage(options: UsageCommandOptions) -> Result<()> {
     let UsageCommandOptions {
         source,
+        origin,
         since,
         until,
-        json,
+        output,
         include_events,
         cost_mode,
         root,
         machines,
     } = options;
+    if include_events && output.format == OutputFormat::Text {
+        return Err(anyhow!("--events requires --format json or --format jsonl"));
+    }
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let since_ms = parse_ts_millis(since)?;
@@ -2605,10 +4630,11 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
                 cost_mode,
                 include_events,
                 memo_ttl_ms: 0,
+                kind: Some(origin.into()),
             },
         )?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+        if output.format != OutputFormat::Text {
+            output.print_value(&serde_json::to_value(&report)?)?;
         } else {
             println!("{}", report.authority);
             print_usage_rows(
@@ -2643,11 +4669,18 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
         source,
         project: None,
         project_grouping: crate::analytics::ProjectGrouping::Flat,
-        session_keys: None,
+        session_keys: match origin {
+            SessionOrigin::All | SessionOrigin::Regular => None,
+            other => Some(crate::machine::usage_session_keys_for_kind(
+                &paths,
+                other.into(),
+            )?),
+        },
         since_ms,
         until_ms,
         cost_mode,
         include_events,
+        include_reviews: origin == SessionOrigin::All,
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: 0,
     };
@@ -2706,8 +4739,8 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
         let _ = reporter.join();
     }
     let report = report?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    if output.format != OutputFormat::Text {
+        output.print_value(&serde_json::to_value(&report)?)?;
     } else {
         println!("local reconstructed usage (not subscription quota)");
         print_usage_table(&report);
@@ -2994,7 +5027,7 @@ fn source_dir_of(source_path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn session_resume_command(
+pub(crate) fn session_resume_command(
     config: &UserConfig,
     row: &crate::analytics::SessionDetailRow,
 ) -> Option<(String, String)> {
@@ -3017,46 +5050,109 @@ fn session_resume_command(
 
 #[allow(clippy::too_many_arguments)]
 fn run_sessions(
+    session_id: Option<String>,
+    source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
     source: Option<SourceFilter>,
     since: Option<String>,
     limit: usize,
-    machines: Vec<String>,
-    json_array: bool,
+    origin: SessionOrigin,
+    output: OutputOptions,
     root: Option<PathBuf>,
+    machine: Vec<String>,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let result = federated_sessions(
         &paths,
         &config,
-        &machines,
+        &machine,
         &SessionListSpec {
             source,
             project,
             cwd: canonical_cwd_filter(cwd),
             since_ms: parse_ts_millis(since)?,
             limit,
+            origin: match origin {
+                SessionOrigin::All => None,
+                other => Some(other.into()),
+            },
+            session_id,
+            source_path,
         },
     )?;
-    for (machine, error) in &result.failures {
-        eprintln!("Warning: machine '{machine}' unavailable: {error}");
+    for (machine, error) in result.failures {
+        eprintln!("{machine}: {error}");
     }
-
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
     let mut items = Vec::new();
-    for located in &result.items {
-        let row = &located.session;
-        let resume_cmd = (located.machine == crate::machine::LOCAL_MACHINE_ID)
-            .then(|| session_resume_command(&config, row).map(|(command, _)| command))
-            .flatten();
+    for located in result.items {
+        let row = located.session;
+        let resume_cmd = located
+            .resume_cmd
+            .or_else(|| session_resume_command(&config, &row).map(|(command, _)| command));
+        let mut value = serde_json::to_value(&row)?;
+        value["machine"] = Value::String(located.machine);
+        value["started_at"] = Value::String(format_ts(row.started_at));
+        value["last_at"] = Value::String(format_ts(row.last_at));
+        if let Some(command) = resume_cmd {
+            value["resume_cmd"] = Value::String(command);
+        }
+        items.push(value);
+    }
+    output.print_values(items)
+}
+
+pub(crate) fn collect_projects(paths: &Paths, source: Option<SourceFilter>) -> Result<Vec<Value>> {
+    let store = open_analytics_read_only(paths)?;
+    Ok(store.query_project_summaries(source)?.into_iter().map(|row| {
+        let last_at = row.last_at.and_then(|timestamp| {
+            let formatted = format_ts(timestamp);
+            (formatted != "-").then_some(formatted)
+        });
+        serde_json::json!({"project": row.project, "session_count": row.session_count, "last_at": last_at})
+    }).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_sessions(
+    session_id: Option<String>,
+    source_path: Option<String>,
+    cwd: Option<PathBuf>,
+    project: Option<String>,
+    source: Option<SourceFilter>,
+    since: Option<String>,
+    limit: usize,
+    origin: SessionOrigin,
+    root: Option<PathBuf>,
+) -> Result<Vec<Value>> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let store = open_analytics_read_only(&paths)?;
+    let since_ms = parse_ts_millis(since)?;
+    let cwd_filter = canonical_cwd_filter(cwd);
+    let kind_filter = match origin {
+        SessionOrigin::All => None,
+        other => Some(other.into()),
+    };
+    let rows = store.query_sessions_detailed_selected(
+        source,
+        project.as_deref(),
+        cwd_filter.as_deref(),
+        since_ms,
+        kind_filter,
+        session_id.as_deref(),
+        source_path.as_deref(),
+        Some(limit),
+    )?;
+
+    let mut items = Vec::new();
+    for row in &rows {
+        let resume_cmd = session_resume_command(&config, row).map(|(command, _)| command);
         let mut value = serde_json::to_value(row)?;
         let object = value
             .as_object_mut()
             .expect("session row serializes to object");
-        object.insert("machine".into(), Value::String(located.machine.clone()));
         object.insert(
             "started_at".into(),
             Value::String(format_ts(row.started_at)),
@@ -3065,16 +5161,122 @@ fn run_sessions(
         if let Some(resume_cmd) = resume_cmd {
             object.insert("resume_cmd".into(), Value::String(resume_cmd));
         }
-        if json_array {
-            items.push(value);
-        } else {
-            writeln!(out, "{value}")?;
+        items.push(value);
+    }
+    Ok(items)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SessionCount {
+    pub(crate) total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+pub(crate) fn collect_session_count(
+    paths: &Paths,
+    request: SessionsRequest,
+    query: Option<String>,
+) -> Result<SessionCount> {
+    let source = parse_source_filter(request.source)?;
+    let since = parse_ts_millis(request.since)?;
+    let kind = request.origin.into();
+    let query = query.filter(|query| !query.trim().is_empty());
+    if let Some(query) = query {
+        if request.cwd.is_some() {
+            return Err(anyhow!("--query count does not support --cwd"));
         }
+        if !SearchIndex::exists(&paths.index) {
+            return Ok(SessionCount {
+                total: None,
+                reason: Some("search index unavailable".into()),
+            });
+        }
+        let index = SearchIndex::open_or_create(&paths.index)?;
+        let scopes = index.fast_session_scopes_matching_query(&QueryOptions {
+            query,
+            project: request.project,
+            role: None,
+            tool: None,
+            session_id: request.session_id,
+            session_scope: None,
+            source,
+            since,
+            until: None,
+            limit: 1,
+        })?;
+        let Some(mut scopes) = scopes else {
+            return Ok(SessionCount {
+                total: None,
+                reason: Some("index lacks fast session identity fields".into()),
+            });
+        };
+        if let Some(path) = request.source_path {
+            scopes.retain(|scope| scope.2 == path);
+        }
+        if scopes.is_empty() || kind == crate::analytics::SessionKindFilter::All {
+            return Ok(SessionCount {
+                total: Some(scopes.len() as u64),
+                reason: None,
+            });
+        }
+        let store = match open_analytics_read_only(paths) {
+            Ok(store) => store,
+            Err(_) => {
+                return Ok(SessionCount {
+                    total: None,
+                    reason: Some("canonical session metadata unavailable".into()),
+                });
+            }
+        };
+        let total = store.count_session_scopes(&scopes, kind)?;
+        Ok(SessionCount {
+            total,
+            reason: total
+                .is_none()
+                .then(|| "canonical session metadata incomplete".into()),
+        })
+    } else {
+        let store = open_analytics_read_only(paths)?;
+        let cwd = canonical_cwd_filter(request.cwd.map(PathBuf::from));
+        let total = store.count_sessions_selected(
+            source,
+            request.project.as_deref(),
+            cwd.as_deref(),
+            since,
+            Some(kind),
+            request.session_id.as_deref(),
+            request.source_path.as_deref(),
+        )?;
+        Ok(SessionCount {
+            total: Some(total),
+            reason: None,
+        })
     }
-    if json_array {
-        writeln!(out, "{}", Value::Array(items))?;
+}
+
+pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> Result<Value> {
+    validate_mcp_limit(request.limit)?;
+    let source = parse_source_filter(request.source)?;
+    let mut results = collect_sessions(
+        request.session_id,
+        request.source_path,
+        request.cwd.map(PathBuf::from),
+        request.project,
+        source,
+        request.since,
+        request.limit,
+        request.origin,
+        root,
+    )?;
+    for value in &mut results {
+        value["machine"] = Value::String(crate::machine::LOCAL_MACHINE_ID.to_string());
     }
-    Ok(())
+    Ok(serde_json::json!({
+        "results": results,
+        "failures": [],
+        "selected_machines": [crate::machine::LOCAL_MACHINE_ID],
+    }))
 }
 
 fn run_herdr_resume(
@@ -3091,15 +5293,29 @@ fn run_herdr_resume(
 
     let mut rows =
         store.query_sessions_detailed(source, None, cwd_filter.as_deref(), None, None)?;
+    // Resume-last targets the user's own work, never a background worker
+    // transcript. An explicit session id still resumes anything.
+    let interactive = |row: &crate::analytics::SessionDetailRow| {
+        row.conversation_kind
+            .as_deref()
+            .is_none_or(|kind| kind == "main")
+    };
     if let Some(session_id) = &session_id {
         rows.retain(|row| &row.session_id == session_id);
         if rows.is_empty() {
             return Err(anyhow!("session '{session_id}' not found"));
         }
-    } else if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
-        // The public CLI keeps its historical global fallback unless the Herdr plugin
-        // explicitly requires the focused directory to match.
-        rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
+    } else {
+        // Implicit resume never selects a background worker: discard
+        // non-interactive rows even when nothing interactive matches, so
+        // selection falls through to the global fallback or reports none.
+        rows.retain(&interactive);
+        if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
+            // The public CLI keeps its historical global fallback unless the Herdr plugin
+            // explicitly requires the focused directory to match.
+            rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
+            rows.retain(&interactive);
+        }
     }
 
     let Some((row, command, cwd)) = rows
@@ -3149,6 +5365,14 @@ fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
     let store = AnalyticsStore::open(&db)?;
     println!("analytics: {}", db.display());
     println!("documents: {}", index.doc_count()?);
+    println!("segments: {}", index.segment_count()?);
+    println!(
+        "index storage: {} bytes",
+        observed_directory_size(&paths.index)
+    );
+    if let Some(status) = crate::vector_backfill::status(&paths)? {
+        println!("{}", status.line());
+    }
     println!("sessions: {}", store.session_count()?);
     Ok(())
 }
@@ -3221,6 +5445,37 @@ fn run_skill_status(target: SkillTarget) -> Result<()> {
         println!("{label}: {state} ({})", path.display());
     }
     Ok(())
+}
+
+fn skill_warnings(home: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut differing = Vec::new();
+    for (label, path) in skill_destinations(home, SkillTarget::All) {
+        match std::fs::read(&path) {
+            Ok(contents) if contents != MEMEX_SEARCH_SKILL.as_bytes() => differing.push(label),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => warnings.push(format!(
+                "cannot check {label} memex-search skill ({}): {err}",
+                path.display()
+            )),
+        }
+    }
+    if !differing.is_empty() {
+        warnings.push(format!(
+            "memex-search skill is outdated or locally modified ({}). Run `memex skill status` to inspect, or `memex skill update` to replace installed copies with this version. Use `memex update --yes` to update both memex and its skills.",
+            differing.join(", ")
+        ));
+    }
+    warnings
+}
+
+fn warn_if_skill_outdated() {
+    if let Ok(home) = home_dir() {
+        for warning in skill_warnings(&home) {
+            eprintln!("warning: {warning}");
+        }
+    }
 }
 
 fn run_skill_install(
@@ -3458,6 +5713,9 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Grok => "grok",
         crate::types::SourceKind::Omp => "omp",
         crate::types::SourceKind::Hermes => "hermes",
+        crate::types::SourceKind::Jcode => "jcode",
+        crate::types::SourceKind::Muse => "muse",
+        crate::types::SourceKind::Antigravity => "antigravity",
     };
     let source_path = &record.source_path;
 
@@ -3565,9 +5823,11 @@ fn is_executable(path: &std::path::Path) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn run_index_service_enable(
     index: &IndexArgs,
+    mcp_args: DaemonMcpArgs,
     label: Option<String>,
     continuous: bool,
     poll_interval: Option<u64>,
+    watch_mode: Option<WatchMode>,
     interval: Option<u64>,
     web_ui: bool,
     web_listen: Option<String>,
@@ -3587,14 +5847,34 @@ fn run_index_service_enable(
         ));
     }
 
+    let config_updates = IndexServiceConfigUpdates {
+        label: label.clone(),
+        stdout: config_path_setting(stdout.as_deref(), "--stdout")?,
+        stderr: config_path_setting(stderr.as_deref(), "--stderr")?,
+        plist: config_path_setting(plist.as_deref(), "--plist")?,
+        systemd_dir: config_path_setting(systemd_dir.as_deref(), "--systemd-dir")?,
+        ..IndexServiceConfigUpdates::from_cli(
+            continuous,
+            poll_interval,
+            watch_mode,
+            interval,
+            web_ui,
+            web_listen.as_deref(),
+            &mcp_args,
+        )?
+    };
+
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
+    let mcp = mcp_args.resolve(&config);
+    let mcp_listen = mcp.as_ref().map(|options| options.listen);
     let cli_web_ui = web_ui || web_listen.is_some();
     let web_ui = cli_web_ui || config.index_service_web_ui_default();
     let web_listen = web_listen
         .or_else(|| config.index_service_web_listen.clone())
         .unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string());
-    let cli_continuous = continuous || poll_interval.is_some() || cli_web_ui;
+    let cli_continuous =
+        continuous || poll_interval.is_some() || watch_mode.is_some() || cli_web_ui;
     let config_continuous = match config.index_service_mode() {
         Some("interval") => false,
         Some("continuous") => true,
@@ -3605,22 +5885,33 @@ fn run_index_service_enable(
         }
         None => config.index_service_continuous_default(),
     };
-    let continuous = if cli_continuous || web_ui {
+    let continuous = if cli_continuous || web_ui || mcp.is_some() {
         true
     } else if interval.is_some() {
         false
     } else {
         config_continuous
     };
-    let poll_interval = poll_interval.unwrap_or(config.index_service_poll_interval());
+    let watch_mode = watch_mode.unwrap_or(config.index_service_watch_mode()?);
+    let poll_interval = poll_interval.unwrap_or(match watch_mode {
+        WatchMode::Events => config.index_service_resync_interval(),
+        WatchMode::Poll => config.index_service_poll_interval(),
+    });
     let interval = interval.unwrap_or(config.index_service_interval());
     if web_ui {
         crate::web::validate_listener(&web_listen)?;
     }
 
     let exe = std::env::current_exe()?;
-    let program_args =
-        build_index_command_args(index, continuous, poll_interval, web_ui, &web_listen);
+    let program_args = build_index_command_args(
+        index,
+        continuous,
+        poll_interval,
+        watch_mode,
+        web_ui,
+        &web_listen,
+        mcp_listen,
+    );
 
     std::fs::create_dir_all(&paths.root)?;
 
@@ -3655,12 +5946,191 @@ fn run_index_service_enable(
     };
 
     result?;
+    persist_index_service_config(&paths, &config_updates)?;
     disable_auto_index_on_search_by_default(&paths, &config)?;
     if web_ui {
         wait_for_web_ui(&web_listen, Duration::from_secs(5))?;
-        println!("web UI: http://{web_listen}");
+        println!("web UI: running on {web_listen}");
+        println!("open: memex web open --listen {web_listen}");
+    }
+    if let Some(listen) = mcp_listen {
+        let address = mcp_health_address(listen);
+        wait_for_http_health(&address, "memex-mcp", Duration::from_secs(5))?;
+        println!("MCP: http://{address}/mcp");
+        if let Some(public_url) = config.mcp.public_url.as_deref() {
+            println!("MCP OAuth: {public_url}/mcp");
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct IndexServiceConfigUpdates {
+    mode: Option<&'static str>,
+    poll_interval: Option<i64>,
+    watch_mode: Option<String>,
+    interval: Option<i64>,
+    web_ui: Option<bool>,
+    web_listen: Option<String>,
+    mcp: Option<bool>,
+    mcp_listen: Option<std::net::SocketAddr>,
+    label: Option<String>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    plist: Option<String>,
+    systemd_dir: Option<String>,
+}
+
+fn config_path_setting(path: Option<&Path>, option: &str) -> Result<Option<String>> {
+    path.map(|path| {
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("{option} must be valid UTF-8 to store in config.toml"))
+    })
+    .transpose()
+}
+
+impl IndexServiceConfigUpdates {
+    fn from_cli(
+        continuous: bool,
+        poll_interval: Option<u64>,
+        watch_mode: Option<WatchMode>,
+        interval: Option<u64>,
+        web_ui: bool,
+        web_listen: Option<&str>,
+        mcp_args: &DaemonMcpArgs,
+    ) -> Result<Self> {
+        let mode = if continuous
+            || poll_interval.is_some()
+            || watch_mode.is_some()
+            || web_ui
+            || web_listen.is_some()
+            || mcp_args.mcp
+            || mcp_args.mcp_listen.is_some()
+        {
+            Some("continuous")
+        } else if interval.is_some() {
+            Some("interval")
+        } else {
+            None
+        };
+        Ok(Self {
+            mode,
+            watch_mode: watch_mode.map(|mode| mode.to_string()),
+            poll_interval: poll_interval
+                .map(i64::try_from)
+                .transpose()
+                .context("--poll-interval is too large to store in config.toml")?,
+            interval: interval
+                .map(i64::try_from)
+                .transpose()
+                .context("--interval is too large to store in config.toml")?,
+            web_ui: (web_ui || web_listen.is_some()).then_some(true),
+            web_listen: web_listen.map(str::to_owned),
+            mcp: if mcp_args.no_mcp {
+                Some(false)
+            } else if mcp_args.mcp || mcp_args.mcp_listen.is_some() {
+                Some(true)
+            } else {
+                None
+            },
+            mcp_listen: mcp_args.mcp_listen,
+            ..Default::default()
+        })
+    }
+}
+
+fn persist_index_service_config(paths: &Paths, updates: &IndexServiceConfigUpdates) -> Result<()> {
+    if updates.mode.is_none()
+        && updates.poll_interval.is_none()
+        && updates.watch_mode.is_none()
+        && updates.interval.is_none()
+        && updates.web_ui.is_none()
+        && updates.web_listen.is_none()
+        && updates.mcp.is_none()
+        && updates.mcp_listen.is_none()
+        && updates.label.is_none()
+        && updates.stdout.is_none()
+        && updates.stderr.is_none()
+        && updates.plist.is_none()
+        && updates.systemd_dir.is_none()
+    {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&paths.root)?;
+    let path = paths.root.join("config.toml");
+    let contents = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parse {} before updating daemon settings", path.display()))?;
+
+    if let Some(mode) = updates.mode {
+        replace_toml_value(&mut document["index_service_mode"], value(mode));
+    }
+    if let Some(interval) = updates.poll_interval {
+        // Both names deserialize into one field; keep the existing spelling
+        // rather than introducing a duplicate field into a legacy config.
+        let key = if document.contains_key("index_service_watch_interval") {
+            "index_service_watch_interval"
+        } else {
+            "index_service_poll_interval"
+        };
+        replace_toml_value(&mut document[key], value(interval));
+    }
+    if let Some(mode) = &updates.watch_mode {
+        replace_toml_value(
+            &mut document["index_service_watch_mode"],
+            value(mode.as_str()),
+        );
+    }
+    if let Some(interval) = updates.interval {
+        replace_toml_value(&mut document["index_service_interval"], value(interval));
+    }
+    if let Some(enabled) = updates.web_ui {
+        replace_toml_value(&mut document["index_service_web_ui"], value(enabled));
+    }
+    if let Some(listen) = &updates.web_listen {
+        replace_toml_value(
+            &mut document["index_service_web_listen"],
+            value(listen.as_str()),
+        );
+    }
+    if let Some(enabled) = updates.mcp {
+        replace_toml_value(&mut document["index_service_mcp"], value(enabled));
+    }
+    if let Some(listen) = updates.mcp_listen {
+        replace_toml_value(&mut document["mcp"]["listen"], value(listen.to_string()));
+    }
+    for (key, setting) in [
+        ("index_service_label", updates.label.as_deref()),
+        ("index_service_stdout", updates.stdout.as_deref()),
+        ("index_service_stderr", updates.stderr.as_deref()),
+        ("index_service_plist", updates.plist.as_deref()),
+        ("index_service_systemd_dir", updates.systemd_dir.as_deref()),
+    ] {
+        if let Some(setting) = setting {
+            replace_toml_value(&mut document[key], value(setting));
+        }
+    }
+
+    std::fs::write(&path, document.to_string())?;
+    println!("updated daemon settings: {}", path.display());
+    Ok(())
+}
+
+fn replace_toml_value(item: &mut TomlItem, replacement: TomlItem) {
+    let decor = item.as_value().map(|value| value.decor().clone());
+    *item = replacement;
+    if let Some(decor) = decor
+        && let Some(value) = item.as_value_mut()
+    {
+        *value.decor_mut() = decor;
+    }
 }
 
 fn disable_auto_index_on_search_by_default(paths: &Paths, config: &UserConfig) -> Result<()> {
@@ -3676,16 +6146,9 @@ fn disable_auto_index_on_search_by_default(paths: &Paths, config: &UserConfig) -
         String::new()
     };
 
-    if !contents.trim().is_empty() {
-        if !contents.ends_with('\n') {
-            contents.push('\n');
-        }
-        contents.push('\n');
-    }
-    contents.push_str(
-        "# Background indexing handles freshness; avoid duplicate scan work during search.\n",
+    contents = format!(
+        "# Background indexing handles freshness; avoid duplicate scan work during search.\nauto_index_on_search = false\n\n{contents}"
     );
-    contents.push_str("auto_index_on_search = false\n");
 
     std::fs::write(&path, contents)?;
     println!(
@@ -3905,13 +6368,21 @@ fn run_index_service_status(
     }
 }
 
-fn run_index_service_open(listen: Option<String>, root: Option<PathBuf>) -> Result<()> {
+fn run_index_service_open(
+    listen: Option<String>,
+    root: Option<PathBuf>,
+    print_url: bool,
+) -> Result<()> {
     let paths = Paths::new(root.clone())?;
     let config = UserConfig::load(&paths)?;
     let listen = listen
         .or(config.index_service_web_listen)
         .unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string());
     let url = crate::web::bootstrap_url(root, &listen)?;
+    if print_url {
+        println!("{url}");
+        return Ok(());
+    }
     let status = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(&url).status()?
     } else if cfg!(target_os = "linux") {
@@ -3949,7 +6420,7 @@ fn run_index_service_status_launchd(
 
     if !output.status.success() {
         if launchctl_not_found(&output) {
-            println!("index service: stopped");
+            println!("Memex daemon: stopped");
             println!("label: {label}");
             println!("definition: {}", plist_path.display());
             return Ok(());
@@ -3962,7 +6433,7 @@ fn run_index_service_status_launchd(
 
     let state = String::from_utf8_lossy(&output.stdout);
     let service_state = service_output_value(&state, "state").unwrap_or("loaded");
-    println!("index service: {service_state}");
+    println!("Memex daemon: {service_state}");
     println!("label: {label}");
     println!(
         "mode: {}",
@@ -3973,6 +6444,7 @@ fn run_index_service_status_launchd(
         }
     );
     print_service_web_ui_status(&state);
+    print_service_mcp_status(&state);
     println!("definition: {}", plist_path.display());
     Ok(())
 }
@@ -3993,7 +6465,7 @@ fn run_index_service_status_systemd(
     let service_path = systemd_dir.join(format!("{}.service", label));
     let timer_path = systemd_dir.join(format!("{}.timer", label));
     if !service_path.exists() && !timer_path.exists() {
-        println!("index service: stopped");
+        println!("Memex daemon: stopped");
         println!("label: {label}");
         println!("definition: {}", service_path.display());
         return Ok(());
@@ -4006,7 +6478,7 @@ fn run_index_service_status_systemd(
         SystemdServiceMode::Interval => format!("{}.timer", label),
     };
     let state = systemd_unit_state(&unit)?;
-    println!("index service: {state}");
+    println!("Memex daemon: {state}");
     println!("label: {label}");
     println!(
         "mode: {}",
@@ -4022,6 +6494,7 @@ fn run_index_service_status_systemd(
         String::new()
     };
     print_service_web_ui_status(&definition);
+    print_service_mcp_status(&definition);
     println!("definition: {}", service_path.display());
     if mode == SystemdServiceMode::Interval {
         println!("timer: {}", timer_path.display());
@@ -4151,7 +6624,8 @@ fn print_service_web_ui_status(output: &str) {
         let listen =
             service_output_arg_value(output, "--web-listen").unwrap_or(crate::web::DEFAULT_LISTEN);
         if web_ui_is_healthy(listen) {
-            println!("web UI: http://{listen}");
+            println!("web UI: running on {listen}");
+            println!("open: memex web open --listen {listen}");
         } else {
             println!("web UI: unavailable (configured at http://{listen})");
         }
@@ -4172,6 +6646,10 @@ fn web_ui_addresses(listen: &str) -> Result<Vec<std::net::SocketAddr>> {
 }
 
 fn web_ui_is_healthy(listen: &str) -> bool {
+    http_is_healthy(listen, "ok")
+}
+
+fn http_is_healthy(listen: &str, expected: &str) -> bool {
     web_ui_addresses(listen).is_ok_and(|addresses| {
         addresses.iter().any(|address| {
             let Ok(mut stream) = TcpStream::connect_timeout(address, Duration::from_millis(100))
@@ -4200,19 +6678,19 @@ fn web_ui_is_healthy(listen: &str) -> bool {
                     Ok(0) => break,
                     Ok(read) => {
                         response.extend_from_slice(&chunk[..read]);
-                        if is_memex_health_response(&response) {
+                        if is_http_health_response(&response, expected) {
                             return true;
                         }
                     }
                     Err(_) => return false,
                 }
             }
-            is_memex_health_response(&response)
+            is_http_health_response(&response, expected)
         })
     })
 }
 
-fn is_memex_health_response(response: &[u8]) -> bool {
+fn is_http_health_response(response: &[u8], expected: &str) -> bool {
     let Ok(response) = std::str::from_utf8(response) else {
         return false;
     };
@@ -4223,7 +6701,49 @@ fn is_memex_health_response(response: &[u8]) -> bool {
         .lines()
         .next()
         .is_some_and(|status| status.ends_with(" 200 OK"))
-        && body == "ok"
+        && body == expected
+}
+
+fn mcp_health_address(mut listen: std::net::SocketAddr) -> String {
+    if listen.ip().is_unspecified() {
+        listen.set_ip(if listen.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    listen.to_string()
+}
+
+fn wait_for_http_health(listen: &str, expected: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !http_is_healthy(listen, expected) {
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "{expected} did not become ready at {listen} within {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+fn print_service_mcp_status(output: &str) {
+    if service_output_has_arg(output, "--mcp") || output.contains(" --mcp ") {
+        let listen = service_output_arg_value(output, "--mcp-listen").unwrap_or("127.0.0.1:5363");
+        let address = listen
+            .parse()
+            .map(mcp_health_address)
+            .unwrap_or_else(|_| listen.to_string());
+        if http_is_healthy(&address, "memex-mcp") {
+            println!("MCP: http://{address}/mcp");
+        } else {
+            println!("MCP: unavailable (configured at {address})");
+        }
+    } else {
+        println!("MCP: disabled");
+    }
 }
 
 fn wait_for_web_ui(listen: &str, timeout: Duration) -> Result<()> {
@@ -4434,15 +6954,32 @@ fn build_index_command_args(
     index: &IndexArgs,
     continuous: bool,
     poll_interval: u64,
+    watch_mode: WatchMode,
     web_ui: bool,
     web_listen: &str,
+    mcp_listen: Option<std::net::SocketAddr>,
 ) -> Vec<String> {
     let mut args = Vec::new();
     args.push("index".to_string());
 
     if let Some(source) = &index.source {
-        args.push("--source".to_string());
+        args.push("--claude-path".to_string());
         args.push(source.to_string_lossy().to_string());
+    }
+    for (flag, sources) in [
+        ("--only-source", &index.only_source),
+        ("--exclude-source", &index.exclude_source),
+    ] {
+        for source in sources {
+            args.push(flag.to_string());
+            args.push(
+                source
+                    .to_possible_value()
+                    .expect("index source")
+                    .get_name()
+                    .to_string(),
+            );
+        }
     }
     if index.include_agents {
         args.push("--include-agents".to_string());
@@ -4478,6 +7015,19 @@ fn build_index_command_args(
     if !index.grok || index.no_grok {
         args.push("--no-grok".to_string());
     }
+    if !index.jcode || index.no_jcode {
+        args.push("--no-jcode".to_string());
+    }
+    if !index.muse || index.no_muse {
+        args.push("--no-muse".to_string());
+    }
+    if let Some(listen) = mcp_listen {
+        args.push("--mcp".to_string());
+        args.push("--mcp-listen".to_string());
+        args.push(listen.to_string());
+    } else if continuous {
+        args.push("--no-mcp".to_string());
+    }
     if index.embeddings {
         args.push("--embeddings".to_string());
     }
@@ -4490,7 +7040,12 @@ fn build_index_command_args(
     if index.no_prune {
         args.push("--no-prune".to_string());
     }
-    if continuous {
+    if continuous && watch_mode == WatchMode::Poll {
+        args.push("--watch-mode".to_string());
+        args.push("poll".to_string());
+        args.push("--watch-interval".to_string());
+        args.push(format!("{poll_interval}"));
+    } else if continuous {
         args.push("--watch".to_string());
         args.push("--watch-interval".to_string());
         args.push(format!("{poll_interval}"));
@@ -4663,10 +7218,6 @@ fn build_systemd_service(
     let mut out = String::new();
     out.push_str("[Unit]\n");
     out.push_str("Description=Memex Index Service\n");
-    if continuous {
-        out.push_str("StartLimitIntervalSec=5min\n");
-        out.push_str("StartLimitBurst=3\n");
-    }
     out.push('\n');
     out.push_str("[Service]\n");
     for (key, value) in env_vars {
@@ -4679,9 +7230,8 @@ fn build_systemd_service(
     out.push_str("Type=");
     if continuous {
         out.push_str("simple\n");
-        out.push_str("Restart=on-failure\n");
-        out.push_str("RestartSec=30s\n");
-        out.push_str("OOMPolicy=stop\n");
+        out.push_str("Restart=always\n");
+        out.push_str("RestartSec=10\n");
     } else {
         out.push_str("oneshot\n");
     }
@@ -4779,10 +7329,26 @@ fn summarize(text: &str, max: usize) -> String {
     out.trim().to_string()
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SortBy {
     Score,
     Ts,
+}
+
+const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search";
+
+fn search_fields(fields: Option<String>, full: bool) -> Result<Option<HashSet<String>>> {
+    if full {
+        return Ok(None);
+    }
+    Ok(parse_fields(fields)?.or_else(|| {
+        Some(
+            DEFAULT_SEARCH_FIELDS
+                .split(',')
+                .map(str::to_string)
+                .collect(),
+        )
+    }))
 }
 
 fn parse_fields(value: Option<String>) -> Result<Option<HashSet<String>>> {
@@ -4810,12 +7376,91 @@ fn wants_field(fields: &Option<HashSet<String>>, name: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Stored session kinds for the candidate groups, keyed by
+/// (machine, source label, session id) with prefer-main dominance. Remote
+/// machines and sessions missing from the analytics cache simply have no
+/// entry, and grouping falls back to the matched records. Empty unless an
+/// origin filter is active.
+fn stored_session_kinds(
+    paths: &Paths,
+    results: &[LocatedRecord],
+    origin_filtered: bool,
+) -> HashMap<(String, String, String), Option<String>> {
+    let mut out = HashMap::new();
+    if !origin_filtered {
+        return out;
+    }
+    let Ok(store) = open_analytics_read_only(paths) else {
+        return out;
+    };
+    for result in results {
+        let key = (
+            result.machine.clone(),
+            result.record.source.storage_label().to_string(),
+            result.record.session_id.clone(),
+        );
+        let stored = store.session_conversation_kind(
+            result.record.source.storage_label(),
+            &result.record.session_id,
+            &result.record.source_path,
+        );
+        let dominated = stored.as_deref() == Some("main");
+        out.entry(key)
+            .and_modify(|kind: &mut Option<String>| {
+                if dominated {
+                    *kind = Some("main".to_string());
+                }
+            })
+            .or_insert(stored);
+    }
+    out
+}
+
 fn apply_post_processing_located(
     mut results: Vec<LocatedRecord>,
     render: &RenderOptions,
+    stored_kinds: &HashMap<(String, String, String), Option<String>>,
 ) -> Vec<LocatedRecord> {
     if let Some(min_score) = render.min_score {
         results.retain(|result| result.score >= min_score);
+    }
+
+    // Session-grouped origin filter with prefer-main: a sidechain hit inside
+    // a primary session must not hide the session (mirrors the TUI and the
+    // analytics accumulator). Groups resolve against the stored session kind
+    // first — complete-session truth — and only fall back to the matched
+    // records when the analytics cache has no row (remote machines, stale
+    // caches).
+    if render.kind_filter != crate::analytics::SessionKindFilter::All {
+        let mut group_kind: HashMap<(String, String, String), Option<String>> = HashMap::new();
+        for result in &results {
+            let key = (
+                result.machine.clone(),
+                result.record.source.storage_label().to_string(),
+                result.record.session_id.clone(),
+            );
+            let dominated = result.record.links.conversation_kind.as_deref() == Some("main");
+            group_kind
+                .entry(key)
+                .and_modify(|kind| {
+                    if dominated {
+                        *kind = Some("main".to_string());
+                    }
+                })
+                .or_insert_with(|| result.record.links.conversation_kind.clone());
+        }
+        results.retain(|result| {
+            let key = (
+                result.machine.clone(),
+                result.record.source.storage_label().to_string(),
+                result.record.session_id.clone(),
+            );
+            let kind = stored_kinds
+                .get(&key)
+                .and_then(|stored| stored.as_deref())
+                .or_else(|| group_kind.get(&key).and_then(|kind| kind.as_deref()));
+            render.kind_filter.matches_kind(kind)
+        });
     }
 
     match render.sort {
@@ -4864,27 +7509,71 @@ fn format_ts(ts: u64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
-    let mut terms = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for part in query.split_whitespace() {
-        let cleaned = part.trim_matches(|c: char| !c.is_alphanumeric());
-        if cleaned.len() < 2 {
-            continue;
-        }
-        let key = cleaned.to_lowercase();
-        if seen.insert(key.clone()) {
-            terms.push(key);
+pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+    use tantivy::query_grammar::{Occur, UserInputAst, UserInputLeaf};
+    fn literals(ast: &UserInputAst, terms: &mut Vec<String>) {
+        match ast {
+            UserInputAst::Clause(children) => {
+                for (occur, child) in children {
+                    if *occur != Some(Occur::MustNot) {
+                        literals(child, terms);
+                    }
+                }
+            }
+            UserInputAst::Boost(child, _) => literals(child, terms),
+            UserInputAst::Leaf(leaf) => {
+                if let UserInputLeaf::Literal(literal) = leaf.as_ref()
+                    && literal
+                        .field_name
+                        .as_deref()
+                        .is_none_or(|field| field == "text")
+                {
+                    terms.extend(literal.phrase.split_whitespace().map(str::to_string));
+                }
+            }
         }
     }
+    let mut terms = Vec::new();
+    match tantivy::query_grammar::parse_query(query) {
+        Ok(ast) => literals(&ast, &mut terms),
+        // Semantic requests need not be valid lexical syntax.
+        Err(_) => terms.extend(query.split_whitespace().map(str::to_string)),
+    }
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for term in terms {
-        let re = RegexBuilder::new(&regex::escape(&term))
-            .case_insensitive(true)
-            .build()?;
-        out.push(re);
+        let term = term
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        if term.is_empty() || !seen.insert(term.clone()) {
+            continue;
+        }
+        out.push(
+            RegexBuilder::new(&regex::escape(&term))
+                .case_insensitive(true)
+                .build()?,
+        );
     }
     Ok(out)
+}
+
+// Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.
+pub(crate) fn match_preview(text: &str, matchers: &[regex::Regex], max_chars: usize) -> String {
+    let first = matchers
+        .iter()
+        .filter_map(|matcher| matcher.find(text))
+        .min_by_key(|m| m.start());
+    let Some(hit) = first else {
+        return summarize(text, max_chars);
+    };
+    let prefix = take_last_chars(&text[..hit.start()], 80);
+    let start = hit.start() - prefix.len();
+    let preview = summarize(&text[start..], max_chars.saturating_sub(1));
+    if start > 0 {
+        format!("…{preview}")
+    } else {
+        preview
+    }
 }
 
 fn collect_matches(text: &str, matchers: &[regex::Regex], max: usize) -> Vec<MatchSpan> {
@@ -4940,106 +7629,220 @@ fn resolve_flag(default: bool, enable: bool, disable: bool, name: &str) -> Resul
 
 const REPO: &str = "nicosuave/memex";
 
+const HOMEBREW_FORMULA: &str = "nicosuave/tap/memex";
+
+fn interaction_allowed(
+    explicitly_disabled: bool,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    stderr_tty: bool,
+    agent_or_ci: bool,
+) -> bool {
+    !explicitly_disabled && stdin_tty && stdout_tty && stderr_tty && !agent_or_ci
+}
+
+fn agent_or_ci_environment() -> bool {
+    [
+        "CI",
+        "CODEX_CI",
+        "CODEX_THREAD_ID",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var_os(name).is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    })
+}
+
+fn homebrew_executable(path: &Path) -> bool {
+    let components: Vec<_> = path.components().collect();
+    components
+        .windows(2)
+        .any(|pair| pair[0].as_os_str() == "Cellar" && pair[1].as_os_str() == "memex")
+}
+
 fn is_homebrew_install() -> bool {
     std::env::current_exe()
         .ok()
-        .and_then(|p| {
-            p.to_str()
-                .map(|s| s.contains("/Cellar/") || s.contains("/homebrew/"))
-        })
-        .unwrap_or(false)
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|path| homebrew_executable(&path))
 }
 
-fn run_update(skip_confirm: bool) -> Result<()> {
+fn confirm_update() -> Result<bool> {
+    use dialoguer::{Confirm, theme::ColorfulTheme};
     if is_homebrew_install() {
-        println!("memex was installed via Homebrew.");
-        println!("Run 'brew upgrade memex' to update.");
-        return Ok(());
+        eprintln!("brew update && brew upgrade {HOMEBREW_FORMULA}");
     }
+    eprintln!(
+        "Existing memex-search skill copies will also be replaced with the installed version; missing copies stay uninstalled."
+    );
+    Ok(Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Update memex and its installed skills now?")
+        .default(true)
+        .interact()?)
+}
 
-    let current = env!("CARGO_PKG_VERSION");
-    let latest = fetch_latest_version()?;
-
-    if !is_newer_version(current, &latest) {
-        println!("memex is already up to date (v{current})");
-        return Ok(());
+fn refresh_installed_skills(binary: &Path) -> Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(["skill", "update", "--target", "all"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("run installed skill updater {}", binary.display()))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "memex is installed, but refreshing its skills failed ({status}); run `memex skill update` to retry"
+        ));
     }
+    Ok(())
+}
 
-    println!("Current version: v{current}");
-    println!("Latest version:  v{latest}");
-    println!();
-
-    if !skip_confirm {
-        use dialoguer::{Confirm, theme::ColorfulTheme};
-        let confirm = Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!("Update to v{latest}?"))
-            .default(true)
-            .interact()?;
-        if !confirm {
-            println!("Update cancelled.");
-            return Ok(());
+fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBuf> {
+    for args in [vec!["update"], vec!["upgrade", HOMEBREW_FORMULA]] {
+        let status = std::process::Command::new(brew)
+            .args(&args)
+            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .with_context(|| format!("run brew {}", args.join(" ")))?;
+        if !status.success() {
+            return Err(anyhow!(
+                "brew {} failed ({status}); update stopped",
+                args.join(" ")
+            ));
         }
     }
+    // The running executable can live in an old Cellar version that brew just removed.
+    let output = std::process::Command::new(brew)
+        .args(["--prefix", HOMEBREW_FORMULA])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("locate the installed Homebrew memex")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Homebrew upgrade finished, but `brew --prefix {HOMEBREW_FORMULA}` failed; run `memex skill update` after resolving the installation"
+        ));
+    }
+    let prefix = std::str::from_utf8(&output.stdout)
+        .context("Homebrew returned a non-UTF-8 memex prefix")?
+        .trim();
+    if prefix.is_empty() || prefix.lines().count() != 1 || !Path::new(prefix).is_absolute() {
+        return Err(anyhow!(
+            "Homebrew returned an invalid memex installation prefix"
+        ));
+    }
+    let binary = Path::new(prefix).join("bin/memex");
+    let version = std::process::Command::new(&binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("check installed memex {}", binary.display()))?;
+    if !version.status.success() {
+        return Err(anyhow!(
+            "Homebrew upgrade finished, but the installed memex version check failed"
+        ));
+    }
+    let version = std::str::from_utf8(&version.stdout)?.trim();
+    let installed_version = version
+        .strip_prefix("memex ")
+        .filter(|value| parse_version_parts(value).is_some())
+        .ok_or_else(|| anyhow!("unexpected installed memex version: {version}"))?;
+    println!("Installed {version}");
+    refresh_installed_skills(&binary)?;
+    if expected_version.is_some_and(|latest| is_newer_version(installed_version, latest)) {
+        return Err(anyhow!(
+            "Homebrew still provides memex v{installed_version}; release v{} is newer. The tap may not have caught up or the formula may be pinned. Installed skills were refreshed; retry `memex update` later",
+            expected_version.unwrap()
+        ));
+    }
+    Ok(binary)
+}
 
+fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
+    let parent = current_exe
+        .parent()
+        .ok_or_else(|| anyhow!("binary has no parent directory"))?;
+    // Stage in the destination filesystem so a failed copy leaves the running binary intact.
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    let mut source = std::fs::File::open(new_binary)?;
+    std::io::copy(&mut source, &mut staged)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    staged.as_file().sync_all()?;
+    staged.persist(current_exe).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn update_release(current_exe: &Path, latest: &str) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    if !is_newer_version(current, latest) {
+        println!("memex is already up to date (v{current}); refreshing installed skills");
+        return refresh_installed_skills(current_exe);
+    }
     let (os, arch) = detect_platform()?;
     let url = format!(
         "https://github.com/{REPO}/releases/download/v{latest}/memex-{latest}-{os}-{arch}.tar.gz"
     );
-
-    println!("Downloading {url}...");
-
+    println!("Downloading memex v{latest}...");
     let tmp_dir = tempfile::tempdir()?;
     let archive_path = tmp_dir.path().join("memex.tar.gz");
-
-    // Download using curl
     let status = std::process::Command::new("curl")
-        .args(["-fsSL", "-o"])
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "300",
+            "-o",
+        ])
         .arg(&archive_path)
         .arg(&url)
+        .stdin(std::process::Stdio::null())
         .status()?;
     if !status.success() {
         return Err(anyhow!("Failed to download release"));
     }
-
-    // Extract
     let status = std::process::Command::new("tar")
         .args(["-xzf"])
         .arg(&archive_path)
         .arg("-C")
         .arg(tmp_dir.path())
+        .stdin(std::process::Stdio::null())
         .status()?;
     if !status.success() {
         return Err(anyhow!("Failed to extract release"));
     }
-
-    let new_binary = tmp_dir.path().join("memex");
-    if !new_binary.exists() {
-        return Err(anyhow!("Binary not found in release archive"));
-    }
-
-    // Replace current binary
-    let current_exe = std::env::current_exe()?;
-    let backup = current_exe.with_extension("old");
-
-    // Move current to backup, move new to current
-    if backup.exists() {
-        std::fs::remove_file(&backup)?;
-    }
-    std::fs::rename(&current_exe, &backup)?;
-    std::fs::copy(&new_binary, &current_exe)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    // Remove backup
-    let _ = std::fs::remove_file(&backup);
-
+    replace_binary(&tmp_dir.path().join("memex"), current_exe)?;
     println!("Updated memex to v{latest}");
-    println!();
-    println!("Run 'memex skill update' to update installed skill copies.");
+    refresh_installed_skills(current_exe)
+}
+
+fn perform_update(known_latest: Option<&str>) -> Result<()> {
+    let current_exe = std::env::current_exe()?.canonicalize()?;
+    if homebrew_executable(&current_exe) {
+        let brew = find_in_path("brew").ok_or_else(|| {
+            anyhow!("Homebrew manages this installation, but brew is not on PATH")
+        })?;
+        update_homebrew(&brew, known_latest)?;
+    } else {
+        let fetched;
+        let latest = match known_latest {
+            Some(latest) => latest,
+            None => {
+                fetched = fetch_latest_version()?;
+                &fetched
+            }
+        };
+        update_release(&current_exe, latest)?;
+    }
     Ok(())
 }
 
@@ -5047,8 +7850,13 @@ fn fetch_latest_version() -> Result<String> {
     let output = std::process::Command::new("curl")
         .args([
             "-fsSL",
+            "--connect-timeout",
+            "1",
+            "--max-time",
+            "2",
             &format!("https://api.github.com/repos/{REPO}/releases/latest"),
         ])
+        .stdin(std::process::Stdio::null())
         .output()?;
 
     if !output.status.success() {
@@ -5083,31 +7891,70 @@ fn detect_platform() -> Result<(&'static str, &'static str)> {
     Ok((os, arch))
 }
 
-/// Check for updates in the background and print a warning if outdated.
-/// This is non-blocking and fails silently.
-pub fn check_for_update_async(sender: Option<std::sync::mpsc::Sender<String>>) {
-    let is_brew = is_homebrew_install();
-    std::thread::spawn(move || {
-        if let Ok(latest) = fetch_latest_version() {
-            let current = env!("CARGO_PKG_VERSION");
-            if is_newer_version(current, &latest) {
-                let upgrade_cmd = if is_brew {
-                    "brew upgrade memex"
-                } else {
-                    "memex update"
-                };
-                if let Some(sender) = sender {
-                    let message = format!("update: v{latest} ({upgrade_cmd})");
-                    let _ = sender.send(message);
-                } else {
-                    eprintln!(
-                        "\x1b[33mA new version of memex is available: v{latest} (current: v{current})\x1b[0m"
-                    );
-                    eprintln!("\x1b[33mRun '{upgrade_cmd}' to upgrade.\x1b[0m");
-                }
-            }
+#[derive(Serialize, Deserialize)]
+struct UpdateCheck {
+    checked_at: u64,
+    latest: Option<String>,
+}
+
+fn latest_version_cached(
+    cache_path: &Path,
+    now: u64,
+    fetch: impl FnOnce() -> Result<String>,
+) -> Option<String> {
+    if let Ok(contents) = std::fs::read(cache_path)
+        && let Ok(cached) = serde_json::from_slice::<UpdateCheck>(&contents)
+    {
+        // Retry a failed check sooner, without delaying every command while offline.
+        let ttl = if cached.latest.is_some() {
+            6 * 60 * 60
+        } else {
+            5 * 60
+        };
+        if cached.checked_at <= now && now - cached.checked_at < ttl {
+            return cached.latest;
         }
-    });
+    }
+    let latest = fetch().ok();
+    let check = UpdateCheck {
+        checked_at: now,
+        latest: latest.clone(),
+    };
+    // Cache writes are best effort and atomic; concurrent launches never read a partial file.
+    let _ = (|| -> Result<()> {
+        let parent = cache_path
+            .parent()
+            .ok_or_else(|| anyhow!("cache has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(file.as_file_mut(), &check)?;
+        file.persist(cache_path).map_err(|error| error.error)?;
+        Ok(())
+    })();
+    latest
+}
+
+fn available_update() -> Option<String> {
+    let home = home_dir().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    latest_version_cached(
+        &home.join(".memex/update-check.json"),
+        now,
+        fetch_latest_version,
+    )
+    .filter(|latest| is_newer_version(env!("CARGO_PKG_VERSION"), latest))
+}
+
+fn print_update_notice(latest: Option<&str>) {
+    if let Some(latest) = latest {
+        eprintln!(
+            "update: memex v{latest} is available (current v{}). Run `memex update` or `memex update --yes` for a noninteractive update of memex and installed skills.",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
 }
 
 fn is_newer_version(current: &str, latest: &str) -> bool {
@@ -5148,185 +7995,7 @@ mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use tempfile::TempDir;
-
-    #[test]
-    fn build_index_command_args_preserves_disabled_sources() {
-        let index = IndexArgs {
-            source: None,
-            include_agents: false,
-            include_reasoning: false,
-            exclude: Vec::new(),
-            codex: false,
-            opencode: false,
-            cursor: false,
-            pi: false,
-            omp: false,
-            openclaw: false,
-            copilot: false,
-            grok: false,
-            no_codex: false,
-            no_opencode: false,
-            no_pi: false,
-            no_omp: false,
-            no_openclaw: false,
-            no_copilot: false,
-            no_grok: false,
-            embeddings: false,
-            no_embeddings: false,
-            model: None,
-            root: None,
-            diagnostics: false,
-            no_prune: true,
-        };
-
-        let args = build_index_command_args(&index, false, 30, false, crate::web::DEFAULT_LISTEN);
-
-        assert!(args.contains(&"--no-codex".to_string()));
-        assert!(args.contains(&"--no-opencode".to_string()));
-        assert!(args.contains(&"--no-cursor".to_string()));
-        assert!(args.contains(&"--no-pi".to_string()));
-        assert!(args.contains(&"--no-openclaw".to_string()));
-        assert!(args.contains(&"--no-omp".to_string()));
-        assert!(args.contains(&"--no-copilot".to_string()));
-        assert!(args.contains(&"--no-grok".to_string()));
-        assert!(args.contains(&"--no-prune".to_string()));
-    }
-
-    #[test]
-    fn build_index_command_args_forwards_exclude_patterns() {
-        let index = IndexArgs {
-            source: None,
-            include_agents: false,
-            include_reasoning: false,
-            exclude: vec!["~/work/**".to_string(), "/tmp/secret/*.jsonl".to_string()],
-            codex: true,
-            opencode: true,
-            cursor: true,
-            pi: true,
-            omp: true,
-            openclaw: true,
-            copilot: true,
-            grok: true,
-            no_codex: false,
-            no_opencode: false,
-            no_pi: false,
-            no_omp: false,
-            no_openclaw: false,
-            no_copilot: false,
-            no_grok: false,
-            embeddings: false,
-            no_embeddings: false,
-            model: None,
-            root: None,
-            diagnostics: false,
-            no_prune: false,
-        };
-
-        let args = build_index_command_args(&index, false, 30, false, "127.0.0.1:7777");
-
-        let mut pairs = args.windows(2);
-        assert!(pairs.any(|w| w == ["--exclude", "~/work/**"]));
-        let mut pairs = args.windows(2);
-        assert!(pairs.any(|w| w == ["--exclude", "/tmp/secret/*.jsonl"]));
-    }
-
-    #[test]
-    fn build_index_command_args_includes_web_ui_options() {
-        let index = IndexArgs {
-            source: None,
-            include_agents: false,
-            include_reasoning: false,
-            exclude: Vec::new(),
-            codex: true,
-            opencode: true,
-            cursor: true,
-            pi: true,
-            omp: true,
-            openclaw: true,
-            copilot: true,
-            grok: true,
-            no_codex: false,
-            no_opencode: false,
-            no_pi: false,
-            no_omp: false,
-            no_openclaw: false,
-            no_copilot: false,
-            no_grok: false,
-            embeddings: false,
-            no_embeddings: false,
-            model: None,
-            root: None,
-            diagnostics: false,
-            no_prune: false,
-        };
-
-        let args = build_index_command_args(&index, true, 30, true, "127.0.0.1:6363");
-
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--web-listen", "127.0.0.1:6363"])
-        );
-        assert!(args.contains(&"--web-ui".to_string()));
-        assert!(args.contains(&"--watch".to_string()));
-    }
-
-    #[test]
-    fn index_loop_starts_web_before_initial_indexing() {
-        let events = std::cell::RefCell::new(Vec::new());
-
-        initialize_index_loop(
-            || {
-                events.borrow_mut().push("index");
-                Ok(())
-            },
-            || {
-                events.borrow_mut().push("web");
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(*events.borrow(), ["web", "index"]);
-    }
-
-    #[test]
-    fn embedding_worker_only_receives_model_and_root() {
-        let index = IndexArgs {
-            source: Some(PathBuf::from("/ignored/source")),
-            include_agents: true,
-            include_reasoning: true,
-            exclude: vec!["/ignored/**".to_string()],
-            codex: false,
-            opencode: false,
-            cursor: false,
-            pi: false,
-            omp: false,
-            openclaw: false,
-            copilot: false,
-            grok: false,
-            no_codex: true,
-            no_opencode: true,
-            no_pi: true,
-            no_omp: true,
-            no_openclaw: true,
-            no_copilot: true,
-            no_grok: true,
-            embeddings: true,
-            no_embeddings: false,
-            model: Some("bge".to_string()),
-            root: Some(PathBuf::from("/tmp/memex")),
-            diagnostics: true,
-            no_prune: true,
-        };
-
-        assert_eq!(
-            build_embed_command_args(&index, ModelChoice::BGESmall),
-            ["embed", "--model", "bge", "--root", "/tmp/memex"]
-        );
-    }
 
     #[test]
     fn vector_work_is_rechecked_only_after_relevant_events() {
@@ -5353,51 +8022,6 @@ mod tests {
         assert!(state.verify);
     }
 
-    #[test]
-    fn embedding_configuration_is_reloaded_between_cycles() {
-        let temporary = TempDir::new().unwrap();
-        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
-        paths.ensure_dirs().unwrap();
-        let index = IndexArgs {
-            source: None,
-            include_agents: false,
-            include_reasoning: false,
-            exclude: Vec::new(),
-            codex: true,
-            opencode: true,
-            cursor: true,
-            pi: true,
-            omp: true,
-            openclaw: true,
-            copilot: true,
-            grok: true,
-            no_codex: false,
-            no_opencode: false,
-            no_pi: false,
-            no_omp: false,
-            no_openclaw: false,
-            no_copilot: false,
-            no_grok: false,
-            embeddings: false,
-            no_embeddings: false,
-            model: None,
-            root: Some(paths.root.clone()),
-            diagnostics: false,
-            no_prune: false,
-        };
-
-        std::fs::write(paths.root.join("config.toml"), "embeddings = false\n").unwrap();
-        assert!(load_embed_worker_spec(&index, &paths).unwrap().is_none());
-
-        std::fs::write(
-            paths.root.join("config.toml"),
-            "embeddings = true\nmodel = \"bge\"\n",
-        )
-        .unwrap();
-        let spec = load_embed_worker_spec(&index, &paths).unwrap().unwrap();
-        assert_eq!(spec.model, ModelChoice::BGESmall);
-    }
-
     #[derive(Debug, Default)]
     struct FakeProcessState {
         running: bool,
@@ -5405,7 +8029,7 @@ mod tests {
     }
 
     struct FakeProcess {
-        state: Rc<RefCell<FakeProcessState>>,
+        state: std::rc::Rc<std::cell::RefCell<FakeProcessState>>,
     }
 
     impl ChildProcess for FakeProcess {
@@ -5427,7 +8051,7 @@ mod tests {
 
     #[test]
     fn dropping_embedding_worker_terminates_and_reaps_child() {
-        let state = Rc::new(RefCell::new(FakeProcessState {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(FakeProcessState {
             running: true,
             ..FakeProcessState::default()
         }));
@@ -5442,35 +8066,698 @@ mod tests {
     }
 
     #[test]
+    fn personal_cli_paths_survive_upstream_surface_changes() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "sessions",
+            "--machine",
+            "local",
+            "--machine",
+            "peer",
+            "--origin",
+            "subagent",
+        ])
+        .unwrap();
+        let Some(Commands::Sessions {
+            machine, origin, ..
+        }) = cli.command
+        else {
+            panic!("sessions");
+        };
+        assert_eq!(machine, ["local", "peer"]);
+        assert!(matches!(origin, SessionOrigin::Subagent));
+        let cli = Cli::try_parse_from(["memex", "index", "--no-prune", "--no-embeddings"]).unwrap();
+        let Some(Commands::Index { index, .. }) = cli.command else {
+            panic!("index");
+        };
+        assert!(index.no_prune);
+        assert_eq!(
+            build_embed_command_args(&index, ModelChoice::BGESmall),
+            ["embed", "--model", "bge"]
+        );
+    }
+
+    #[test]
+    fn session_count_query_requires_count_and_rejects_cwd() {
+        assert!(Cli::try_parse_from(["memex", "sessions", "--query", "needle"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "memex", "sessions", "--count", "--query", "needle", "--cwd", "."
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "memex",
+                "sessions",
+                "--count",
+                "--query=--needle",
+                "--format",
+                "json"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn mcp_search_request_uses_bounded_compact_defaults() {
+        let request: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "needle"
+        }))
+        .unwrap();
+
+        assert_eq!(request.limit, 20);
+        assert_eq!(request.content, SearchContent::Conversations);
+        assert!(request.unique_session);
+        assert_eq!(request.mode, McpSearchMode::Lexical);
+        assert_eq!(request.sort, McpSearchSort::Score);
+        assert_eq!(request.recency_weight, 1.0);
+        assert_eq!(request.recency_half_life_days, 30.0);
+        assert!(request.additional_queries.is_empty());
+        assert!(request.machines.is_empty());
+        assert_eq!(request.origin, SessionOrigin::Regular);
+    }
+
+    #[test]
+    fn mcp_request_limits_and_source_names_are_validated() {
+        assert!(validate_mcp_limit(1).is_ok());
+        assert!(validate_mcp_limit(500).is_ok());
+        assert!(validate_mcp_limit(0).is_err());
+        assert!(validate_mcp_limit(501).is_err());
+        assert_eq!(
+            parse_source_filter(Some("open-claw".to_string())).unwrap(),
+            Some(SourceFilter::OpenClaw)
+        );
+        assert!(parse_source_filter(Some("unknown".to_string())).is_err());
+
+        let mut request: SearchRequest =
+            serde_json::from_value(serde_json::json!({"query": "needle"})).unwrap();
+        request.additional_queries = (0..8).map(|index| format!("query {index}")).collect();
+        assert!(validate_mcp_search_request(&request).is_err());
+        request.additional_queries.clear();
+        request.top_n_per_session = Some(501);
+        assert!(validate_mcp_search_request(&request).is_err());
+        request.top_n_per_session = None;
+        request.recency_half_life_days = 0.0;
+        assert!(validate_mcp_search_request(&request).is_err());
+
+        assert!(
+            serde_json::from_value::<SessionsRequest>(serde_json::json!({
+                "limit": 20,
+                "unexpected": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_command_accepts_a_custom_root() {
+        let cli = Cli::try_parse_from(["memex", "mcp", "--root", "/tmp/custom-memex"])
+            .expect("parse MCP root");
+        let Some(Commands::Mcp {
+            root,
+            transport,
+            listen,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected MCP command");
+        };
+        assert_eq!(root, Some(PathBuf::from("/tmp/custom-memex")));
+        assert_eq!(transport, McpTransport::Http);
+        assert_eq!(listen, None);
+    }
+
+    #[test]
+    fn update_interaction_requires_a_human_terminal_and_explicit_opt_out_wins() {
+        assert!(interaction_allowed(false, true, true, true, false));
+        for (disabled, stdin, stdout, stderr, agent) in [
+            (true, true, true, true, false),
+            (false, false, true, true, false),
+            (false, true, false, true, false),
+            (false, true, true, false, false),
+            (false, true, true, true, true),
+        ] {
+            assert!(!interaction_allowed(disabled, stdin, stdout, stderr, agent));
+        }
+        for args in [
+            vec!["memex", "--non-interactive", "update", "--yes"],
+            vec!["memex", "update", "--yes", "--non-interactive"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.non_interactive);
+            assert!(matches!(cli.command, Some(Commands::Update { yes: true })));
+        }
+        let cli = Cli::try_parse_from(["memex", "update", "--non-interactive"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Update { yes: false })));
+    }
+
+    #[test]
+    fn update_install_detection_requires_the_memex_cellar_entry() {
+        for path in [
+            "/opt/homebrew/Cellar/memex/0.14.0/bin/memex",
+            "/usr/local/Cellar/memex/0.14.0/bin/memex",
+            "/home/linuxbrew/.linuxbrew/Cellar/memex/0.14.0/bin/memex",
+        ] {
+            assert!(homebrew_executable(Path::new(path)));
+        }
+        for path in [
+            "/home/me/homebrew/project/target/debug/memex",
+            "/opt/homebrew/Cellar/other/0.14.0/bin/memex",
+            "/home/me/.local/bin/memex",
+        ] {
+            assert!(!homebrew_executable(Path::new(path)));
+        }
+    }
+
+    #[test]
+    fn update_cache_reuses_notices_and_retries_expired_or_failed_checks() {
+        let temp = TempDir::new().unwrap();
+        let cache = temp.path().join("cache.json");
+        assert_eq!(
+            latest_version_cached(&cache, 100, || Ok("99.0.0".into())),
+            Some("99.0.0".into())
+        );
+        assert_eq!(
+            latest_version_cached(&cache, 200, || panic!("fresh cache must avoid network")),
+            Some("99.0.0".into())
+        );
+        assert_eq!(
+            latest_version_cached(&cache, 100 + 6 * 60 * 60, || Ok("100.0.0".into())),
+            Some("100.0.0".into())
+        );
+        std::fs::write(&cache, "partial invalid cache").unwrap();
+        assert_eq!(
+            latest_version_cached(&cache, 30_000, || Err(anyhow!("offline"))),
+            None
+        );
+        assert_eq!(
+            latest_version_cached(&cache, 30_001, || panic!(
+                "failure backoff must avoid network"
+            )),
+            None
+        );
+        assert_eq!(
+            latest_version_cached(&cache, 30_300, || Ok("101.0.0".into())),
+            Some("101.0.0".into())
+        );
+        // A clock correction must not make a future-dated cache permanent.
+        assert_eq!(
+            latest_version_cached(&cache, 20_000, || Ok("102.0.0".into())),
+            Some("102.0.0".into())
+        );
+        assert_eq!(
+            latest_version_cached(&temp.path().join("missing/other.json"), 1, || Ok(
+                "99.0.0".into()
+            )),
+            Some("99.0.0".into())
+        );
+    }
+
+    #[test]
+    fn skill_warnings_are_quiet_for_missing_or_matching_copies_and_clear_after_update() {
+        let home = TempDir::new().unwrap();
+        assert!(skill_warnings(home.path()).is_empty());
+        write_skill_targets(home.path(), &[SkillTarget::Shared], SkillWriteMode::Install).unwrap();
+        assert!(skill_warnings(home.path()).is_empty());
+        let shared = home.path().join(".agents/skills/memex-search/SKILL.md");
+        std::fs::write(&shared, "older or edited skill").unwrap();
+        let warning = skill_warnings(home.path());
+        assert_eq!(warning.len(), 1);
+        assert!(warning[0].contains("outdated or locally modified (shared)"));
+        assert_eq!(
+            std::fs::read_to_string(&shared).unwrap(),
+            "older or edited skill"
+        );
+        write_skill_targets(home.path(), &[SkillTarget::Claude], SkillWriteMode::Install).unwrap();
+        let claude = home.path().join(".claude/skills/memex-search/SKILL.md");
+        std::fs::write(&claude, "edited Claude copy").unwrap();
+        assert!(skill_warnings(home.path())[0].contains("shared, claude"));
+        write_skill_targets(home.path(), &[SkillTarget::All], SkillWriteMode::Update).unwrap();
+        assert!(skill_warnings(home.path()).is_empty());
+    }
+
+    #[test]
+    fn skill_warnings_do_not_fail_on_unreadable_paths() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".agents/skills/memex-search/SKILL.md")).unwrap();
+        let warnings = skill_warnings(home.path());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cannot check shared"));
+        assert!(!warnings[0].contains("outdated"));
+    }
+
+    #[test]
+    fn update_binary_replacement_leaves_old_binary_intact_on_copy_failure() {
+        let temp = TempDir::new().unwrap();
+        let installed = temp.path().join("memex");
+        let release = temp.path().join("release-memex");
+        std::fs::write(&installed, "old binary").unwrap();
+        assert!(replace_binary(&release, &installed).is_err());
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), "old binary");
+        std::fs::write(&release, "new binary").unwrap();
+        replace_binary(&release, &installed).unwrap();
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), "new binary");
+        assert!(!temp.path().join("memex.old").exists());
+    }
+
+    #[test]
+    fn previews_use_positive_text_literals_and_bound_unicode() {
+        let text = format!("padding {} needlé evidence", "界".repeat(1000));
+        let matchers = build_matchers("text:needlé AND NOT text:padding").unwrap();
+        let preview = match_preview(&text, &matchers, 400);
+        assert!(preview.contains("needlé"));
+        assert!(!preview.contains("padding"));
+        assert!(preview.chars().count() <= 400);
+        assert_eq!(
+            match_preview("semantic fallback", &[], 400),
+            "semantic fallback"
+        );
+        assert!(build_matchers("project:memex").unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_search_projection_keeps_the_compact_default() {
+        for fields in [None, Some("".to_string()), Some(" , ".to_string())] {
+            let fields = search_fields(fields, false).unwrap().unwrap();
+            assert!(fields.contains("record_id"));
+            assert!(!fields.contains("text"));
+        }
+        assert!(search_fields(None, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn sessions_cli_accepts_exact_identity_selectors() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "sessions",
+            "--source",
+            "codex",
+            "--session-id",
+            "shared",
+            "--source-path",
+            "/old session.jsonl",
+            "--origin",
+            "all",
+            "--limit",
+            "1",
+        ])
+        .unwrap();
+        let Commands::Sessions {
+            session_id,
+            source_path,
+            source,
+            origin,
+            limit,
+            ..
+        } = cli.command.unwrap()
+        else {
+            panic!("expected sessions command");
+        };
+        assert_eq!(session_id.as_deref(), Some("shared"));
+        assert_eq!(source_path.as_deref(), Some("/old session.jsonl"));
+        assert_eq!(source, Some(SourceFilter::Codex));
+        assert_eq!(origin, SessionOrigin::All);
+        assert_eq!(limit, 1);
+        let defaults: SessionsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(defaults.session_id.is_none());
+        assert!(defaults.source_path.is_none());
+        let serialized = serde_json::to_value(defaults).unwrap();
+        assert!(serialized.get("session_id").is_none());
+        assert!(serialized.get("source_path").is_none());
+    }
+
+    #[test]
+    fn discovery_defaults_exclude_reviews_with_explicit_all_opt_in() {
+        for command in ["search", "sessions", "usage"] {
+            for explicit_all in [false, true] {
+                let mut args = vec!["memex", command];
+                if command == "search" {
+                    args.push("needle");
+                }
+                if explicit_all {
+                    args.extend(["--origin", "all"]);
+                }
+                let cli = Cli::try_parse_from(args).unwrap();
+                let origin = match cli.command.unwrap() {
+                    Commands::Search { origin, .. }
+                    | Commands::Sessions { origin, .. }
+                    | Commands::Usage { origin, .. } => origin,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    origin,
+                    if explicit_all {
+                        SessionOrigin::All
+                    } else {
+                        SessionOrigin::Regular
+                    }
+                );
+            }
+        }
+        let request: SessionsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(request.origin, SessionOrigin::Regular);
+    }
+
+    #[test]
+    fn sessions_interactive_only_conflicts_with_explicit_origin() {
+        assert!(
+            Cli::try_parse_from([
+                "memex",
+                "sessions",
+                "--origin",
+                "subagent",
+                "--interactive-only"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["memex", "sessions", "--interactive-only"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions", "--origin", "subagent"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions"]).is_ok());
+    }
+
+    #[test]
+    fn build_index_command_args_preserves_disabled_sources() {
+        let index = IndexArgs {
+            no_prune: false,
+            only_source: Vec::new(),
+            exclude_source: Vec::new(),
+            source: None,
+            include_agents: false,
+            include_reasoning: false,
+            exclude: Vec::new(),
+            codex: false,
+            opencode: false,
+            cursor: false,
+            pi: false,
+            omp: false,
+            openclaw: false,
+            copilot: false,
+            grok: false,
+            jcode: false,
+            muse: false,
+            antigravity: false,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_omp: false,
+            no_openclaw: false,
+            no_copilot: false,
+            no_grok: false,
+            no_jcode: false,
+            no_muse: false,
+            no_antigravity: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: None,
+            diagnostics: false,
+        };
+
+        let args = build_index_command_args(
+            &index,
+            false,
+            30,
+            WatchMode::Events,
+            false,
+            crate::web::DEFAULT_LISTEN,
+            None,
+        );
+
+        assert!(args.contains(&"--no-codex".to_string()));
+        assert!(args.contains(&"--no-opencode".to_string()));
+        assert!(args.contains(&"--no-cursor".to_string()));
+        assert!(args.contains(&"--no-pi".to_string()));
+        assert!(args.contains(&"--no-openclaw".to_string()));
+        assert!(args.contains(&"--no-omp".to_string()));
+        assert!(args.contains(&"--no-copilot".to_string()));
+        assert!(args.contains(&"--no-grok".to_string()));
+        assert!(args.contains(&"--no-jcode".to_string()));
+        assert!(args.contains(&"--no-muse".to_string()));
+    }
+
+    #[test]
+    fn build_index_command_args_forwards_exclude_patterns() {
+        let index = IndexArgs {
+            no_prune: false,
+            only_source: Vec::new(),
+            exclude_source: Vec::new(),
+            source: None,
+            include_agents: false,
+            include_reasoning: false,
+            exclude: vec!["~/work/**".to_string(), "/tmp/secret/*.jsonl".to_string()],
+            codex: true,
+            opencode: true,
+            cursor: true,
+            pi: true,
+            omp: true,
+            openclaw: true,
+            copilot: true,
+            grok: true,
+            jcode: true,
+            muse: true,
+            antigravity: true,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_omp: false,
+            no_openclaw: false,
+            no_copilot: false,
+            no_grok: false,
+            no_jcode: false,
+            no_muse: false,
+            no_antigravity: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: None,
+            diagnostics: false,
+        };
+
+        let args = build_index_command_args(
+            &index,
+            false,
+            30,
+            WatchMode::Events,
+            false,
+            "127.0.0.1:7777",
+            None,
+        );
+
+        let mut pairs = args.windows(2);
+        assert!(pairs.any(|w| w == ["--exclude", "~/work/**"]));
+        let mut pairs = args.windows(2);
+        assert!(pairs.any(|w| w == ["--exclude", "/tmp/secret/*.jsonl"]));
+    }
+
+    #[test]
+    fn build_index_command_args_includes_web_ui_options() {
+        let index = IndexArgs {
+            no_prune: false,
+            only_source: Vec::new(),
+            exclude_source: Vec::new(),
+            source: None,
+            include_agents: false,
+            include_reasoning: false,
+            exclude: Vec::new(),
+            codex: true,
+            opencode: true,
+            cursor: true,
+            pi: true,
+            omp: true,
+            openclaw: true,
+            copilot: true,
+            grok: true,
+            jcode: true,
+            muse: true,
+            antigravity: true,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_omp: false,
+            no_openclaw: false,
+            no_copilot: false,
+            no_grok: false,
+            no_jcode: false,
+            no_muse: false,
+            no_antigravity: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: None,
+            diagnostics: false,
+        };
+
+        let args = build_index_command_args(
+            &index,
+            true,
+            30,
+            WatchMode::Events,
+            true,
+            "127.0.0.1:6363",
+            None,
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--web-listen", "127.0.0.1:6363"])
+        );
+        assert!(args.contains(&"--web-ui".to_string()));
+        assert!(args.contains(&"--watch".to_string()));
+    }
+
+    #[test]
+    fn build_index_command_args_emits_poll_mode_without_watch() {
+        let index = IndexArgs {
+            no_prune: false,
+            only_source: Vec::new(),
+            exclude_source: Vec::new(),
+            source: None,
+            include_agents: false,
+            include_reasoning: false,
+            exclude: Vec::new(),
+            codex: true,
+            opencode: true,
+            cursor: true,
+            pi: true,
+            omp: true,
+            openclaw: true,
+            copilot: true,
+            grok: true,
+            jcode: true,
+            muse: true,
+            antigravity: true,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_omp: false,
+            no_openclaw: false,
+            no_copilot: false,
+            no_grok: false,
+            no_jcode: false,
+            no_muse: false,
+            no_antigravity: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: None,
+            diagnostics: false,
+        };
+
+        let args = build_index_command_args(
+            &index,
+            true,
+            30,
+            WatchMode::Poll,
+            false,
+            crate::web::DEFAULT_LISTEN,
+            None,
+        );
+
+        assert!(!args.contains(&"--watch".to_string()));
+        assert!(args.windows(2).any(|pair| pair == ["--watch-mode", "poll"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--watch-interval", "30"])
+        );
+    }
+
+    #[test]
+    fn daemon_run_accepts_watch_mode_flag() {
+        let cli = Cli::try_parse_from(["memex", "daemon", "run", "--watch-mode", "poll"])
+            .expect("parse daemon run");
+        let Some(Commands::IndexService {
+            action: IndexServiceCommand::Run { watch_mode, .. },
+        }) = cli.command
+        else {
+            panic!("expected daemon run command");
+        };
+        assert_eq!(watch_mode, Some(WatchMode::Poll));
+    }
+
+    #[test]
+    fn legacy_index_watch_defaults_to_events() {
+        let cli = Cli::try_parse_from(["memex", "index", "--watch"]).expect("parse index watch");
+        let Some(Commands::Index { watch_mode, .. }) = cli.command else {
+            panic!("expected index command");
+        };
+        assert_eq!(watch_mode, None);
+    }
+
+    #[test]
+    fn index_loop_starts_web_before_initial_indexing() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        initialize_index_loop(
+            || {
+                events.borrow_mut().push("index");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("web");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*events.borrow(), ["web", "index"]);
+    }
+
+    #[test]
     fn web_ui_readiness_requires_memex_health_response() {
-        let (listen, server) = serve_one_test_response(
+        let server = serve_test_responses(
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         );
 
-        wait_for_web_ui(&listen, Duration::from_secs(1)).unwrap();
-        server.join().unwrap();
+        wait_for_web_ui(&server.listen, Duration::from_secs(1)).unwrap();
+        server.shutdown();
     }
 
     #[test]
     fn web_ui_readiness_rejects_unrelated_tcp_listener() {
-        let (listen, server) = serve_one_test_response(
+        let server = serve_test_responses(
             "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
         );
 
-        assert!(!web_ui_is_healthy(&listen));
-        server.join().unwrap();
+        assert!(!web_ui_is_healthy(&server.listen));
+        server.shutdown();
     }
 
-    fn serve_one_test_response(response: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    struct TestResponseServer {
+        listen: String,
+        shutdown: std::sync::mpsc::Sender<()>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl TestResponseServer {
+        fn shutdown(self) {
+            self.shutdown.send(()).unwrap();
+            TcpStream::connect(&self.listen).unwrap();
+            self.server.join().unwrap();
+        }
+    }
+
+    fn serve_test_responses(response: &'static str) -> TestResponseServer {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let listen = listener.local_addr().unwrap().to_string();
+        let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            stream.write_all(response.as_bytes()).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+                let mut request = [0_u8; 1024];
+                if stream.read(&mut request).is_ok() {
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
         });
-        (listen, server)
+        TestResponseServer {
+            listen,
+            shutdown,
+            server,
+        }
     }
 
     #[test]
@@ -5587,6 +8874,22 @@ arguments = {
     }
 
     #[test]
+    fn disabling_auto_index_preserves_nested_mcp_config() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[mcp]\nlisten = \"127.0.0.1:4567\"\n",
+        )
+        .unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        disable_auto_index_on_search_by_default(&paths, &config).unwrap();
+        let updated = UserConfig::load(&paths).unwrap();
+        assert_eq!(updated.auto_index_on_search, Some(false));
+        assert_eq!(updated.mcp.listen, Some("127.0.0.1:4567".parse().unwrap()));
+    }
+
+    #[test]
     fn disabling_auto_index_on_search_preserves_explicit_config() {
         let tmp = TempDir::new().unwrap();
         let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
@@ -5602,6 +8905,401 @@ arguments = {
 
         let contents = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
         assert_eq!(contents, "auto_index_on_search = true\n");
+    }
+
+    #[test]
+    fn reindex_resets_only_derived_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::create_dir_all(paths.root.join("embed-cache")).unwrap();
+
+        let preserved = [
+            (paths.root.join("config.toml"), "index_service_mcp = true"),
+            (paths.root.join("web-auth-token"), "owner-secret"),
+            (paths.root.join("mcp-oauth.sqlite3"), "oauth registrations"),
+            (paths.root.join("index-service.plist"), "launch config"),
+            (paths.root.join("unrelated-user-file"), "keep me"),
+            (
+                paths.state.join("retrieval-traces.jsonl"),
+                "recorded evaluation",
+            ),
+            (paths.state.join("unrelated-state"), "keep this too"),
+            (paths.root.join("embed-cache/model.bin"), "cached model"),
+        ];
+        for (path, contents) in &preserved {
+            std::fs::write(path, contents).unwrap();
+        }
+
+        std::fs::write(paths.index.join("derived-index"), "index").unwrap();
+        std::fs::write(paths.vectors.join("derived-vectors"), "vectors").unwrap();
+        std::fs::create_dir_all(paths.root.join("memory")).unwrap();
+        std::fs::write(paths.root.join("memory/documents.json"), "memory snapshot").unwrap();
+        for name in [
+            "ingest.json",
+            "ingest.pending.json",
+            "scan_cache.json",
+            "analytics.sqlite",
+            "analytics.sqlite-wal",
+            "analytics.sqlite-shm",
+            "analytics.sqlite-journal",
+            "usage-cache.sqlite3",
+            "usage-cache.sqlite3-wal",
+            "usage-cache.sqlite3-shm",
+            "usage-cache.sqlite3-journal",
+        ] {
+            std::fs::write(paths.state.join(name), "derived").unwrap();
+        }
+
+        reset_reindex_artifacts(&paths).unwrap();
+
+        assert!(!paths.index.exists());
+        assert!(!paths.vectors.exists());
+        assert!(!paths.root.join("memory").exists());
+        for name in [
+            "ingest.json",
+            "ingest.pending.json",
+            "scan_cache.json",
+            "analytics.sqlite",
+            "analytics.sqlite-wal",
+            "analytics.sqlite-shm",
+            "analytics.sqlite-journal",
+            "usage-cache.sqlite3",
+            "usage-cache.sqlite3-wal",
+            "usage-cache.sqlite3-shm",
+            "usage-cache.sqlite3-journal",
+        ] {
+            assert!(!paths.state.join(name).exists(), "preserved {name}");
+        }
+        for (path, expected) in preserved {
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                expected,
+                "changed preserved file {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_cli_settings_override_config_without_discarding_other_content() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "# user preferences\nindex_service_mode = \"interval\" # choose scheduling\nindex_service_web_ui = false\nindex_service_mcp = false\ninclude_reasoning = true\n\n[mcp]\n# keep this policy\nlisten = \"127.0.0.1:5363\"\nallowed_hosts = [\"localhost\"]\n",
+        )
+        .unwrap();
+        let web_listen = "127.0.0.1:6464".to_string();
+        let mcp_listen = "127.0.0.1:5464".parse().unwrap();
+
+        persist_index_service_config(
+            &paths,
+            &IndexServiceConfigUpdates {
+                mode: Some("continuous"),
+                poll_interval: Some(12),
+                web_ui: Some(true),
+                web_listen: Some(web_listen.clone()),
+                mcp: Some(true),
+                mcp_listen: Some(mcp_listen),
+                plist: Some("/tmp/com.memex.index.plist".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let updated = UserConfig::load(&paths).unwrap();
+        assert_eq!(updated.index_service_mode(), Some("continuous"));
+        assert_eq!(updated.index_service_poll_interval(), 12);
+        assert_eq!(updated.index_service_web_ui, Some(true));
+        assert_eq!(
+            updated.index_service_web_listen.as_deref(),
+            Some(web_listen.as_str())
+        );
+        assert_eq!(updated.index_service_mcp, Some(true));
+        assert_eq!(updated.mcp.listen, Some(mcp_listen));
+        assert_eq!(updated.include_reasoning, Some(true));
+        assert_eq!(
+            updated.index_service_plist.as_deref(),
+            Some(Path::new("/tmp/com.memex.index.plist"))
+        );
+        let contents = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(contents.contains("# user preferences"));
+        assert!(contents.contains("# choose scheduling"));
+        assert!(contents.contains("# keep this policy"));
+        assert!(contents.contains("allowed_hosts = [\"localhost\"]"));
+    }
+
+    #[test]
+    fn daemon_poll_interval_updates_preserve_supported_key_spelling() {
+        for key in [
+            "index_service_watch_interval",
+            "index_service_poll_interval",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+            let path = paths.root.join("config.toml");
+            std::fs::write(
+                &path,
+                format!("# polling preference\n{key} = 30 # seconds\nindex_service_watch = true\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                UserConfig::load(&paths)
+                    .unwrap()
+                    .index_service_poll_interval(),
+                30
+            );
+
+            let updates = IndexServiceConfigUpdates::from_cli(
+                false,
+                Some(12),
+                None,
+                None,
+                false,
+                None,
+                &DaemonMcpArgs::default(),
+            )
+            .unwrap();
+            persist_index_service_config(&paths, &updates).unwrap();
+            let updated = UserConfig::load(&paths).unwrap();
+            assert_eq!(updated.index_service_poll_interval(), 12);
+            assert_eq!(updated.index_service_continuous, Some(true));
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert!(contents.contains(&format!("{key} = 12 # seconds")));
+            assert!(contents.contains("# polling preference"));
+
+            // A plain restart must leave the valid saved configuration intact.
+            persist_index_service_config(&paths, &IndexServiceConfigUpdates::default()).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(
+                UserConfig::load(&paths)
+                    .unwrap()
+                    .index_service_poll_interval(),
+                12
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_watch_mode_persists_continuous_across_plain_restart() {
+        for action in ["enable", "restart"] {
+            for watch_mode in ["events", "poll"] {
+                for initial_config in ["", "index_service_mode = \"interval\"\n"] {
+                    for interval in [None, Some("60")] {
+                        let tmp = TempDir::new().unwrap();
+                        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+                        let path = paths.root.join("config.toml");
+                        std::fs::write(&path, initial_config).unwrap();
+                        let mut args = vec!["memex", "daemon", action, "--watch-mode", watch_mode];
+                        if let Some(interval) = interval {
+                            args.extend(["--interval", interval]);
+                        }
+                        let cli = Cli::try_parse_from(args).unwrap();
+                        let Some(Commands::IndexService {
+                            action:
+                                IndexServiceCommand::Enable {
+                                    continuous,
+                                    poll_interval,
+                                    watch_mode: selected_mode,
+                                    interval,
+                                    web_ui,
+                                    web_listen,
+                                    mcp,
+                                    ..
+                                }
+                                | IndexServiceCommand::Restart {
+                                    continuous,
+                                    poll_interval,
+                                    watch_mode: selected_mode,
+                                    interval,
+                                    web_ui,
+                                    web_listen,
+                                    mcp,
+                                    ..
+                                },
+                        }) = cli.command
+                        else {
+                            panic!("expected daemon enable or restart");
+                        };
+                        let updates = IndexServiceConfigUpdates::from_cli(
+                            continuous,
+                            poll_interval,
+                            selected_mode,
+                            interval,
+                            web_ui,
+                            web_listen.as_deref(),
+                            &mcp,
+                        )
+                        .unwrap();
+                        persist_index_service_config(&paths, &updates).unwrap();
+                        let before_restart = std::fs::read_to_string(&path).unwrap();
+
+                        // A restart without flags must retain the continuous mode
+                        // implied by --watch-mode, even over interval configuration.
+                        let restart_updates = IndexServiceConfigUpdates::from_cli(
+                            false,
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
+                            &DaemonMcpArgs::default(),
+                        )
+                        .unwrap();
+                        persist_index_service_config(&paths, &restart_updates).unwrap();
+                        let restarted = UserConfig::load(&paths).unwrap();
+                        assert_eq!(restarted.index_service_mode(), Some("continuous"));
+                        assert_eq!(
+                            restarted.index_service_watch_mode().unwrap().to_string(),
+                            watch_mode
+                        );
+                        assert_eq!(std::fs::read_to_string(&path).unwrap(), before_restart);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_no_mcp_persists_over_configured_enablement() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "index_service_mode = \"continuous\"\nindex_service_mcp = true\n",
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from(["memex", "index-service", "restart", "--no-mcp"]).unwrap();
+        let Some(Commands::IndexService {
+            action:
+                IndexServiceCommand::Restart {
+                    continuous,
+                    poll_interval,
+                    interval,
+                    web_ui,
+                    web_listen,
+                    mcp,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected index service restart command");
+        };
+        let updates = IndexServiceConfigUpdates::from_cli(
+            continuous,
+            poll_interval,
+            None,
+            interval,
+            web_ui,
+            web_listen.as_deref(),
+            &mcp,
+        )
+        .unwrap();
+        persist_index_service_config(&paths, &updates).unwrap();
+
+        let updated = UserConfig::load(&paths).unwrap();
+        assert_eq!(updated.index_service_mcp, Some(false));
+        assert!(
+            DaemonMcpArgs {
+                mcp: false,
+                no_mcp: false,
+                mcp_listen: None,
+            }
+            .resolve(&updated)
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn plain_restart_reuses_previously_persisted_daemon_settings() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        let mcp_listen = "127.0.0.1:5565".parse().unwrap();
+        let cli = Cli::try_parse_from([
+            "memex",
+            "index-service",
+            "enable",
+            "--continuous",
+            "--poll-interval",
+            "9",
+            "--web-listen",
+            "127.0.0.1:6565",
+            "--mcp-listen",
+            "127.0.0.1:5565",
+        ])
+        .unwrap();
+        let Some(Commands::IndexService {
+            action:
+                IndexServiceCommand::Enable {
+                    continuous,
+                    poll_interval,
+                    interval,
+                    web_ui,
+                    web_listen,
+                    mcp,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected index service enable command");
+        };
+        let updates = IndexServiceConfigUpdates::from_cli(
+            continuous,
+            poll_interval,
+            None,
+            interval,
+            web_ui,
+            web_listen.as_deref(),
+            &mcp,
+        )
+        .unwrap();
+        persist_index_service_config(&paths, &updates).unwrap();
+        let before_restart = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+        let restart = Cli::try_parse_from(["memex", "index-service", "restart"]).unwrap();
+        let Some(Commands::IndexService {
+            action:
+                IndexServiceCommand::Restart {
+                    continuous,
+                    poll_interval,
+                    interval,
+                    web_ui,
+                    web_listen,
+                    mcp,
+                    ..
+                },
+        }) = restart.command
+        else {
+            panic!("expected plain index service restart command");
+        };
+        let restart_updates = IndexServiceConfigUpdates::from_cli(
+            continuous,
+            poll_interval,
+            None,
+            interval,
+            web_ui,
+            web_listen.as_deref(),
+            &mcp,
+        )
+        .unwrap();
+        persist_index_service_config(&paths, &restart_updates).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            before_restart
+        );
+        let restarted = UserConfig::load(&paths).unwrap();
+        assert_eq!(restarted.index_service_mode(), Some("continuous"));
+        assert_eq!(restarted.index_service_poll_interval(), 9);
+        assert!(restarted.index_service_web_ui_default());
+        assert_eq!(
+            restarted.index_service_web_listen.as_deref(),
+            Some("127.0.0.1:6565")
+        );
+        let mcp = DaemonMcpArgs::default().resolve(&restarted).unwrap();
+        assert_eq!(mcp.listen, mcp_listen);
     }
 
     fn make_vector(dims: usize) -> Vec<f32> {
@@ -5632,17 +9330,6 @@ arguments = {
     }
 
     #[test]
-    fn observed_directory_size_sums_nested_files() {
-        let tmp = TempDir::new().unwrap();
-        let nested = tmp.path().join("nested");
-        std::fs::create_dir(&nested).unwrap();
-        std::fs::write(tmp.path().join("one"), b"abc").unwrap();
-        std::fs::write(nested.join("two"), b"defgh").unwrap();
-
-        assert_eq!(observed_directory_size(tmp.path()), 8);
-    }
-
-    #[test]
     fn index_args_accept_negative_source_flags() {
         let cli = Cli::try_parse_from([
             "memex",
@@ -5652,6 +9339,8 @@ arguments = {
             "--no-pi",
             "--no-copilot",
             "--no-grok",
+            "--no-jcode",
+            "--no-muse",
         ])
         .unwrap();
 
@@ -5663,61 +9352,8 @@ arguments = {
         assert!(index.no_pi);
         assert!(index.no_copilot);
         assert!(index.no_grok);
-    }
-
-    #[test]
-    fn prune_defaults_to_preview_and_accepts_source_filters() {
-        let cli =
-            Cli::try_parse_from(["memex", "prune", "--dry-run", "--no-codex", "--no-opencode"])
-                .unwrap();
-
-        let Some(Commands::Prune {
-            prune,
-            dry_run,
-            apply,
-        }) = cli.command
-        else {
-            panic!("expected prune command");
-        };
-        assert!(dry_run);
-        assert!(!apply);
-        assert!(prune.no_codex);
-        assert!(prune.no_opencode);
-    }
-
-    #[test]
-    fn prune_rejects_dry_run_with_apply() {
-        assert!(Cli::try_parse_from(["memex", "prune", "--dry-run", "--apply"]).is_err());
-    }
-
-    #[test]
-    fn prune_preview_does_not_resolve_embedding_configuration() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("memex");
-        let paths = Paths::new(Some(root.clone())).unwrap();
-        paths.ensure_dirs().unwrap();
-        SearchIndex::open_or_create(&paths.index).unwrap();
-        std::fs::write(
-            root.join("config.toml"),
-            "model = 'not-a-model'\nexecution_provider = 'not-a-provider'\n",
-        )
-        .unwrap();
-
-        run_prune(
-            PruneArgs {
-                source: Some(tmp.path().join("missing-claude-root")),
-                no_codex: true,
-                no_opencode: true,
-                no_cursor: true,
-                no_pi: true,
-                no_openclaw: true,
-                no_copilot: true,
-                root: Some(root),
-                ..PruneArgs::default()
-            },
-            false,
-        )
-        .expect("preview should ignore embedding configuration");
+        assert!(index.no_jcode);
+        assert!(index.no_muse);
     }
 
     #[test]
@@ -5757,6 +9393,37 @@ arguments = {
     }
 
     #[test]
+    fn search_content_defaults_to_conversations_and_accepts_memory_corpora() {
+        let default = Cli::try_parse_from(["memex", "search", "needle"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Some(Commands::Search {
+                content: SearchContent::Conversations,
+                ..
+            })
+        ));
+
+        for (value, expected) in [
+            ("memories", SearchContent::Memories),
+            ("all", SearchContent::All),
+        ] {
+            let cli =
+                Cli::try_parse_from(["memex", "search", "needle", "--content", value]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Search { content, .. }) if content == expected
+            ));
+        }
+
+        let request: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "needle",
+            "content": "memories"
+        }))
+        .unwrap();
+        assert_eq!(request.content, SearchContent::Memories);
+    }
+
+    #[test]
     fn show_session_and_hydrate_accept_machine_scoped_requests() {
         let show = Cli::try_parse_from(["memex", "show", "42", "--machine", "mini"])
             .expect("parse machine-scoped show");
@@ -5764,6 +9431,52 @@ arguments = {
             panic!("expected show command");
         };
         assert_eq!(machine, "mini");
+
+        let memory = Cli::try_parse_from([
+            "memex",
+            "show",
+            "--memory-id",
+            "memory_sha256",
+            "--section",
+            "heading-2",
+            "--content-version",
+            "version_sha256",
+            "--offset-chars",
+            "120",
+            "--max-chars",
+            "400",
+            "--machine",
+            "mini",
+        ])
+        .expect("parse memory read");
+        let Some(Commands::Show {
+            memory_id,
+            section,
+            content_version,
+            offset_chars,
+            machine,
+            ..
+        }) = memory.command
+        else {
+            panic!("expected show command");
+        };
+        assert_eq!(memory_id.as_deref(), Some("memory_sha256"));
+        assert_eq!(section.as_deref(), Some("heading-2"));
+        assert_eq!(content_version.as_deref(), Some("version_sha256"));
+        assert_eq!(offset_chars, 120);
+        assert_eq!(machine, "mini");
+
+        assert!(
+            Cli::try_parse_from([
+                "memex",
+                "show",
+                "--memory-id",
+                "memory",
+                "--record-id",
+                "record"
+            ])
+            .is_err()
+        );
 
         let session = Cli::try_parse_from([
             "memex",
@@ -5992,18 +9705,6 @@ arguments = {
     }
 
     #[test]
-    fn continuous_systemd_service_caps_failure_restarts() {
-        let service = build_systemd_service("/usr/bin/memex", &[], true, &[]);
-
-        assert!(service.contains(
-            "[Unit]\nDescription=Memex Index Service\nStartLimitIntervalSec=5min\nStartLimitBurst=3\n"
-        ));
-        assert!(service.contains(
-            "[Service]\nType=simple\nRestart=on-failure\nRestartSec=30s\nOOMPolicy=stop\n"
-        ));
-    }
-
-    #[test]
     fn registered_systemd_mode_comes_from_definition_not_activity_or_stale_timer() {
         let temp = TempDir::new().unwrap();
         let service_path = temp.path().join("memex-index.service");
@@ -6165,4 +9866,112 @@ arguments = {
         let error = parse_systemd_unit_state("memex-index.service", &unavailable).unwrap_err();
         assert!(error.to_string().contains("Failed to connect to bus"));
     }
+}
+
+fn observed_directory_size(path: &std::path::Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn run_prune(args: PruneArgs, apply: bool) -> Result<()> {
+    let paths = Paths::new(args.root)?;
+    if !SearchIndex::exists(&paths.index) {
+        return Err(anyhow!(
+            "memex index not found at {}; run `memex index` first",
+            paths.index.display()
+        ));
+    }
+    let options = PruneOptions {
+        claude_sources: args
+            .source
+            .map(|path| vec![path])
+            .unwrap_or_else(default_claude_sources),
+        include_agents: args.include_agents,
+        include_codex: !args.no_codex,
+        include_opencode: !args.no_opencode,
+        include_cursor: !args.no_cursor,
+        include_pi: !args.no_pi,
+        include_omp: !args.no_omp,
+        include_openclaw: !args.no_openclaw,
+        include_copilot: !args.no_copilot,
+    };
+    let report = if apply {
+        let ingest_lease = IngestLease::acquire(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
+        let embedding_lease =
+            IngestLease::acquire_embedding(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+        let report =
+            prune_missing_paths(&paths, &index, &options, &ingest_lease, &embedding_lease)?;
+        if !report.source_paths.is_empty() {
+            index.publish_generation()?;
+        }
+        report
+    } else {
+        let index = SearchIndex::open_or_create(&paths.index)?;
+        preview_missing_paths(&paths, &index, &options)?
+    };
+    if report.source_paths.is_empty() {
+        println!("no missing indexed paths found beneath readable source roots");
+        return Ok(());
+    }
+
+    if apply {
+        println!(
+            "pruned {} records from {} missing paths:",
+            report.records,
+            report.source_paths.len()
+        );
+    } else {
+        println!(
+            "would prune {} records from {} missing paths:",
+            report.records,
+            report.source_paths.len()
+        );
+    }
+    for source_path in report.source_paths {
+        println!("  {source_path}");
+    }
+    if !apply {
+        println!("rerun with --apply to delete these records without rebuilding the corpus");
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug, Clone)]
+struct PruneArgs {
+    /// Path to Claude projects directory [default: ~/.claude/projects]
+    #[arg(long)]
+    source: Option<PathBuf>,
+    /// Include missing Claude Code subagent transcript paths
+    #[arg(long)]
+    include_agents: bool,
+    /// Skip pruning Codex paths
+    #[arg(long = "no-codex")]
+    no_codex: bool,
+    /// Skip pruning OpenCode paths
+    #[arg(long = "no-opencode")]
+    no_opencode: bool,
+    /// Skip pruning Cursor paths
+    #[arg(long = "no-cursor")]
+    no_cursor: bool,
+    /// Skip pruning Pi paths
+    #[arg(long = "no-pi")]
+    no_pi: bool,
+    /// Skip pruning Oh My Pi paths
+    #[arg(long = "no-omp")]
+    no_omp: bool,
+    /// Skip pruning OpenClaw paths
+    #[arg(long = "no-openclaw")]
+    no_openclaw: bool,
+    /// Skip pruning GitHub Copilot CLI paths
+    #[arg(long = "no-copilot")]
+    no_copilot: bool,
+    /// Path to memex data directory [default: ~/.memex]
+    #[arg(long)]
+    root: Option<PathBuf>,
 }

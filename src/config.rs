@@ -2,7 +2,9 @@ use crate::embed::{EmbedRuntimeConfig, ExecutionProviderChoice, ModelChoice};
 use anyhow::{Result, anyhow};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -76,11 +78,48 @@ fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn default_claude_source() -> PathBuf {
+pub fn default_claude_sources() -> Vec<PathBuf> {
+    if let Some(value) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        let mut roots: Vec<_> = value
+            .to_string_lossy()
+            .split(',')
+            .filter_map(|value| {
+                let value = value.trim();
+                if value.is_empty() {
+                    None
+                } else {
+                    let root = PathBuf::from(value);
+                    Some(
+                        if root.file_name().and_then(|name| name.to_str()) == Some("projects") {
+                            root
+                        } else {
+                            root.join("projects")
+                        },
+                    )
+                }
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        roots.retain(|root| seen.insert(root.clone()));
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+
     let home = directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".claude").join("projects")
+    vec![
+        home.join(".claude").join("projects"),
+        home.join(".config").join("claude").join("projects"),
+    ]
+}
+
+pub fn default_claude_source() -> PathBuf {
+    default_claude_sources()
+        .into_iter()
+        .next()
+        .expect("default Claude sources are never empty")
 }
 
 pub const DEFAULT_MAX_INDEXED_TOOL_INPUT_BYTES: usize = 64 * 1024;
@@ -139,8 +178,15 @@ pub struct UserConfig {
     /// Background index service poll interval in seconds.
     #[serde(alias = "index_service_watch_interval")]
     pub index_service_poll_interval: Option<u64>,
+    /// Refresh strategy for the continuous background service: "events" or "poll".
+    pub index_service_watch_mode: Option<String>,
+    /// Full-resync interval in seconds for events mode (the missed-event backstop).
+    /// Falls back to `index_service_poll_interval` when unset.
+    pub index_service_resync_interval: Option<u64>,
     /// Serve the local Web UI from the continuous background index service.
     pub index_service_web_ui: Option<bool>,
+    /// Serve MCP from the continuous background index service.
+    pub index_service_mcp: Option<bool>,
     /// Address and port for the background Web UI.
     pub index_service_web_listen: Option<String>,
     /// Background index service launchd label.
@@ -167,6 +213,10 @@ pub struct UserConfig {
     pub omp_resume_cmd: Option<String>,
     /// Resume command template for GitHub Copilot CLI sessions.
     pub copilot_resume_cmd: Option<String>,
+    /// Resume command template for Jcode sessions.
+    pub jcode_resume_cmd: Option<String>,
+    /// Resume command template for Muse sessions.
+    pub muse_resume_cmd: Option<String>,
     /// Resume command template for Grok sessions.
     pub grok_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
@@ -180,6 +230,19 @@ pub struct UserConfig {
     /// Other machines whose indexes can be queried through a backend.
     #[serde(default)]
     pub machines: Vec<MachineConfig>,
+    /// Shared MCP HTTP configuration for standalone and background service modes.
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct McpConfig {
+    pub listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -406,6 +469,19 @@ impl UserConfig {
         self.index_service_poll_interval.unwrap_or(30)
     }
 
+    pub(crate) fn index_service_watch_mode(&self) -> Result<crate::watch::WatchMode> {
+        match self.index_service_watch_mode.as_deref() {
+            None => Ok(crate::watch::WatchMode::Events),
+            Some(mode) => mode.parse(),
+        }
+    }
+
+    pub fn index_service_resync_interval(&self) -> u64 {
+        self.index_service_resync_interval
+            .or(self.index_service_poll_interval)
+            .unwrap_or(600)
+    }
+
     pub fn index_service_web_ui_default(&self) -> bool {
         self.index_service_web_ui.unwrap_or(false)
     }
@@ -450,6 +526,27 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
 
     #[test]
+    fn claude_sources_honor_config_dir_and_multiple_roots() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            Some(" /tmp/claude-one, /tmp/claude-two/projects, /tmp/claude-one/projects ,, "),
+        )]);
+
+        assert_eq!(
+            default_claude_sources(),
+            vec![
+                PathBuf::from("/tmp/claude-one/projects"),
+                PathBuf::from("/tmp/claude-two/projects"),
+            ]
+        );
+        assert_eq!(
+            default_claude_source(),
+            PathBuf::from("/tmp/claude-one/projects")
+        );
+    }
+
+    #[test]
     fn exclude_paths_parse_and_expand_tilde() {
         let config: UserConfig = toml::from_str(
             r#"
@@ -491,6 +588,79 @@ mod tests {
     #[test]
     fn token_usage_is_disabled_by_default() {
         assert!(!UserConfig::default().token_usage_enabled());
+    }
+
+    #[test]
+    fn watch_mode_defaults_to_events_and_rejects_unknown() {
+        assert_eq!(
+            UserConfig::default()
+                .index_service_watch_mode()
+                .expect("default watch mode"),
+            crate::watch::WatchMode::Events
+        );
+        let config: UserConfig =
+            toml::from_str(r#"index_service_watch_mode = "poll""#).expect("parse config");
+        assert_eq!(
+            config.index_service_watch_mode().expect("poll watch mode"),
+            crate::watch::WatchMode::Poll
+        );
+        let config: UserConfig =
+            toml::from_str(r#"index_service_watch_mode = "fsevents""#).expect("parse config");
+        assert!(config.index_service_watch_mode().is_err());
+    }
+
+    #[test]
+    fn resync_interval_falls_back_to_poll_interval_then_default() {
+        assert_eq!(UserConfig::default().index_service_resync_interval(), 600);
+        let config: UserConfig =
+            toml::from_str("index_service_poll_interval = 30").expect("parse config");
+        assert_eq!(config.index_service_resync_interval(), 30);
+        let config: UserConfig =
+            toml::from_str("index_service_poll_interval = 30\nindex_service_resync_interval = 120")
+                .expect("parse config");
+        assert_eq!(config.index_service_resync_interval(), 120);
+    }
+
+    #[test]
+    fn mcp_defaults_preserve_disabled_service_and_empty_options() {
+        let config = UserConfig::default();
+
+        assert_eq!(config.index_service_mcp, None);
+        assert_eq!(config.mcp.listen, None);
+        assert!(config.mcp.allowed_hosts.is_empty());
+        assert!(config.mcp.allowed_origins.is_empty());
+        assert_eq!(config.mcp.public_url, None);
+    }
+
+    #[test]
+    fn parses_background_mcp_configuration() {
+        let config: UserConfig = toml::from_str(
+            r#"
+                index_service_mcp = true
+
+                [mcp]
+                listen = "127.0.0.1:5363"
+                allowed_hosts = ["memex.example", "127.0.0.1:5363"]
+                allowed_origins = ["https://chat.example"]
+                public_url = "https://memex.example"
+            "#,
+        )
+        .expect("parse MCP config");
+
+        assert_eq!(config.index_service_mcp, Some(true));
+        assert_eq!(
+            config.mcp.listen,
+            Some("127.0.0.1:5363".parse().expect("socket address"))
+        );
+        assert_eq!(
+            config.mcp.allowed_hosts,
+            ["memex.example", "127.0.0.1:5363"]
+        );
+        assert_eq!(config.mcp.allowed_origins, ["https://chat.example"]);
+        assert_eq!(
+            config.mcp.public_url.as_deref(),
+            Some("https://memex.example")
+        );
     }
 
     #[test]

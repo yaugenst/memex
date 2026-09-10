@@ -4,12 +4,13 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::io::BufRead;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct SourceAudit {
     pub source: String,
     pub files: u64,
+    pub unreadable_files: u64,
     pub valid_json_lines: u64,
     pub malformed_json_lines: u64,
     pub non_object_json_lines: u64,
@@ -86,6 +87,27 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .map(|file| file.path)
             .collect(),
     );
+    push(
+        SourceKind::Jcode,
+        super::jcode::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
+    push(
+        SourceKind::Muse,
+        super::muse::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
+    push(
+        SourceKind::Antigravity,
+        super::antigravity::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
 
     push(
         SourceKind::Omp,
@@ -94,10 +116,10 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .map(|file| file.path)
             .collect(),
     );
-    groups
+    Ok(groups
         .into_iter()
         .map(|(kind, files)| audit_files(kind, &deduplicate(files)))
-        .collect()
+        .collect())
 }
 
 fn deduplicate(files: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -108,62 +130,137 @@ fn deduplicate(files: Vec<PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn audit_files(source: SourceKind, files: &[PathBuf]) -> Result<SourceAudit> {
+fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
     let mut audit = SourceAudit {
         source: source.storage_label().to_string(),
         files: files.len() as u64,
         ..SourceAudit::default()
     };
-    for path in files {
-        audit_file(source, path, &mut audit)?;
-    }
-    Ok(audit)
-}
-
-fn audit_file(source: SourceKind, path: &Path, audit: &mut SourceAudit) -> Result<()> {
-    if source == SourceKind::Hermes {
-        // Hermes usage truth is SQLite aggregate data.  Audit must not reinterpret the
-        // database as JSON, and in particular must not read transcript/message columns.
-        std::fs::File::open(path)?;
-        return Ok(());
-    }
-    let reader = std::io::BufReader::new(std::fs::File::open(path)?);
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    for file in files {
+        if source == SourceKind::Hermes {
+            // Hermes usage truth is SQLite aggregate data. Audit must not
+            // reinterpret the database as JSON, and in particular must not
+            // read transcript/message columns: count the file, skip content.
             continue;
         }
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => {
+        if source == SourceKind::Antigravity
+            && file.file_name().and_then(|name| name.to_str()) != Some("overview.txt")
+        {
+            // Antigravity conversation stores are SQLite. Audit must not
+            // reinterpret the database as JSON: count the file, skip content.
+            // overview.txt transcripts are JSONL and audit normally below.
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(file) else {
+            audit.unreadable_files += 1;
+            continue;
+        };
+        if source == SourceKind::Hermes {
+            // Hermes usage truth is SQLite aggregate data. Audit must not
+            // reinterpret the database as JSON, and in particular must not
+            // buffer it as lines or read transcript/message columns.
+            continue;
+        }
+        if source == SourceKind::Jcode {
+            audit_jcode_file(file, &mut audit);
+            continue;
+        }
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines() {
+            let Ok(line) = line else {
                 audit.malformed_json_lines += 1;
                 continue;
+            };
+            if line.trim().is_empty() {
+                continue;
             }
-        };
-        let Some(object) = value.as_object() else {
-            audit.non_object_json_lines += 1;
-            continue;
-        };
-        audit.valid_json_lines += 1;
-        let top_level = object
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        increment(&mut audit.top_level_types, top_level);
-
-        if let Some(version) = producer_version(source, &value) {
-            increment(&mut audit.producer_versions, &version);
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                audit.malformed_json_lines += 1;
+                continue;
+            };
+            let Some(object) = value.as_object() else {
+                audit.non_object_json_lines += 1;
+                continue;
+            };
+            audit.valid_json_lines += 1;
+            let top_level = object
+                .get("type")
+                .or_else(|| object.get("kind"))
+                .or_else(|| object.get("role"))
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
+            increment(&mut audit.top_level_types, top_level);
+            if let Some(version) = extract_producer_version(&value, source) {
+                increment(&mut audit.producer_versions, &version);
+            }
+            record_semantics(source, &value, top_level, &mut audit);
         }
-        record_semantics(source, &value, top_level, audit);
     }
-    Ok(())
+    audit
 }
 
-fn producer_version(source: SourceKind, value: &Value) -> Option<String> {
+/// Audit a Jcode session file as a single JSON document. Jcode sessions are
+/// whole objects with roles/content under `messages`, not JSONL transcripts,
+/// so per-line parsing would report no semantics (compact files) or mostly
+/// malformed lines (pretty-printed files).
+fn audit_jcode_file(file: std::fs::File, audit: &mut SourceAudit) {
+    let mut bytes = Vec::new();
+    let mut file = file;
+    if std::io::Read::read_to_end(&mut file, &mut bytes).is_err() {
+        audit.malformed_json_lines += 1;
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        audit.malformed_json_lines += 1;
+        return;
+    };
+    let Some(doc) = value.as_object() else {
+        audit.non_object_json_lines += 1;
+        return;
+    };
+    audit.valid_json_lines += 1;
+    let top_level = doc
+        .get("type")
+        .or_else(|| doc.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("document");
+    increment(&mut audit.top_level_types, top_level);
+    if let Some(version) = extract_producer_version(&value, SourceKind::Jcode) {
+        increment(&mut audit.producer_versions, &version);
+    }
+    if let Some(messages) = doc.get("messages").and_then(|v| v.as_array()) {
+        for message in messages {
+            let Some(object) = message.as_object() else {
+                audit.non_object_json_lines += 1;
+                continue;
+            };
+            if let Some(role) = object.get("role").and_then(Value::as_str) {
+                increment(&mut audit.semantic_types, role);
+            }
+            record_content_blocks(object.get("content"), audit);
+        }
+    } else {
+        if let Some(role) = doc.get("role").and_then(Value::as_str) {
+            increment(&mut audit.semantic_types, role);
+        }
+        record_content_blocks(doc.get("content"), audit);
+    }
+}
+
+fn extract_producer_version(value: &Value, source: SourceKind) -> Option<String> {
     let version = match source {
         SourceKind::Codex => value
             .get("payload")
-            .and_then(|payload| payload.get("cli_version")),
+            .and_then(|payload| payload.get("cli_version"))
+            .or_else(|| value.get("version")),
+        SourceKind::Cursor => value.get("clientVersion").or_else(|| value.get("version")),
+        SourceKind::Copilot => value.get("copilotVersion").or_else(|| value.get("version")),
+        SourceKind::Hermes => value.get("profileVersion").or_else(|| value.get("version")),
+        SourceKind::Jcode => value.get("version").or_else(|| value.get("jcode_version")),
+        SourceKind::Muse => value
+            .get("protocol_version")
+            .or_else(|| value.get("version")),
+        SourceKind::Grok => value.get("grok_version").or_else(|| value.get("version")),
         _ => value.get("version"),
     }?;
     match version {
@@ -218,6 +315,26 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
             }
             record_content_blocks(value.get("content"), audit);
         }
+        // Jcode files are audited whole-document in `audit_jcode_file` and never
+        // reach the per-line path.
+        SourceKind::Jcode => {}
+        SourceKind::Muse => {
+            if let Some(payload) = value.get("payload").and_then(Value::as_object) {
+                let kind = payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
+                if let Some(event) = payload.get("event").and_then(Value::as_object) {
+                    let ekind = event
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>");
+                    increment(&mut audit.semantic_types, &format!("{kind}/{ekind}"));
+                } else {
+                    increment(&mut audit.semantic_types, kind);
+                }
+            }
+        }
         SourceKind::Grok => {
             if let Some(kind) = value
                 .pointer("/params/update/sessionUpdate")
@@ -230,6 +347,12 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         SourceKind::Hermes => {
             if value.get("records").and_then(Value::as_array).is_some() {
                 increment(&mut audit.semantic_types, "records");
+            }
+        }
+        SourceKind::Antigravity => {
+            increment(&mut audit.semantic_types, top_level);
+            if value.get("tool_calls").and_then(Value::as_array).is_some() {
+                increment(&mut audit.semantic_types, "tool_calls");
             }
         }
     }
@@ -280,7 +403,7 @@ mod tests {
         )
         .unwrap();
 
-        let audit = audit_files(SourceKind::Codex, &[path]).unwrap();
+        let audit = audit_files(SourceKind::Codex, &[path]);
         assert_eq!(audit.files, 1);
         assert_eq!(audit.valid_json_lines, 2);
         assert_eq!(audit.malformed_json_lines, 1);
@@ -296,7 +419,35 @@ mod tests {
         let path = temp.path().join("pi.jsonl");
         fs::write(&path, "{\"type\":\"session\",\"version\":3}\n").unwrap();
 
-        let audit = audit_files(SourceKind::Pi, &[path]).unwrap();
+        let audit = audit_files(SourceKind::Pi, &[path]);
         assert_eq!(audit.producer_versions.get("3"), Some(&1));
+    }
+
+    #[test]
+    fn audit_skips_hermes_database_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        // SQLite header plus binary pages: must never be line-read.
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.extend([0x7Fu8; 4096]);
+        bytes.extend(b"{\"type\":\"should_not_parse\"}\n");
+        fs::write(&path, &bytes).unwrap();
+
+        let audit = audit_files(SourceKind::Hermes, &[path]);
+        assert_eq!(audit.files, 1);
+        assert_eq!(audit.valid_json_lines, 0);
+        assert_eq!(audit.malformed_json_lines, 0);
+        assert_eq!(audit.unreadable_files, 0);
+    }
+
+    #[test]
+    fn audit_counts_unreadable_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("gone.jsonl");
+
+        let audit = audit_files(SourceKind::Codex, &[missing]);
+        assert_eq!(audit.files, 1);
+        assert_eq!(audit.unreadable_files, 1);
+        assert_eq!(audit.valid_json_lines, 0);
     }
 }

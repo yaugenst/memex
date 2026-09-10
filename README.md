@@ -1,12 +1,16 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, GitHub Copilot CLI, and Grok. Also supports Hermes usage records. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, GitHub Copilot CLI, Grok, Jcode, and Muse. Also supports Hermes usage records. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
-Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
+Agents can use Memex through its MCP server or CLI skill. Ask about a previous session, then narrow the search and retrieve source records as needed.
 
 Includes a TUI for browsing, finding and resuming agent CLI sessions, with optional [token usage](#token-usage) tracking.
 
 ![memex tui](docs/tui.png?raw=1&v=4)
+
+A native macOS companion is available in [apps/macos](apps/macos/README.md), with
+a three-column browser and collapsed tool activity. Build and launch it with
+`apps/macos/scripts/launch.sh`; no Xcode GUI is required.
 
 ## Install
 ```bash
@@ -114,12 +118,61 @@ The shared `memex-search` skill is installed once at
 For Claude Code, use `memex skill install --target claude`; its copy lives at
 `~/.claude/skills/memex-search/SKILL.md`.
 
-Use `memex skill status` to compare installed copies with the current Memex binary,
-`memex skill update` after upgrading Memex, and `memex skill cleanup` to explicitly
-remove obsolete paths left by older releases. Install never overwrites a differing file;
-update only replaces copies that are already installed.
+Launching `memex` in a human terminal offers an update when a newer release is
+available. Press Enter to update Memex and refresh its installed skill copies, or
+choose no to continue into the TUI. Homebrew installs run `brew update` followed by
+`brew upgrade nicosuave/tap/memex`; skills are refreshed by the newly installed binary.
+After updating, run `memex` again to start that version.
 
-Restart Claude, Codex, OpenCode, Pi, or Oh My Pi after installing or updating the skill.
+Agents and scripts still receive update notices but never a startup prompt. Memex
+recognizes CI, Codex, and Claude Code environment markers; use `--non-interactive`
+explicitly for other agents, including those using a PTY. Bare noninteractive
+`memex` prints help, while `search` and other data commands run normally. To update:
+
+```bash
+memex update --yes
+```
+
+Without `--yes`, explicit `memex update` requires a human terminal and confirmation.
+Both update paths replace existing shared/Claude skill copies, including local edits;
+they do not install missing copies. Restart your agent after its skill is updated.
+
+Searches warn on stderr when an installed skill differs from the running binary
+(outdated or locally modified). `memex skill status` shows which copies differ;
+`memex skill update` refreshes skills without upgrading Memex. Searches never update
+anything or prompt, and JSONL/TOON output on stdout stays clean. Use
+`memex skill cleanup` to explicitly remove obsolete paths from older releases.
+
+Release checks have a two-second network timeout and are cached for six hours
+(failed checks retry after five minutes). `--no-update-check` skips release checks
+without hiding stale-skill warnings. Install never overwrites a differing skill file.
+
+## Personal fork upgrade from 0.12
+
+This branch retains resumable embedding backfill, independently supervised daemon
+embedding work, confirmed-missing-file pruning (`--no-prune` to retain history),
+and federated CLI session listing. `memex sessions` uses configured machines;
+repeat `--machine` to select peers. MCP session discovery remains local.
+
+Before the first 0.19 index run, stop the daemon and back up the data root, then run:
+
+```sh
+memex index migrate-v019 --dry-run
+memex index migrate-v019
+```
+
+The one-time migration handles the 0.12 Codex/Claude parser metadata changes.
+It retains indexed text, document IDs, ingest offsets, and the complete vector
+store. It updates changed Codex session links and rebuilds only the SQLite
+analytics projection from stored records. It does not regenerate embeddings or
+reparse messages. Unsupported or replaced source files are reported as deferred
+and remain subject to ordinary incremental ingestion. An interrupted migration
+must be rerun before indexing; replay is idempotent.
+
+The existing Tantivy schema stays readable, using upstream's fallback for fields
+absent from older indexes. Obtaining the new indexed canonical-ID field would
+require rebuilding that projection; it is optional. Bounded remote reads and new
+filters require suitably updated peers.
 
 ## Quickstart
 
@@ -127,6 +180,79 @@ Index (incremental):
 ```
 memex index
 ```
+
+The main search, indexing, and maintenance commands are organized as follows:
+
+| Area | Commands |
+| --- | --- |
+| Index maintenance | `memex index`, `memex index rebuild`, `memex index gc`, `memex index embed`, `memex index stats` |
+| Search and reading | `memex search`, `memex sessions`, `memex session`, `memex show`, `memex context` |
+| Batch session reads | `memex session batch [requests.jsonl]` |
+| Background processes | `memex daemon run`, `memex daemon enable`, `memex daemon restart`, `memex daemon status`, `memex daemon disable` |
+| Browser UI | `memex web serve`, `memex web open` (`memex web` also serves) |
+| Retrieval diagnostics | `memex debug eval-retrieval DATASET` |
+
+Index all supported sources by default. Use repeatable `--only-source <source>` or
+`--exclude-source <source>` options to select providers, and `--claude-path <path>`
+to use a non-default Claude projects directory. Index sources are `claude`, `codex`,
+`cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `jcode`, and `muse`.
+
+### Agent memories
+
+Indexing also discovers Claude project memories (`projects/*/memory/**/*.md`) and
+Codex's `memories/MEMORY.md`, `memory_summary.md`, and `rollout_summaries/*.md`.
+Discovery follows the existing Claude roots, `--claude-path`, Codex homes, provider
+selection, and path exclusions. Raw memory intermediates, generated skills, and
+unrelated project storage are not memory sources. Memex never edits these files.
+
+Memories are documents, not sessions. They have a stable document ID, a content
+version, and sections for retrieval. A changed file replaces all its indexed
+sections atomically; deleted sections and files disappear on the next scan.
+Renames are treated as removal and addition. If a source cannot be read, Memex
+keeps the last good copy and marks its freshness instead of treating an error as
+a deletion. Memory snapshots are stored under the Memex data root's `memory/`
+directory, separately from conversation records and session analytics.
+
+For recall of prior decisions, preferences, project conventions, or previous work,
+use `--content all` to search memories and conversations together. Use
+`--content memories` to inspect saved notes specifically. Search without
+`--content` remains conversation-only. Provider selection remains independent:
+`--source claude` selects the provider, not the content type. Memory results carry
+document/section references, source paths, scope, freshness, and content versions.
+For scoped memories, `--project` uses the repository name across Git worktrees;
+`--cwd` selects the exact checkout. Each memory keeps its own source path and ID.
+Their timestamp filters use file modification time; dates explicitly recorded
+inside a note are separate metadata and do not imply that its claims are current.
+
+Memory retrieval uses the existing `search` and `show` interfaces. Session listing,
+session reads, `session batch`, and conversation `context` keep their established
+meaning. A memory read uses a returned document ID rather than an arbitrary file
+path. If the version changed since search, the read identifies that change and
+returns bounded current document content rather than applying an obsolete section
+position to the new file.
+
+The existing daemon handles updates; there is no second memory service. MCP uses
+the same search/read implementation, with structured provenance and bounded
+content. Retrieved notes are historical evidence, not instructions for the
+consuming agent. Explicit links can provide supporting documents or conversations;
+conflicting notes remain separately attributable rather than being silently merged.
+
+```bash
+memex search "deployment decision" --content all
+memex search "deployment decision" --content memories --source codex
+memex show --memory-id <memory_id> --section <section_ref> --content-version <content_version> --machine <machine>
+```
+
+`search`, `sessions`, `session`, `session batch`, `show`, `context`, and `usage`
+support `--format jsonl|json|text`; search also supports `toon`. Search, session
+listings, transcript pages, and batch reads keep JSONL as their default. `show` and
+`context` default to one JSON object, while `usage` defaults to text.
+
+Modern OpenCode sessions stored in `opencode*.db` under
+`~/.local/share/opencode` are discovered automatically, alongside OpenCode's
+legacy JSON storage. To use one or more alternate data roots, set
+`OPENCODE_DATA_DIR` to a comma-separated list of directories before running
+the installed `memex` binary.
 
 The default scan indexes Pi sessions from `~/.pi/agent/sessions` and Oh My Pi sessions
 separately from `~/.omp/agent/sessions` plus named profile session directories.
@@ -140,6 +266,24 @@ Search (JSONL default):
 memex search "your query" --limit 20
 ```
 
+Search output is compact by default. Each hit contains `machine`, `score`, `ts`,
+`doc_id`, `record_id`, `project`, `role`, `session_id`, `source`, `source_path`,
+`snippet`, and `matches`. Lexical snippets center the earliest literal match;
+semantic-only hits use a compact prefix. Use `--fields` for an explicit projection or
+`--full` to restore every legacy search field, including full record text and linkage
+metadata.
+
+Agent-facing TOON output is available for search:
+
+```sh
+memex search "your query" --format toon
+```
+
+It returns one TOON document with a `results` array and preserves the same values as
+JSON output, including custom `--fields` and `--full`. `--format jsonl` is the default;
+`--format json` returns one JSON array, `--format text` is human-readable, and
+`--format json --pretty` pretty-prints that array.
+
 TUI:
 ```
 memex tui
@@ -147,46 +291,58 @@ memex tui
 
 Notes:
 - Embeddings are disabled by default. Pass `--embeddings` to generate them during indexing.
-- Searches run an incremental reindex by default (configurable).
+- Searches run an incremental index refresh by default (configurable).
 - Index updates are copy-on-write generations. A writer builds a private generation and atomically
   publishes it when complete; searches keep using the previous immutable generation until then.
-- Incremental indexing automatically removes records for paths that are confirmed missing beneath
-  readable, enabled source roots. The lexical and analytics publication does not wait for a running
-  embedding backfill: physical vector cleanup is deferred, and semantic search skips deleted vector
-  IDs in the meantime. If embeddings are requested, the subsequent backfill waits for the embedding
-  lease. Use `--no-prune` to suppress missing-path cleanup for a particular run.
 - Concurrent searches coalesce stale auto-index work: one process refreshes while other lexical
-  searches query the last committed index. Semantic and hybrid searches keep using the active
-  complete vector generation while a replacement is built. Prune preview is read-only. Explicit
-  mutations wait up to 30 seconds for the corresponding ingest or embedding lease and report its
-  holder on timeout; lexical publication does not wait for an unrelated backfill.
+  searches query the last committed index. Semantic and hybrid searches wait for vector writes to
+  finish. Explicit `index`, `index rebuild`, `index embed`, and analytics backfill operations wait
+  up to 30 seconds for another index mutation to finish and report its holder on timeout.
 
-Prune missing paths without rediscovering or rebuilding the corpus:
-```
-memex prune             # safe preview (same as --dry-run)
-memex prune --apply     # prune lexical, analytics, vectors, and state; invalidate partial backfill
-```
-
-Apply preserves vectors for live records. If a resumable embedding backfill is in progress, its
-checkpoint is discarded because its original corpus scope is no longer valid; the next backfill
-resumes from the preserved active vector generation.
-
-`memex reindex` is reserved for an intentionally clean rebuild, such as recovering from index
-corruption or applying a schema-wide migration. Routine deletion and path cleanup do not require it.
-
-Full transcript:
+Bounded transcript page:
 ```
 memex session <session_id>
 ```
 
-Single record:
+Single bounded record:
 ```
 memex show <doc_id>
+memex show --record-id <record_id> --machine <machine_id>
 ```
+
+Read commands return at most 16,000 Unicode content characters by default. The budget
+counts `text`, `tool_input`, and `tool_output` together; JSON metadata and wire bytes do
+not count. Each record includes content metadata shaped like:
+
+```json
+{"returned_chars":16000,"total_chars":24000,"truncated":true,"continuations":[{"field":"tool_output","offset_chars":12000,"total_chars":20000}]}
+```
+
+Continue a truncated field from its reported Unicode character offset:
+
+```sh
+memex show --record-id <record_id> --machine <machine_id> \
+  --field tool-output --offset-chars 12000
+```
+
+`--field` accepts `text`, `tool-input`, or `tool-output`. Use `--max-chars N` to
+choose another shared budget. `--full` disables the content budget and conflicts with
+`--max-chars`.
+
+`memex session` returns 50 records by default and shares the 16,000-character budget
+across them. Its JSONL stream ends with a `{"type":"page",...}` object containing
+`offset`, `total`, and `next_offset`. Use `next_offset` with `--offset` to read later
+records, and use `memex show` with a record's continuation metadata to finish a field
+that was truncated within a record. `memex session --full` preserves the unbounded
+transcript behavior; adding `--limit` bounds its record count. For stream commands,
+`--format json` wraps the same entries in an array; for `session`, this includes
+its final page marker. Use
+`--format json --pretty` for indented arrays. `show` and `context` also accept
+`--pretty` with their default single-object JSON output.
 
 Human output:
 ```
-memex search "your query" -v
+memex search "your query" --format text
 ```
 
 ## Multiple machines over SSH
@@ -234,7 +390,9 @@ separate from the control transport so an immutable S3 split backend can replace
 In the TUI, use the `machines` dropdown (or press `m` while the session list is focused)
 to select the configured default set, `local`, or one remote machine. The machine, source,
 project, and query filters are shared by the session results and token chart; the range
-dropdown bounds the chart.
+dropdown bounds the chart. Repository project mode groups linked checkouts and worktrees
+under their repository name. Sessions without repository metadata appear under `Unfiled`
+instead of turning arbitrary working-directory or standalone-task names into projects.
 
 ### Opening federated results
 
@@ -243,25 +401,51 @@ session from another machine:
 
 ~~~sh
 memex show 123 --machine mini
+memex show --record-id rid1_example --machine mini
 memex session SESSION_ID --machine mini --source-path /path/on/mini/session.jsonl
-memex session SESSION_ID --machine mini --offset 500 --limit 500
+memex session SESSION_ID --machine mini --offset 50
+memex context --record-id rid1_example --machine mini --before 5 --after 5
 ~~~
 
-Session pages are limited to 500 records. To fetch several sessions in one bounded
-request, provide JSONL on stdin or as a file:
+`memex context` selects a source/session/path neighborhood around a stable record ID,
+document ID, or native event ID. It accepts `--offset` into that neighborhood and returns
+`offset`, `total`, and `next_offset`, while applying the same shared content budget and
+per-record continuation metadata as `session`. Bounded pages use `order: "anchor_first"`
+so the requested record cannot be crowded out by preceding content; remaining records
+stay chronological. `--full` uses `order: "chronological"`. Keep the same mode when
+following `next_offset`. `--expand-interactions` adds only directly
+owned tool calls/results; it does not follow conversation ancestry. Expansion is capped at
+100 additional records and reports an actionable error when the cap is exceeded.
+
+New indexes provide exact canonical record-ID lookup plus indexed document/event lookup.
+Bounded remote reads require a peer with the new read RPC operations. If a peer is older,
+update it. Legacy document-ID `show` and `session` reads can explicitly use
+`--full` for complete-content reads; remote context and stable-ID reads need an updated
+peer in either mode. Memex does not silently fetch unbounded bodies as a fallback. Character limits apply before the peer
+serializes content. They are not limits on JSON metadata or total network bytes.
+
+Existing indexes remain readable: canonical record IDs fall back to a stored-record scan
+until the index is rebuilt. Neighborhood reads use indexed session, source, and source-path
+scope.
+
+Session and batch pages are limited to 500 records. To fetch several sessions in one
+bounded request, provide JSONL on stdin or as a file:
 
 ~~~json
 {"machine":"mini","session_id":"SESSION_ID","source_path":"/path/on/mini/session.jsonl","offset":0,"limit":500}
 ~~~
 
 ~~~sh
-memex hydrate requests.jsonl
-cat requests.jsonl | memex hydrate
+memex session batch requests.jsonl
+cat requests.jsonl | memex session batch
 ~~~
 
-The batch input accepts at most 32 requests and returns one JSONL response per request,
-including machine provenance, pagination metadata, and stable record_id values where
-available.
+The batch input accepts at most 32 requests and returns one JSONL response per request in
+input order, including machine provenance, `offset`, `total`, `next_offset`, stable
+`record_id` values, and per-record content metadata. One 16,000-character budget is shared
+across all requests in input order. Use `--max-chars N` to change it or `--full` for full
+record content; `--full` conflicts with `--max-chars`. The request envelope's
+`next_offset` resumes later records.
 
 ## Token usage
 
@@ -271,14 +455,14 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, and Hermes records:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, Hermes, Jcode, and Muse records:
 
 ```
 memex usage
 memex usage --source codex --since 2026-07-01
 memex usage --source grok --since 2026-07-01
 memex usage --source hermes --since 2026-07-01
-memex usage --json --events
+memex usage --format json --events
 ```
 
 `--cost auto` prefers a provider-stored request cost and otherwise applies the versioned built-in API price catalog. `--cost source` uses only stored costs; `--cost reprice` always applies the catalog. Calculated costs are API-equivalent estimates, not subscription charges. Events with unknown models or prices remain in token totals and are reported as unpriced.
@@ -315,13 +499,169 @@ memex skill install --target shared
 ```
 
 Omit `--target` for an interactive menu of detected Claude/Codex/OpenCode/Pi/Oh My Pi installations.
+## MCP server
+
+Run `memex mcp` to serve the Model Context Protocol over **Streamable HTTP** at
+`http://127.0.0.1:5363/mcp` using the official Rust SDK (`rmcp`). Use
+`--listen 127.0.0.1:5364` to change the socket and `--root /path/to/memex-data`
+for a custom data directory. This is separate from Memex's internal `rpc` protocol.
+
+MCP can also share the long-running indexing daemon:
+
+```bash
+memex daemon run --mcp
+memex daemon enable --mcp
+```
+
+`--mcp-listen <address>` implies `--mcp`. MCP forces the daemon into continuous
+mode. Set `index_service_mcp = true` in `config.toml` to opt in by default, or
+pass `--no-mcp` to disable configured MCP serving for one daemon invocation.
+Standalone HTTP and daemon-hosted MCP share the `[mcp]` configuration:
+
+```toml
+index_service_mcp = true
+
+[mcp]
+listen = "127.0.0.1:5363"
+allowed_hosts = ["memex.example.com"]
+allowed_origins = ["https://chat.example.com"]
+public_url = "https://memex.example.com"
+```
+
+Command-line values override the corresponding shared configuration values.
+
+For self-hosted ChatGPT or Claude access, enable the built-in single-owner OAuth
+flow with the public origin of your instance:
+
+```bash
+memex mcp --public-url https://memex.example.com
+```
+
+Point your existing HTTPS reverse proxy at `http://127.0.0.1:5363`, forwarding
+both `/mcp` and the OAuth/discovery routes at the root. The public URL must be an
+origin, without a path prefix, query, or fragment. Plain HTTP is accepted only
+for loopback development. Memex automatically allows the configured public Host.
+
+Add `https://memex.example.com/mcp` as a custom connector in ChatGPT or Claude,
+select OAuth where prompted, and leave client credentials empty to use automatic
+registration. Memex presents one approval page showing the requesting client and
+its redirect destination. Enter your instance's owner key on that page and
+approve access. There is no separate login, signup, gateway, or identity provider.
+Client names are supplied by the requesting app; inspect the redirect destination
+before approving. Approval grants access to the history this instance can read,
+including its configured remote machines.
+
+The owner key is in `<root>/web-auth-token` (normally `~/.memex/web-auth-token`),
+the same restricted key file used by Memex's web server. Startup prints its path,
+never the key. Enter it only on your Memex instance's approval page; the chat
+client receives its own access and refresh tokens, including when it requests only
+`memex:read` or omits the scope. Access tokens last one hour; rotating refresh tokens
+last 30 days from issuance. Grants survive server restarts.
+To disconnect all OAuth clients, run:
+
+```bash
+memex mcp --revoke-all
+```
+
+Use the same `--root` as the server if customized. Revocation invalidates issued
+OAuth grants without rotating the owner key. Existing direct bearer clients can
+still use that key, so revoke-all does not disconnect those clients.
+
+Without `--public-url`, HTTP uses the existing static bearer configuration:
+`Authorization: Bearer <token>` from `web-auth-token`. For a browser that calls
+Memex directly, allow its exact origin:
+
+```bash
+memex mcp --allowed-origin https://chat.example.com
+```
+
+Repeat `--allowed-origin` for multiple origins. Browser origins are denied by
+default; clients without an Origin header still require bearer authentication.
+CORS preflights do not require authentication. Remote clients need a reachable
+HTTPS URL, typically through a TLS reverse proxy to the loopback listener; add
+`--allowed-host memex.example.com` when the proxy preserves that Host header.
+Binding to loopback alone does not make the server reachable by hosted chat apps.
+For private ChatGPT setups, [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+can instead connect to `memex mcp --transport stdio`; this requires OpenAI tunnel
+access and a running tunnel client. It is an alternative connection path, separate
+from the public HTTPS/OAuth setup above.
+
+The transport follows the [2026-07-28 Streamable HTTP specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http):
+one POST endpoint with request-scoped SSE responses and no protocol sessions or
+standalone GET stream. The SDK also accepts older clients' initialize flow without
+creating a session. HTTP disconnects cancel the request's wait for retrieval.
+
+For local process clients, stdio remains available with `memex mcp --transport stdio`.
+For clients using an `mcpServers` configuration:
+
+```json
+{
+  "mcpServers": {
+    "memex": { "command": "memex", "args": ["mcp", "--transport", "stdio"] }
+  }
+}
+```
+
+Use the absolute path to your built or installed `memex` binary if it is not on
+the client's PATH. For a local build, run `mbx build` (or `cargo build` when
+Boxington is unavailable) and use the resulting binary. Existing installed
+versions need this change before they can run `mcp`.
+
+| Tool | Behavior |
+| --- | --- |
+| `search` | Compact hits with provenance, match snippets, selected machines, and failures. Shares CLI ranking, multi-query fusion, filters and projection. |
+| `sessions` | Recent local sessions, including resumption commands as data. Reads existing analytics without auto-indexing. |
+| `show` | Direct record read; supports stable `record_id`, legacy `doc_id`, or scoped `event_id`, and continuation within a field. |
+| `context` | Anchor-first neighborhood, optionally expanding directly owned tool interactions. |
+| `session` | Chronological transcript pages, defaulting to 50 records. |
+| `hydrate` | Up to 32 session-page requests with a shared budget in input order and explicit per-request failures. |
+
+Search accepts `query`, `additional_queries` (up to eight queries total), `mode`
+(`lexical`, `hybrid`, `semantic`), `cwd`, `project`, `source`, `role`, `tool`,
+`session`, `origin`, `since`, `until`, `machines`, ranking controls, and `sort`
+(`score` or `ts`). It defaults to 20 hits and `unique_session: true`; set
+`top_n_per_session: 2` for two hits per session or `unique_session: false` for
+individual matches. Search and sessions accept at most 500 results.
+
+Permission-review sessions are hidden by default. CLI search, session listing, usage,
+and MCP search/listing use `origin=regular`, which keeps ordinary subagents visible.
+Use `--origin all` (MCP: `"origin": "all"`) to include permission reviews. The TUI
+and web retain their interactive default; select **all** in the origin filter to
+include reviews. Explicit reads by session or record ID remain available.
+Existing Codex sessions are reclassified on the next index run.
+
+Read tools share a default 16,000 Unicode-character content budget, adjustable
+with `max_chars` from 1 to 64,000. Metadata is outside that budget. Inspect
+`content.truncated` and `content.continuations`: `next_offset` advances records,
+while `show` with `field` and `offset_chars` retrieves omitted field content.
+Fields are `text`, `tool_input`, and `tool_output`. MCP reads always stay bounded.
+Preserve the returned machine and source path when opening a result.
+
+Tools return structured JSON plus a JSON text fallback. Search and hydration
+return successful results alongside `failures`; a tool-level error sets MCP
+`isError`. Session discovery is local; search uses the existing configured machine
+defaults, and read tools accept a machine ID. Remote retrieval uses existing SSH
+configuration and requires peers that support bounded reads.
+
+Search retains configured auto-index behavior on local and remote machines.
+Handshake, session discovery, and transcript reads do not trigger ingestion;
+semantic search may load an embedding model. Run the daemon separately
+when predictable search latency matters. Up to four retrieval calls run at once;
+MCP cancellation stops waiting but synchronous work can finish under its existing
+timeouts. Index readers are opened per call so a running server sees newly
+published generations. Diagnostics go to stderr; in stdio mode, stdout is reserved for MCP.
+
+The server supplies retrieval guidance during initialization: read known IDs
+directly, search exact anchors first, expand progressively, verify source records,
+and treat historical transcript content as evidence rather than instructions.
+
 ## Search modes
 
 | Need | Command |
 | --- | --- |
 | Exact terms | `search "exact term"` |
-| Fuzzy concepts | `search "concept" --semantic` |
-| Mixed | `search "term concept" --hybrid` |
+| Fuzzy concepts | `search "concept" --mode semantic` |
+| Mixed | `search "term concept" --mode hybrid` |
 
 ## Common filters
 
@@ -329,54 +669,65 @@ Omit `--target` for an interactive menu of detected Claude/Codex/OpenCode/Pi/Oh 
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes`
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
 - `--sort score|ts`
 - `--top-n-per-session <n>`
 - `--unique-session`
-- `--fields score,ts,doc_id,session_id,snippet`
-- `--json-array`
+- `--fields score,ts,doc_id,record_id,session_id,snippet`
+- `--full` (all legacy search fields; conflicts with `--fields`)
+- `--mode lexical|semantic|hybrid`
+- `--format jsonl|json|text|toon`
+- `--pretty` (pretty-print JSON output)
 
-JSON output also includes `source` and, when available, tree/linkage metadata:
+Default JSONL search output uses the compact fields documented above. Full or explicit
+projections can also include tree/linkage metadata:
 `event_id`, `parent_event_id`, `logical_parent_event_id`,
 `parent_session_id`, `thread_source`, `conversation_kind`,
 `parent_tool_use_id`, `source_tool_use_id`, and
 `source_tool_assistant_uuid`.
 
-## Background index service
+## Memex daemon
 
 Works on macOS (launchd) and Linux (systemd).
 
+Run indexing and any configured Web UI or MCP server in the foreground:
+
+```
+memex daemon run
+```
+
 Enable:
 ```
-memex index-service enable
-memex index-service enable --continuous
-memex index-service enable --web-ui
+memex daemon enable
+memex daemon enable --continuous
+memex daemon enable --web-ui
 ```
 
-Regenerate the service from current config and restart it:
+Regenerate the daemon from current config and restart it:
 ```
-memex index-service restart
+memex daemon restart
 ```
 
-Inspect the registered service and whether it is serving the Web UI:
+Inspect the registered daemon and whether it is serving the Web UI or MCP:
 ```
-memex index-service status
+memex daemon status
 ```
 
 Open an authenticated browser session:
 ```
-memex index-service open
+memex web open
 ```
 
 Disable:
 ```
-memex index-service disable
+memex daemon disable
 ```
 
-`index-service` reads config defaults (mode, interval, log paths). Flags override.
+The daemon reads config defaults for its mode, interval, listeners, and log paths.
+Flags override those defaults.
 
 ### Reclaiming obsolete index generations
 
@@ -385,16 +736,16 @@ pre-lease generations. It preserves the committed Tantivy segments without rebui
 conversation history. No user action is required.
 
 For diagnostics or to reclaim space immediately without waiting for the next index run, stop the
-background service and close TUI/Web readers, then preview and run GC:
+background daemon and close TUI/Web readers, then preview and run GC:
 
 ```bash
-memex index-service disable
-memex index-gc --dry-run
-memex index-gc --offline
-memex index-service enable --web-ui # or restore the mode you previously used
+memex daemon disable
+memex index gc --dry-run
+memex index gc --offline
+memex daemon enable --web-ui # or restore the mode you previously used
 ```
 
-`index-gc` validates the committed index, hard-links only its live Tantivy segments into a clean
+`memex index gc` validates the committed index, hard-links only its live Tantivy segments into a clean
 generation, atomically switches `CURRENT`, validates the document count again, and then removes
 unreachable generations. It does not rebuild the index and does not rewrite live segment data.
 The explicit command retains an `--offline` acknowledgement because it performs cleanup without a
@@ -412,25 +763,27 @@ remote access is required, use an authenticated TLS reverse proxy to `127.0.0.1`
 injects the installation bearer token into upstream requests. To use a different local port:
 
 ```
-memex index-service enable --web-listen 127.0.0.1:8080
-memex index-service open --listen 127.0.0.1:8080
+memex daemon enable --web-listen 127.0.0.1:8080
+memex web open --listen 127.0.0.1:8080
 ```
 
 The first Web UI start creates `~/.memex/web-auth-token` with mode `0600`. Private API
 routes require that token as `Authorization: Bearer ...` or a browser session established
-by `index-service open`. Browser links carry a signed, one-time credential in the URL
-fragment, remove it before navigation continues, and exchange it for an ephemeral bearer
-token held only in page memory. The browser token is never stored in a cookie,
-`localStorage`, or session storage. Browser sessions expire after 12 hours, disappear when
-the page closes, and are invalidated whenever the daemon restarts.
+by `web open`. Browser links carry a signed, one-time credential in the URL
+fragment, remove it before navigation continues, and exchange it for an `HttpOnly`,
+same-origin cookie. JavaScript cannot read the cookie, and Memex does not store browser
+credentials in `localStorage` or session storage. Browser sessions survive refreshes and
+reopened tabs, expire after 12 hours, and are invalidated whenever the daemon restarts.
 
-To run the same UI in the foreground without changing the background service:
+To run the same UI in the foreground without changing the background daemon:
 
 ```
-memex web
+memex web serve
 ```
 
-Then run `memex index-service open` from another terminal.
+`memex web` is shorthand for `memex web serve`; foreground startup prints a one-time
+login URL. A background `memex daemon` never writes that credential to its service logs.
+Run `memex web open` from a terminal to open an authenticated browser session.
 
 The browser frontend lives in `web/`, uses React and shadcn components, and is
 built with `cd web && bun install && bun run build`. The generated static assets
@@ -444,21 +797,8 @@ Enable during indexing:
 memex index --embeddings
 ```
 
-Build or resume semantic vectors for an existing lexical index:
-```
-memex embed
-memex stats
-```
-
-Embedding batches are committed to `<root>/state/embed-backfill.sqlite3`. If the command or machine
-stops, rerunning `memex embed` resumes from the last committed batch. The active complete vector
-generation remains searchable throughout a model change or full backfill; memex publishes the new
-generation atomically only after every embeddable record in that pass's captured lexical snapshot
-is covered. If lexical indexing commits newer records concurrently, the next embedding pass adds
-them. `memex stats` reports backfill progress and state while vector work exists.
-
 Recommended when embeddings are on (especially non-`potion` models): run the background
-index service or `index --watch`, and consider setting `auto_index_on_search = false`
+daemon with `memex daemon enable --continuous`, and consider setting `auto_index_on_search = false`
 to keep searches fast.
 
 ## Embedding model
@@ -523,20 +863,29 @@ index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
 index_service_web_ui = false  # serve local browser; forces continuous mode when true
+index_service_mcp = false  # serve MCP from the daemon; forces continuous mode when true
 index_service_web_listen = "127.0.0.1:6363"
 index_service_label = "memex-index"  # service name (default: com.memex.index on macOS)
 index_service_systemd_dir = "~/.config/systemd/user"  # Linux only
 claude_resume_cmd = "claude --resume {session_id}"
 codex_resume_cmd = "codex resume {session_id}"
 cursor_resume_cmd = "cursor-agent --resume {session_id}"
-opencode_resume_cmd = "opencode resume {session_id}"
+opencode_resume_cmd = "opencode --session {session_id}"
 pi_resume_cmd = "pi --session {source_path_shell}"
 # copilot_resume_cmd = "your-copilot-resume-command {session_id}"
 grok_resume_cmd = "cd {cwd_shell} && grok --resume {session_id}"
+jcode_resume_cmd = "cd {cwd_shell} && jcode --resume {session_id}"
+muse_resume_cmd = "cd {cwd_shell} && muse resume {session_id}"
 herdr_resume = "tab"  # inside a herdr pane: "tab" (default), "split", or "off"
+
+[mcp]
+listen = "127.0.0.1:5363"
+allowed_hosts = []
+allowed_origins = []
+# public_url = "https://memex.example.com"
 ```
 
-Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
+Daemon logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
 `include_reasoning` defaults to false. Set it to true (or pass `memex index
@@ -544,11 +893,11 @@ Service logs and the plist live under `~/.memex` by default (macOS). On Linux, s
 and redacted reasoning payloads are always excluded.
 `max_indexed_tool_*_bytes` limits oversized tool payloads while leaving user and assistant text
 unchanged. memex keeps roughly the first three quarters and final quarter, with a marker reporting
-the omitted middle. Each value must be at least 1024 bytes. Run `memex index --reindex` to apply
+the omitted middle. Each value must be at least 1024 bytes. Run `memex index rebuild` to apply
 new limits to records that are already indexed.
 `exclude_paths` takes glob patterns matched against transcript source paths at index time, so
 matched transcripts never enter the index (a leading `~/` is expanded to your home directory).
-Adding a pattern also removes records previously indexed from matched paths — no `--reindex`
+Adding a pattern also removes records previously indexed from matched paths — no rebuild
 required. For one-off runs, pass `--exclude GLOB` (repeatable) to `memex index`.
 `execution_provider` applies to ONNX-backed models; `potion` uses the model2vec backend.
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
@@ -595,17 +944,9 @@ session start also kicks off a background incremental index.
 The plugin is backed by two new CLI surfaces that work anywhere:
 
 ```bash
-memex sessions --cwd . --limit 5     # Federated JSONL: machine, session_id, last_at, ...
-memex sessions --since 2026-08-28T09:00:00Z --json-array
+memex sessions --cwd . --limit 5     # JSONL: session_id, cwd, git_root, resume_cmd, ...
 memex herdr resume-last --cwd .      # resume the newest session for this repo into a herdr tab
 ```
-
-`memex sessions` queries the configured machines, sorts sessions by their latest indexed update,
-and keeps each machine ID so a caller can hydrate a result with
-`memex session <session_id> --machine <machine>`. Unavailable machines are reported on stderr
-without discarding results from machines that responded. Treat `machine`, `source`, `session_id`,
-and `source_path` as the session identity, and `last_at` plus `message_count` as its update marker.
-`--since` is inclusive, so incremental callers can reuse the latest `last_at` and deduplicate rows.
 
 Plugin config lives at `config.toml` in the plugin's herdr config directory and is re-read on
 every action:

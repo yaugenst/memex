@@ -1,9 +1,19 @@
-use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionDetailRow, analytics_path};
-use crate::config::{MachineConfig, Paths, UserConfig, default_claude_source};
+use crate::analytics::{
+    AnalyticsStore, ProjectGrouping, SessionDetailRow, SessionKindFilter, analytics_path,
+};
+use crate::config::{MachineConfig, Paths, UserConfig, default_claude_sources};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
+use crate::memory_search::{
+    MemoryReadRequest, MemoryReadValue, MemorySearchHit, MemorySearchOptions,
+};
+use crate::read_budget::{ContentPage, ReadBudget, ReadField};
+use crate::retrieval::{
+    ContextOptions, ContextRelation, ContextResult, ContextSelector, canonical_record_id,
+    context_records, resolve_record,
+};
 use crate::types::{Record, SourceFilter};
 use crate::usage::{
     CacheWaste, CostMode, UsageQuery, UsageSummary, scan_usage, scan_usage_activity,
@@ -11,7 +21,7 @@ use crate::usage::{
 use crate::vector::VectorIndex;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -128,6 +138,15 @@ pub struct LocatedRecord {
     pub record: Record,
 }
 
+/// Memory results keep document identity and provenance without acquiring a
+/// synthetic conversation/session identity for federation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocatedMemoryHit {
+    pub machine: String,
+    #[serde(flatten)]
+    pub hit: MemorySearchHit,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionContext {
     pub records: Vec<Record>,
@@ -154,6 +173,56 @@ pub struct SessionPageContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundedRecord {
+    pub record_id: String,
+    pub record: Record,
+    pub content: ContentPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundedContextRecord {
+    pub record_id: String,
+    pub relation: ContextRelation,
+    pub distance: i64,
+    pub record: Record,
+    pub content: ContentPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundedContext {
+    pub anchor_record_id: String,
+    pub order: String,
+    pub offset: usize,
+    pub total: usize,
+    pub next_offset: Option<usize>,
+    pub records: Vec<BoundedContextRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundedSessionPage {
+    pub session_id: String,
+    pub source_path: String,
+    pub cwd: Option<String>,
+    pub offset: usize,
+    pub total: usize,
+    pub next_offset: Option<usize>,
+    pub records: Vec<BoundedRecord>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PeerSessionPageError {
+    message: String,
+}
+
+impl std::fmt::Display for PeerSessionPageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "session-page read failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for PeerSessionPageError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSpec {
     pub source: Option<SourceFilter>,
     pub project: Option<String>,
@@ -166,6 +235,11 @@ pub struct UsageSpec {
     pub cost_mode: CostMode,
     pub include_events: bool,
     pub memo_ttl_ms: u64,
+    /// Origin filter. None/Regular exclude permission reviews without requiring
+    /// indexed sessions; All explicitly includes reviews. Optional for RPC
+    /// requests from peers that predate the field.
+    #[serde(default)]
+    pub kind: Option<SessionKindFilter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +276,8 @@ pub struct SessionActivitySpec {
     pub project_grouping: ProjectGrouping,
     pub since_ms: Option<u64>,
     pub until_ms: Option<u64>,
+    #[serde(default)]
+    pub kind: Option<SessionKindFilter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +289,12 @@ pub struct SessionActivityPointWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListSpec {
+    #[serde(default)]
+    pub origin: Option<SessionKindFilter>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<String>,
     pub source: Option<SourceFilter>,
     pub project: Option<String>,
     pub cwd: Option<String>,
@@ -224,6 +306,15 @@ pub struct SessionListSpec {
 pub struct LocatedSession {
     pub machine: String,
     pub session: SessionDetailRow,
+    pub resume_cmd: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionListing {
+    #[serde(flatten)]
+    session: SessionDetailRow,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_cmd: Option<String>,
 }
 
 #[derive(Debug)]
@@ -235,9 +326,37 @@ pub struct Federated<T> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SessionsInput {
+    Request {
+        request: crate::cli::SessionsRequest,
+    },
+    Spec {
+        spec: SessionListSpec,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum RpcOperation {
     Ping,
+    Projects {
+        source: Option<SourceFilter>,
+    },
+    Sessions {
+        #[serde(flatten)]
+        input: SessionsInput,
+    },
+    SessionCount {
+        request: crate::cli::SessionsRequest,
+        query: Option<String>,
+    },
+    MemorySearch {
+        options: MemorySearchOptions,
+    },
+    MemoryRead {
+        request: MemoryReadRequest,
+    },
     Search {
         spec: SearchSpec,
     },
@@ -251,6 +370,29 @@ enum RpcOperation {
     },
     Show {
         doc_id: u64,
+    },
+    ResolveRecord {
+        selector: ContextSelector,
+    },
+    Context {
+        selector: ContextSelector,
+        options: ContextOptions,
+    },
+    ReadRecord {
+        selector: ContextSelector,
+        field: Option<ReadField>,
+        offset_chars: usize,
+        max_chars: usize,
+    },
+    ReadContext {
+        selector: ContextSelector,
+        options: ContextOptions,
+        offset: usize,
+        max_chars: usize,
+    },
+    ReadSessionPages {
+        requests: Vec<SessionPageRequest>,
+        max_chars: usize,
     },
     SessionPage {
         request: SessionPageRequest,
@@ -268,9 +410,6 @@ enum RpcOperation {
     SessionActivity {
         spec: SessionActivitySpec,
     },
-    Sessions {
-        spec: SessionListSpec,
-    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -282,8 +421,23 @@ struct RpcRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RpcPayload {
+    Projects {
+        projects: Vec<serde_json::Value>,
+    },
+    Sessions {
+        sessions: Vec<serde_json::Value>,
+    },
+    SessionCount {
+        count: crate::cli::SessionCount,
+    },
     Pong {
         version: String,
+    },
+    MemoryHits {
+        hits: Vec<MemorySearchHit>,
+    },
+    MemoryDocument {
+        document: Box<MemoryReadValue>,
     },
     Records {
         records: Vec<(f32, Record)>,
@@ -293,6 +447,18 @@ enum RpcPayload {
     },
     Record {
         record: Box<Record>,
+    },
+    Context {
+        context: ContextResult,
+    },
+    BoundedRecord {
+        record: Box<BoundedRecord>,
+    },
+    BoundedContext {
+        context: BoundedContext,
+    },
+    BoundedSessionPages {
+        pages: Vec<BoundedSessionPage>,
     },
     SessionPage {
         context: SessionPageContext,
@@ -316,9 +482,7 @@ enum RpcPayload {
     SessionActivity {
         points: Vec<SessionActivityPointWire>,
     },
-    Sessions {
-        sessions: Vec<SessionDetailRow>,
-    },
+
     Error {
         message: String,
     },
@@ -463,6 +627,147 @@ pub fn federated_search(
     })
 }
 
+/// Query each selected machine's memory snapshot using the same routing and
+/// timeout policy as conversation search. Older peers report an explicit
+/// unsupported-operation failure rather than silently omitting memories.
+pub fn federated_memory_search(
+    paths: &Paths,
+    config: &UserConfig,
+    requested: &[String],
+    options: &MemorySearchOptions,
+    auto_index_local: bool,
+) -> Result<Federated<LocatedMemoryHit>> {
+    options.validate()?;
+    let ids = selected_machine_ids(config, requested)?;
+    let timeout = Duration::from_secs(config.multi_machine.timeout_seconds());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for id in &ids {
+            let tx = tx.clone();
+            let options = options.clone();
+            if id == LOCAL_MACHINE_ID {
+                scope.spawn(move || {
+                    let result = (|| {
+                        if auto_index_local {
+                            ensure_local_index(paths, config, false)?;
+                        }
+                        crate::memory_search::search_memory(paths, &options)
+                    })();
+                    let _ = tx.send((LOCAL_MACHINE_ID.to_string(), result));
+                });
+            } else {
+                let machine = machine_by_id(config, id).expect("selected machines validated");
+                scope.spawn(move || {
+                    let result = (|| match rpc(
+                        machine,
+                        RpcOperation::MemorySearch { options },
+                        timeout,
+                    )? {
+                        RpcPayload::MemoryHits { hits } => Ok(hits),
+                        RpcPayload::Error { message } => bail!("memory search failed: {message}"),
+                        _ => bail!(
+                            "unexpected memory search response; upgrade peer for memory retrieval"
+                        ),
+                    })()
+                    .with_context(|| {
+                        format!(
+                            "memory retrieval on '{}'; upgrade peers that do not support memories",
+                            machine.id
+                        )
+                    });
+                    let _ = tx.send((machine.id.clone(), result));
+                });
+            }
+        }
+        drop(tx);
+    });
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for (machine, result) in rx {
+        match result {
+            Ok(hits) if hits.len() <= options.limit => successes.push((machine, hits)),
+            Ok(_) => failures.push((
+                machine,
+                "memory search exceeded requested result limit".into(),
+            )),
+            Err(error) => failures.push((machine, format!("{error:#}"))),
+        }
+    }
+    let use_rrf = successes.len() > 1;
+    let mut items = Vec::new();
+    for (machine, hits) in successes {
+        for (rank, mut hit) in hits.into_iter().enumerate() {
+            if use_rrf {
+                hit.score = 1.0 / (RRF_K + rank as f32 + 1.0);
+            }
+            items.push(LocatedMemoryHit {
+                machine: machine.clone(),
+                hit,
+            });
+        }
+    }
+    items.sort_by(|left, right| {
+        let order = if options.sort_by_timestamp {
+            right.hit.mtime_ms.cmp(&left.hit.mtime_ms)
+        } else {
+            right.hit.score.total_cmp(&left.hit.score)
+        };
+        order
+            .then_with(|| right.hit.mtime_ms.cmp(&left.hit.mtime_ms))
+            .then_with(|| left.machine.cmp(&right.machine))
+            .then_with(|| left.hit.section_ref.cmp(&right.hit.section_ref))
+    });
+    let candidate_count = items.len();
+    items.truncate(options.limit);
+    failures.sort();
+    Ok(Federated {
+        items,
+        failures,
+        candidate_count,
+    })
+}
+
+pub fn read_memory(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    request: &MemoryReadRequest,
+) -> Result<MemoryReadValue> {
+    request.validate()?;
+    let value = if machine_id == LOCAL_MACHINE_ID {
+        crate::memory_search::read_memory(paths, request)?
+    } else {
+        let machine = machine_by_id(config, machine_id)
+            .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+        match rpc(
+            machine,
+            RpcOperation::MemoryRead {
+                request: request.clone(),
+            },
+            Duration::from_secs(config.multi_machine.timeout_seconds()),
+        )
+        .with_context(|| {
+            format!("memory read on '{machine_id}'; upgrade peer for memory retrieval")
+        })? {
+            RpcPayload::MemoryDocument { document } => *document,
+            RpcPayload::Error { message } => bail!("memory read failed: {message}"),
+            _ => bail!("unexpected memory read response; upgrade peer for memory retrieval"),
+        }
+    };
+    if value.memory_id != request.memory_id {
+        bail!("memory read returned a different document");
+    }
+    if value.text.chars().count() > request.max_chars {
+        bail!("memory read exceeded requested content budget");
+    }
+    if value.content.returned_chars != value.text.chars().count()
+        || value.content.returned_chars > value.content.total_chars
+    {
+        bail!("memory read returned inconsistent content metadata");
+    }
+    Ok(value)
+}
+
 pub fn federated_recent(
     paths: &Paths,
     config: &UserConfig,
@@ -551,7 +856,6 @@ pub fn federated_sessions(
     spec: &SessionListSpec,
 ) -> Result<Federated<LocatedSession>> {
     let ids = selected_machine_ids(config, requested)?;
-    let timeout = Duration::from_secs(config.multi_machine.timeout_seconds());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         for id in &ids {
@@ -570,7 +874,7 @@ pub fn federated_sessions(
                     .expect("selected machines were validated")
                     .clone();
                 scope.spawn(move || {
-                    let result = rpc_sessions(&machine, spec, timeout);
+                    let result = rpc_sessions(config, &machine, spec);
                     let _ = tx.send((machine.id.clone(), result));
                 });
             }
@@ -600,7 +904,7 @@ pub fn federated_sessions(
 }
 
 fn merge_sessions(
-    successes: Vec<(String, Vec<SessionDetailRow>)>,
+    successes: Vec<(String, Vec<SessionListing>)>,
     mut failures: Vec<(String, String)>,
     limit: usize,
 ) -> Federated<LocatedSession> {
@@ -609,7 +913,8 @@ fn merge_sessions(
         .flat_map(|(machine, sessions)| {
             sessions.into_iter().map(move |session| LocatedSession {
                 machine: machine.clone(),
-                session,
+                session: session.session,
+                resume_cmd: session.resume_cmd,
             })
         })
         .collect::<Vec<_>>();
@@ -707,6 +1012,217 @@ pub fn record_by_doc_id(
         RpcPayload::Record { record } => Ok(*record),
         RpcPayload::Error { message } => Err(anyhow!("show failed: {message}")),
         other => Err(anyhow!("show returned unexpected response: {other:?}")),
+    }
+}
+
+/// Resolve a record on exactly the machine that supplied its retrieval reference.
+/// Legacy document-ID reads retain the existing RPC operation for older peers.
+pub fn record_by_selector(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    selector: &ContextSelector,
+) -> Result<Record> {
+    if let ContextSelector::DocId {
+        id,
+        session_id: None,
+        source: None,
+    } = selector
+    {
+        return record_by_doc_id(paths, config, machine_id, *id);
+    }
+    if machine_id == LOCAL_MACHINE_ID {
+        return resolve_record(&SearchIndex::open_or_create(&paths.index)?, selector);
+    }
+    let machine = machine_by_id(config, machine_id)
+        .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+    match rpc(
+        machine,
+        RpcOperation::ResolveRecord {
+            selector: selector.clone(),
+        },
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    )? {
+        RpcPayload::Record { record } => Ok(*record),
+        RpcPayload::Error { message } => Err(anyhow!("record resolution failed: {message}")),
+        other => Err(anyhow!(
+            "record resolution returned unexpected response: {other:?}"
+        )),
+    }
+}
+
+pub fn context_on_machine(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    selector: &ContextSelector,
+    options: ContextOptions,
+) -> Result<ContextResult> {
+    options.validate()?;
+    if machine_id == LOCAL_MACHINE_ID {
+        return context_records(
+            &SearchIndex::open_or_create(&paths.index)?,
+            selector,
+            options,
+        );
+    }
+    let machine = machine_by_id(config, machine_id)
+        .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+    match rpc(
+        machine,
+        RpcOperation::Context {
+            selector: selector.clone(),
+            options,
+        },
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    )? {
+        RpcPayload::Context { context } => Ok(context),
+        RpcPayload::Error { message } => Err(anyhow!("context failed: {message}")),
+        other => Err(anyhow!("context returned unexpected response: {other:?}")),
+    }
+}
+
+pub fn read_record(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    selector: &ContextSelector,
+    field: Option<ReadField>,
+    offset_chars: usize,
+    max_chars: Option<usize>,
+) -> Result<BoundedRecord> {
+    validate_context_selector(selector)?;
+    if max_chars == Some(0) {
+        bail!("max_chars must be greater than zero for a record read");
+    }
+    if max_chars.is_none() {
+        let record = record_by_selector(paths, config, machine_id, selector)?;
+        let mut budget = ReadBudget::from_remaining(None);
+        let bounded = apply_record_budget(record, &mut budget, field, offset_chars)?;
+        validate_bounded_record(&bounded, selector, None)?;
+        return Ok(bounded);
+    }
+    if machine_id == LOCAL_MACHINE_ID {
+        let record = resolve_record(&SearchIndex::open_or_create(&paths.index)?, selector)?;
+        let mut budget = ReadBudget::from_remaining(max_chars);
+        return apply_record_budget(record, &mut budget, field, offset_chars);
+    }
+    let machine = machine_by_id(config, machine_id)
+        .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+    let response = rpc(
+        machine,
+        RpcOperation::ReadRecord {
+            selector: selector.clone(),
+            field,
+            offset_chars,
+            max_chars: max_chars.expect("bounded branch"),
+        },
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    )
+    .with_context(|| bounded_rpc_help(machine_id, "record read"))?;
+    match response {
+        RpcPayload::BoundedRecord { record } => {
+            validate_bounded_record(&record, selector, max_chars)?;
+            Ok(*record)
+        }
+        RpcPayload::Error { message } => Err(anyhow!("record read failed: {message}")),
+        other => Err(anyhow!(
+            "record read returned an unexpected response; upgrade peer for bounded reads: {other:?}"
+        )),
+    }
+}
+
+pub fn read_context(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    selector: &ContextSelector,
+    options: ContextOptions,
+    offset: usize,
+    max_chars: Option<usize>,
+) -> Result<BoundedContext> {
+    validate_context_selector(selector)?;
+    options.validate()?;
+    if max_chars.is_none() {
+        let context = context_on_machine(paths, config, machine_id, selector, options)?;
+        let bounded = apply_context_budget(context, offset, None)?;
+        validate_bounded_context(&bounded, selector, offset, None)?;
+        return Ok(bounded);
+    }
+    if machine_id == LOCAL_MACHINE_ID {
+        let context = context_records(
+            &SearchIndex::open_or_create(&paths.index)?,
+            selector,
+            options,
+        )?;
+        return apply_context_budget(context, offset, max_chars);
+    }
+    let machine = machine_by_id(config, machine_id)
+        .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+    let response = rpc(
+        machine,
+        RpcOperation::ReadContext {
+            selector: selector.clone(),
+            options,
+            offset,
+            max_chars: max_chars.expect("bounded branch"),
+        },
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    )
+    .with_context(|| bounded_rpc_help(machine_id, "context read"))?;
+    match response {
+        RpcPayload::BoundedContext { context } => {
+            validate_bounded_context(&context, selector, offset, max_chars)?;
+            Ok(context)
+        }
+        RpcPayload::Error { message } => Err(anyhow!("context read failed: {message}")),
+        other => Err(anyhow!(
+            "context read returned an unexpected response; upgrade peer for bounded reads: {other:?}"
+        )),
+    }
+}
+
+pub fn read_session_pages(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    requests: &[SessionPageRequest],
+    max_chars: Option<usize>,
+) -> Result<Vec<BoundedSessionPage>> {
+    validate_session_batch(requests)?;
+    if max_chars.is_none() {
+        let contexts = batch_session_contexts(paths, config, machine_id, requests)?;
+        let pages = apply_session_pages_budget(contexts, None)?;
+        validate_bounded_session_pages(&pages, requests, None)?;
+        return Ok(pages);
+    }
+    if machine_id == LOCAL_MACHINE_ID {
+        let contexts = requests
+            .iter()
+            .map(|request| session_page_context_local(paths, request))
+            .collect::<Result<Vec<_>>>()?;
+        return apply_session_pages_budget(contexts, max_chars);
+    }
+    let machine = machine_by_id(config, machine_id)
+        .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+    let response = rpc(
+        machine,
+        RpcOperation::ReadSessionPages {
+            requests: requests.to_vec(),
+            max_chars: max_chars.expect("bounded branch"),
+        },
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    )
+    .with_context(|| bounded_rpc_help(machine_id, "session-page read"))?;
+    match response {
+        RpcPayload::BoundedSessionPages { pages } => {
+            validate_bounded_session_pages(&pages, requests, max_chars)?;
+            Ok(pages)
+        }
+        RpcPayload::Error { message } => Err(PeerSessionPageError { message }.into()),
+        other => Err(anyhow!(
+            "session-page read returned an unexpected response; upgrade peer for bounded reads: {other:?}"
+        )),
     }
 }
 
@@ -875,6 +1391,335 @@ fn validate_session_page_context(
         bail!("session page response has invalid pagination metadata");
     }
     Ok(())
+}
+
+fn apply_record_budget(
+    mut record: Record,
+    budget: &mut ReadBudget,
+    field: Option<ReadField>,
+    offset_chars: usize,
+) -> Result<BoundedRecord> {
+    let record_id = canonical_record_id(&record);
+    let content = budget.apply(&mut record, field, offset_chars)?;
+    Ok(BoundedRecord {
+        record_id,
+        record,
+        content,
+    })
+}
+
+fn apply_context_budget(
+    mut context: ContextResult,
+    offset: usize,
+    max_chars: Option<usize>,
+) -> Result<BoundedContext> {
+    let order = if max_chars.is_some() {
+        context
+            .records
+            .sort_by_key(|item| item.relation != ContextRelation::Anchor);
+        "anchor_first"
+    } else {
+        "chronological"
+    };
+    let total = context.records.len();
+    let mut budget = ReadBudget::from_remaining(max_chars);
+    let mut records = Vec::new();
+    if max_chars != Some(0) {
+        for item in context.records.into_iter().skip(offset) {
+            if budget.remaining() == Some(0) {
+                break;
+            }
+            let bounded = apply_record_budget(item.record, &mut budget, None, 0)?;
+            records.push(BoundedContextRecord {
+                record_id: bounded.record_id,
+                relation: item.relation,
+                distance: item.distance,
+                record: bounded.record,
+                content: bounded.content,
+            });
+        }
+    }
+    let next_offset = bounded_next_offset(offset, records.len(), total);
+    Ok(BoundedContext {
+        anchor_record_id: context.anchor_record_id,
+        order: order.to_string(),
+        offset,
+        total,
+        next_offset,
+        records,
+    })
+}
+
+fn apply_session_pages_budget(
+    contexts: Vec<SessionPageContext>,
+    max_chars: Option<usize>,
+) -> Result<Vec<BoundedSessionPage>> {
+    let mut budget = ReadBudget::from_remaining(max_chars);
+    contexts
+        .into_iter()
+        .map(|context| {
+            let mut records = Vec::new();
+            if budget.remaining() != Some(0) {
+                for record in context.records {
+                    if budget.remaining() == Some(0) {
+                        break;
+                    }
+                    records.push(apply_record_budget(record, &mut budget, None, 0)?);
+                }
+            }
+            Ok(BoundedSessionPage {
+                session_id: context.session_id,
+                source_path: context.source_path,
+                cwd: context.cwd,
+                offset: context.offset,
+                total: context.total,
+                next_offset: bounded_next_offset(context.offset, records.len(), context.total),
+                records,
+            })
+        })
+        .collect()
+}
+
+fn bounded_next_offset(offset: usize, returned: usize, total: usize) -> Option<usize> {
+    let end = offset.saturating_add(returned);
+    (end < total).then_some(end)
+}
+
+fn validate_context_selector(selector: &ContextSelector) -> Result<()> {
+    let (id, session_id) = match selector {
+        ContextSelector::RecordId { id, session_id, .. }
+        | ContextSelector::EventId { id, session_id, .. } => (Some(id.as_str()), session_id),
+        ContextSelector::DocId { session_id, .. } => (None, session_id),
+    };
+    if id.is_some_and(str::is_empty) {
+        bail!("record selector id must not be empty");
+    }
+    if session_id.as_deref().is_some_and(str::is_empty) {
+        bail!("record selector session_id must not be empty");
+    }
+    Ok(())
+}
+
+fn record_matches_selector(record: &Record, selector: &ContextSelector) -> bool {
+    let (session_id, source, identity_matches) = match selector {
+        ContextSelector::RecordId {
+            id,
+            session_id,
+            source,
+        } => (session_id, source, canonical_record_id(record) == *id),
+        ContextSelector::DocId {
+            id,
+            session_id,
+            source,
+        } => (session_id, source, record.doc_id == *id),
+        ContextSelector::EventId {
+            id,
+            session_id,
+            source,
+        } => (
+            session_id,
+            source,
+            record.links.event_id.as_deref() == Some(id.as_str()),
+        ),
+    };
+    identity_matches
+        && session_id
+            .as_deref()
+            .is_none_or(|session_id| record.session_id == session_id)
+        && source.is_none_or(|source| record.source == source)
+}
+
+fn validate_content_page(record: &Record, content: &ContentPage) -> Result<usize> {
+    let actual = record.text.chars().count()
+        + record
+            .tool_input
+            .as_deref()
+            .map_or(0, |value| value.chars().count())
+        + record
+            .tool_output
+            .as_deref()
+            .map_or(0, |value| value.chars().count());
+    if actual != content.returned_chars {
+        bail!("bounded response content length does not match returned_chars");
+    }
+    if content.returned_chars > content.total_chars {
+        bail!("bounded response returned_chars exceeds total_chars");
+    }
+    if content.truncated == content.continuations.is_empty() {
+        bail!("bounded response has inconsistent truncation metadata");
+    }
+    let mut fields = Vec::new();
+    for continuation in &content.continuations {
+        if continuation.offset_chars > continuation.total_chars {
+            bail!("bounded response has invalid continuation metadata");
+        }
+        if fields.contains(&continuation.field) {
+            bail!("bounded response repeats a continuation field");
+        }
+        fields.push(continuation.field);
+    }
+    Ok(actual)
+}
+
+fn validate_bounded_record(
+    bounded: &BoundedRecord,
+    selector: &ContextSelector,
+    max_chars: Option<usize>,
+) -> Result<()> {
+    if bounded.record_id != canonical_record_id(&bounded.record) {
+        bail!("record read returned a non-canonical record identity");
+    }
+    if !record_matches_selector(&bounded.record, selector) {
+        bail!("record read response does not match its selector");
+    }
+    let returned = validate_content_page(&bounded.record, &bounded.content)?;
+    if max_chars.is_some_and(|max_chars| returned > max_chars) {
+        bail!("record read response exceeds its requested character budget");
+    }
+    Ok(())
+}
+
+fn validate_bounded_context(
+    context: &BoundedContext,
+    selector: &ContextSelector,
+    offset: usize,
+    max_chars: Option<usize>,
+) -> Result<()> {
+    if context.offset != offset {
+        bail!("context read response has an unexpected offset");
+    }
+    let expected_order = if max_chars.is_some() {
+        "anchor_first"
+    } else {
+        "chronological"
+    };
+    if context.order != expected_order {
+        bail!("context read response has an unexpected order");
+    }
+    validate_bounded_pagination(
+        context.offset,
+        context.total,
+        context.next_offset,
+        context.records.len(),
+        "context read",
+    )?;
+    let mut returned = 0usize;
+    let mut anchor_count = 0usize;
+    for item in &context.records {
+        if item.record_id != canonical_record_id(&item.record) {
+            bail!("context read returned a non-canonical record identity");
+        }
+        if item.relation == ContextRelation::Anchor {
+            anchor_count += 1;
+            if item.record_id != context.anchor_record_id
+                || !record_matches_selector(&item.record, selector)
+            {
+                bail!("context read returned the wrong anchor record");
+            }
+        }
+        returned = returned
+            .checked_add(validate_content_page(&item.record, &item.content)?)
+            .ok_or_else(|| anyhow!("context read character count overflowed"))?;
+    }
+    if max_chars.is_some_and(|max_chars| returned > max_chars) {
+        bail!("context read response exceeds its requested character budget");
+    }
+    if max_chars.is_some_and(|max_chars| max_chars > 0) && offset == 0 {
+        if context.records.first().is_none_or(|item| {
+            item.relation != ContextRelation::Anchor
+                || item.record_id != context.anchor_record_id
+                || !record_matches_selector(&item.record, selector)
+        }) || anchor_count != 1
+        {
+            bail!("bounded context response does not begin with exactly the selected anchor");
+        }
+    } else if anchor_count > 1 {
+        bail!("context read response contains duplicate anchors");
+    }
+    Ok(())
+}
+
+fn validate_bounded_session_pages(
+    pages: &[BoundedSessionPage],
+    requests: &[SessionPageRequest],
+    max_chars: Option<usize>,
+) -> Result<()> {
+    if pages.len() != requests.len() {
+        bail!(
+            "session-page read returned {} pages for {} requests",
+            pages.len(),
+            requests.len()
+        );
+    }
+    let mut returned = 0usize;
+    for (page, request) in pages.iter().zip(requests) {
+        if page.session_id != request.session_id
+            || page.source_path != request.source_path
+            || page.offset != request.offset
+        {
+            bail!("session-page read response does not match its request");
+        }
+        if page.records.len() > request.limit {
+            bail!("session-page read response exceeds its requested record limit");
+        }
+        validate_bounded_pagination(
+            page.offset,
+            page.total,
+            page.next_offset,
+            page.records.len(),
+            "session-page read",
+        )?;
+        for bounded in &page.records {
+            if bounded.record_id != canonical_record_id(&bounded.record) {
+                bail!("session-page read returned a non-canonical record identity");
+            }
+            if bounded.record.session_id != request.session_id
+                || (!request.source_path.is_empty()
+                    && bounded.record.source_path != request.source_path)
+            {
+                bail!("session-page read returned a record outside its requested session");
+            }
+            returned = returned
+                .checked_add(validate_content_page(&bounded.record, &bounded.content)?)
+                .ok_or_else(|| anyhow!("session-page read character count overflowed"))?;
+        }
+    }
+    if max_chars.is_some_and(|max_chars| returned > max_chars) {
+        bail!("session-page read response exceeds its requested character budget");
+    }
+    Ok(())
+}
+
+fn validate_bounded_pagination(
+    offset: usize,
+    total: usize,
+    next_offset: Option<usize>,
+    returned: usize,
+    context: &str,
+) -> Result<()> {
+    if offset > total {
+        if returned != 0 || next_offset.is_some() {
+            bail!("{context} response has invalid out-of-range pagination");
+        }
+        return Ok(());
+    }
+    let expected_end = offset
+        .checked_add(returned)
+        .ok_or_else(|| anyhow!("{context} response has overflowing pagination metadata"))?;
+    if expected_end > total {
+        bail!("{context} response has an invalid pagination total");
+    }
+    let expected_next = (expected_end < total).then_some(expected_end);
+    if next_offset != expected_next {
+        bail!("{context} response has inconsistent continuation metadata");
+    }
+    Ok(())
+}
+
+fn bounded_rpc_help(machine_id: &str, operation: &str) -> String {
+    format!(
+        "{operation} requires bounded-read RPC support on machine '{machine_id}'; upgrade peer for bounded reads"
+    )
 }
 
 pub fn machine_by_id<'a>(config: &'a UserConfig, id: &str) -> Option<&'a MachineConfig> {
@@ -1095,6 +1940,98 @@ pub fn federated_session_activity(
     Ok((points, !errors.is_empty()))
 }
 
+/// Discovery deliberately ignores the configured default search subset and never
+/// exposes transport commands, hosts, credentials, or index configuration.
+pub fn configured_machine_summaries(config: &UserConfig) -> Result<Vec<serde_json::Value>> {
+    let mut items = vec![serde_json::json!({"id": LOCAL_MACHINE_ID, "label": "This Mac"})];
+    let mut seen = HashSet::from([LOCAL_MACHINE_ID.to_string()]);
+    for machine in config.machines.iter().filter(|machine| machine.enabled()) {
+        validate_machine(machine)?;
+        if !seen.insert(machine.id.clone()) {
+            bail!("duplicate machine id '{}'", machine.id);
+        }
+        items.push(serde_json::json!({
+            "id": machine.id,
+            "label": machine.label.as_deref().filter(|label| !label.trim().is_empty()).unwrap_or(&machine.id),
+        }));
+    }
+    Ok(items)
+}
+
+pub(crate) fn remote_project_summaries(
+    config: &UserConfig,
+    id: &str,
+    source: Option<SourceFilter>,
+) -> Result<Vec<serde_json::Value>> {
+    match metadata_rpc(config, id, RpcOperation::Projects { source }, "projects")? {
+        RpcPayload::Projects { projects } => Ok(projects),
+        _ => bail!("machine '{id}' returned an unexpected projects metadata response"),
+    }
+}
+
+pub(crate) fn remote_sessions(
+    config: &UserConfig,
+    id: &str,
+    request: crate::cli::SessionsRequest,
+) -> Result<Vec<serde_json::Value>> {
+    match metadata_rpc(
+        config,
+        id,
+        RpcOperation::Sessions {
+            input: SessionsInput::Request { request },
+        },
+        "sessions",
+    )? {
+        RpcPayload::Sessions { sessions } => Ok(sessions),
+        _ => bail!("machine '{id}' returned an unexpected sessions metadata response"),
+    }
+}
+
+pub(crate) fn remote_session_count(
+    config: &UserConfig,
+    id: &str,
+    request: crate::cli::SessionsRequest,
+    query: Option<String>,
+) -> Result<crate::cli::SessionCount> {
+    match metadata_rpc(
+        config,
+        id,
+        RpcOperation::SessionCount { request, query },
+        "session count",
+    )? {
+        RpcPayload::SessionCount { count } => Ok(count),
+        _ => bail!("machine '{id}' returned an unexpected session count metadata response"),
+    }
+}
+
+fn metadata_rpc(
+    config: &UserConfig,
+    id: &str,
+    operation: RpcOperation,
+    name: &str,
+) -> Result<RpcPayload> {
+    let machine = config
+        .machines
+        .iter()
+        .find(|machine| machine.id == id)
+        .ok_or_else(|| anyhow!("unknown machine '{id}'"))?;
+    let response = rpc(
+        machine,
+        operation,
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    );
+    let response = match response {
+        Ok(RpcPayload::Error { message }) => Err(anyhow!(message)),
+        value => value,
+    };
+    response.map_err(|error| {
+        let message = error.to_string();
+        if message.contains("unknown variant") || message.contains("unsupported RPC protocol") {
+            anyhow!("machine '{id}' does not support {name} metadata; update Memex on that peer to use this view. {message}")
+        } else { error }
+    })
+}
+
 pub fn remote_shell_command(machine: &MachineConfig, command: &str) -> Result<String> {
     validate_machine(machine)?;
     let target = machine
@@ -1145,8 +2082,39 @@ pub fn run_rpc_stdio(root: Option<std::path::PathBuf>) -> Result<()> {
 
 fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Result<RpcPayload> {
     match request {
+        RpcOperation::Projects { source } => Ok(RpcPayload::Projects {
+            projects: crate::cli::collect_projects(paths, source)?,
+        }),
+        RpcOperation::Sessions {
+            input: SessionsInput::Request { request },
+        } => Ok(RpcPayload::Sessions {
+            sessions: crate::cli::collect_sessions(
+                request.session_id,
+                request.source_path,
+                request.cwd.map(std::path::PathBuf::from),
+                request.project,
+                crate::cli::parse_source_filter(request.source)?,
+                request.since,
+                request.limit,
+                request.origin,
+                Some(paths.root.clone()),
+            )?,
+        }),
+        RpcOperation::SessionCount { request, query } => Ok(RpcPayload::SessionCount {
+            count: crate::cli::collect_session_count(paths, request, query)?,
+        }),
         RpcOperation::Ping => Ok(RpcPayload::Pong {
             version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+        RpcOperation::MemorySearch { options } => {
+            options.validate()?;
+            ensure_local_index(paths, config, false)?;
+            Ok(RpcPayload::MemoryHits {
+                hits: crate::memory_search::search_memory(paths, &options)?,
+            })
+        }
+        RpcOperation::MemoryRead { request } => Ok(RpcPayload::MemoryDocument {
+            document: Box::new(read_memory(paths, config, LOCAL_MACHINE_ID, &request)?),
         }),
         RpcOperation::Search { spec } => Ok(RpcPayload::Records {
             records: search_local(paths, config, &spec, true)?,
@@ -1177,6 +2145,66 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
                 .ok_or_else(|| anyhow!("doc_id not found"))?;
             Ok(RpcPayload::Record {
                 record: Box::new(record),
+            })
+        }
+        RpcOperation::ResolveRecord { selector } => {
+            let index = SearchIndex::open_or_create(&paths.index)?;
+            Ok(RpcPayload::Record {
+                record: Box::new(resolve_record(&index, &selector)?),
+            })
+        }
+        RpcOperation::Context { selector, options } => {
+            let index = SearchIndex::open_or_create(&paths.index)?;
+            Ok(RpcPayload::Context {
+                context: context_records(&index, &selector, options)?,
+            })
+        }
+        RpcOperation::ReadRecord {
+            selector,
+            field,
+            offset_chars,
+            max_chars,
+        } => {
+            validate_context_selector(&selector)?;
+            if max_chars == 0 {
+                bail!("max_chars must be greater than zero for a record read");
+            }
+            let index = SearchIndex::open_or_create(&paths.index)?;
+            let record = resolve_record(&index, &selector)?;
+            let mut budget = ReadBudget::from_remaining(Some(max_chars));
+            Ok(RpcPayload::BoundedRecord {
+                record: Box::new(apply_record_budget(
+                    record,
+                    &mut budget,
+                    field,
+                    offset_chars,
+                )?),
+            })
+        }
+        RpcOperation::ReadContext {
+            selector,
+            options,
+            offset,
+            max_chars,
+        } => {
+            validate_context_selector(&selector)?;
+            let index = SearchIndex::open_or_create(&paths.index)?;
+            let context = context_records(&index, &selector, options)?;
+            Ok(RpcPayload::BoundedContext {
+                context: apply_context_budget(context, offset, Some(max_chars))?,
+            })
+        }
+        RpcOperation::ReadSessionPages {
+            requests,
+            max_chars,
+        } => {
+            validate_session_batch(&requests)?;
+            let contexts = requests
+                .iter()
+                .map(|request| session_page_context_local(paths, request))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RpcPayload::BoundedSessionPages {
+                pages: apply_session_pages_budget(contexts, Some(max_chars))?,
             })
         }
         RpcOperation::SessionPage { request } => {
@@ -1212,28 +2240,48 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         RpcOperation::SessionActivity { spec } => Ok(RpcPayload::SessionActivity {
             points: session_activity_local(paths, &spec)?,
         }),
-        RpcOperation::Sessions { spec } => Ok(RpcPayload::Sessions {
-            sessions: sessions_local(paths, &spec)?,
+        RpcOperation::Sessions {
+            input: SessionsInput::Spec { spec },
+        } => Ok(RpcPayload::Sessions {
+            sessions: sessions_local(paths, &spec)?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<_, _>>()?,
         }),
     }
 }
 
-fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionDetailRow>> {
+fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionListing>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-    store.query_sessions_detailed(
+    let config = UserConfig::load(paths)?;
+    let rows = store.query_sessions_detailed_selected(
         spec.source,
         spec.project.as_deref(),
         spec.cwd.as_deref(),
         spec.since_ms,
+        spec.origin,
+        spec.session_id.as_deref(),
+        spec.source_path.as_deref(),
         Some(spec.limit),
-    )
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|session| {
+            let resume_cmd =
+                crate::cli::session_resume_command(&config, &session).map(|(command, _)| command);
+            SessionListing {
+                session,
+                resume_cmd,
+            }
+        })
+        .collect())
 }
 
 fn usage_local(paths: &Paths, config: &UserConfig, spec: &UsageSpec) -> Result<UsageReportWire> {
     if !config.token_usage_enabled() {
         bail!("token usage tracking is disabled on this machine");
     }
-    let report = scan_usage(&usage_query(paths, spec))?;
+    let report = scan_usage(&usage_query(paths, spec)?)?;
     let details = report
         .details
         .iter()
@@ -1266,7 +2314,7 @@ fn usage_activity_local(
     if !config.token_usage_enabled() {
         bail!("token usage tracking is disabled on this machine");
     }
-    let (points, partial) = scan_usage_activity(&usage_query(paths, spec))?;
+    let (points, partial) = scan_usage_activity(&usage_query(paths, spec)?)?;
     Ok((
         points
             .into_iter()
@@ -1292,6 +2340,7 @@ fn session_activity_local(
         spec.until_ms,
         spec.project.as_deref(),
         spec.project_grouping,
+        Some(spec.kind.unwrap_or_default()),
     )?;
     Ok(rows
         .into_iter()
@@ -1304,22 +2353,66 @@ fn session_activity_local(
         .collect())
 }
 
-fn usage_query(paths: &Paths, spec: &UsageSpec) -> UsageQuery {
-    UsageQuery {
+/// Session keys allowed by an origin filter, resolved against the local
+/// analytics store. Keys collapse to usage-event coordinates
+/// `(source label, session id)`; codex storage variants collapse via
+/// `label()`, matching `scan_usage_activity`'s
+/// `(event.source, session_id)` check. Returns an error when the analytics
+/// store cannot be opened so callers surface it instead of silently
+/// showing unfiltered totals.
+pub(crate) fn usage_session_keys_for_kind(
+    paths: &Paths,
+    kind: SessionKindFilter,
+) -> Result<HashSet<(String, String)>> {
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let rows =
+        store.query_sessions_filtered(None, None, None, ProjectGrouping::Flat, Some(kind), None)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.source.label().to_string(), row.session_id))
+        .collect())
+}
+
+/// Intersects an explicit session-key filter (e.g. from a text search) with
+/// the origin filter. Either side being unrestricted leaves the other side.
+fn apply_kind_to_session_keys(
+    session_keys: Option<HashSet<(String, String)>>,
+    kind: Option<SessionKindFilter>,
+    allowed: Option<HashSet<(String, String)>>,
+) -> Option<HashSet<(String, String)>> {
+    let kind = kind.unwrap_or(SessionKindFilter::Regular);
+    if matches!(kind, SessionKindFilter::All | SessionKindFilter::Regular) {
+        return session_keys;
+    }
+    let allowed = allowed?;
+    Some(match session_keys {
+        Some(keys) => keys.intersection(&allowed).cloned().collect(),
+        None => allowed,
+    })
+}
+
+fn usage_query(paths: &Paths, spec: &UsageSpec) -> Result<UsageQuery> {
+    let session_keys: Option<HashSet<(String, String)>> = spec
+        .session_keys
+        .as_ref()
+        .map(|keys| keys.iter().cloned().collect());
+    let allowed = match spec.kind.unwrap_or(SessionKindFilter::Regular) {
+        SessionKindFilter::All | SessionKindFilter::Regular => None,
+        kind => Some(usage_session_keys_for_kind(paths, kind)?),
+    };
+    Ok(UsageQuery {
         source: spec.source,
         project: spec.project.clone(),
         project_grouping: spec.project_grouping,
-        session_keys: spec
-            .session_keys
-            .as_ref()
-            .map(|keys| keys.iter().cloned().collect()),
+        session_keys: apply_kind_to_session_keys(session_keys, spec.kind, allowed),
         since_ms: spec.since_ms,
         until_ms: spec.until_ms,
         cost_mode: spec.cost_mode,
         include_events: spec.include_events,
+        include_reviews: spec.kind == Some(SessionKindFilter::All),
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: spec.memo_ttl_ms,
-    }
+    })
 }
 
 fn merge_usage_reports(
@@ -1666,7 +2759,8 @@ fn index_local_with_lease(
 ) -> Result<IngestReport> {
     let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
     let options = IngestOptions {
-        claude_source: default_claude_source(),
+        backfill_embeddings: false,
+        claude_sources: default_claude_sources(),
         include_agents: false,
         include_reasoning: config.include_reasoning_default(),
         include_codex: true,
@@ -1677,6 +2771,9 @@ fn index_local_with_lease(
         include_openclaw: true,
         include_copilot: true,
         include_grok: true,
+        include_jcode: true,
+        include_muse: true,
+        include_antigravity: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),
         prune_missing: true,
@@ -1725,45 +2822,12 @@ fn records_for_session_page(
     index: &SearchIndex,
     request: &SessionPageRequest,
 ) -> Result<(Vec<Record>, usize)> {
-    if request.source_path.is_empty() {
-        return index.records_by_session_id_page(
-            &request.session_id,
-            request.offset,
-            request.limit,
-        );
-    }
-
-    // The index page collector can page by session but not by source path.
-    // Scan bounded index pages while retaining only the requested output page,
-    // so a source-qualified request cannot materialize the whole trajectory.
-    let mut scan_offset = 0usize;
-    let mut matched = 0usize;
-    let mut records = Vec::with_capacity(request.limit);
-    loop {
-        let (page, total) = index.records_by_session_id_page(
-            &request.session_id,
-            scan_offset,
-            MAX_SESSION_PAGE_SIZE,
-        )?;
-        if page.is_empty() {
-            break;
-        }
-        for record in page {
-            if record.source_path != request.source_path {
-                continue;
-            }
-            if matched >= request.offset && records.len() < request.limit {
-                records.push(record);
-            }
-            matched = matched.saturating_add(1);
-        }
-        scan_offset = scan_offset
-            .saturating_add(MAX_SESSION_PAGE_SIZE.min(total.saturating_sub(scan_offset)));
-        if scan_offset >= total {
-            break;
-        }
-    }
-    Ok((records, matched))
+    index.records_by_session_path_page(
+        &request.session_id,
+        (!request.source_path.is_empty()).then_some(request.source_path.as_str()),
+        request.offset,
+        request.limit,
+    )
 }
 
 fn discover_cwd(path: &std::path::Path, session_id: &str) -> Option<String> {
@@ -1818,12 +2882,23 @@ fn rpc_records(
 }
 
 fn rpc_sessions(
+    config: &UserConfig,
     machine: &MachineConfig,
     spec: SessionListSpec,
-    timeout: Duration,
-) -> Result<Vec<SessionDetailRow>> {
-    match rpc(machine, RpcOperation::Sessions { spec }, timeout)? {
-        RpcPayload::Sessions { sessions } => Ok(sessions),
+) -> Result<Vec<SessionListing>> {
+    match metadata_rpc(
+        config,
+        &machine.id,
+        RpcOperation::Sessions {
+            input: SessionsInput::Spec { spec },
+        },
+        "sessions",
+    )? {
+        RpcPayload::Sessions { sessions } => sessions
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Into::into),
         RpcPayload::Error { message } => Err(anyhow!("sessions failed: {message}")),
         other => Err(anyhow!("sessions returned unexpected response: {other:?}")),
     }
@@ -2078,6 +3153,28 @@ mod tests {
         index.publish_generation().unwrap();
     }
 
+    fn rpc_handler_round_trip(
+        paths: &Paths,
+        config: &UserConfig,
+        operation: RpcOperation,
+    ) -> RpcPayload {
+        let request = serde_json::to_vec(&RpcRequest {
+            protocol: RPC_PROTOCOL,
+            request: operation,
+        })
+        .unwrap();
+        let request: RpcRequest = serde_json::from_slice(&request).unwrap();
+        let response = handle_rpc(paths, config, request.request).unwrap();
+        let response = serde_json::to_vec(&RpcResponse {
+            protocol: RPC_PROTOCOL,
+            response,
+        })
+        .unwrap();
+        serde_json::from_slice::<RpcResponse>(&response)
+            .unwrap()
+            .response
+    }
+
     #[test]
     fn busy_auto_index_reads_published_generation() {
         let tmp = TempDir::new().unwrap();
@@ -2238,6 +3335,137 @@ mod tests {
         assert_eq!(contexts.len(), 2);
         assert_eq!(contexts[0].records[0].doc_id, 1);
         assert_eq!(contexts[1].records[0].doc_id, 3);
+    }
+
+    #[test]
+    fn bounded_rpc_handlers_apply_budgets_before_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        let records = vec![
+            test_record(1, "session", "a.jsonl", 1),
+            test_record(2, "session", "a.jsonl", 2),
+            test_record(3, "session", "b.jsonl", 3),
+        ];
+        write_test_index(&paths, &records);
+        let config = UserConfig::default();
+
+        let selector = ContextSelector::doc_id(2);
+        let RpcPayload::BoundedRecord { record } = rpc_handler_round_trip(
+            &paths,
+            &config,
+            RpcOperation::ReadRecord {
+                selector: selector.clone(),
+                field: Some(ReadField::Text),
+                offset_chars: 1,
+                max_chars: 2,
+            },
+        ) else {
+            panic!("unexpected bounded-record response");
+        };
+        assert_eq!(record.record.text, "ec");
+        assert_eq!(record.content.returned_chars, 2);
+        assert_eq!(record.content.total_chars, 8);
+        assert_eq!(record.content.continuations[0].offset_chars, 3);
+        validate_bounded_record(&record, &selector, Some(2)).unwrap();
+
+        let RpcPayload::BoundedContext { context } = rpc_handler_round_trip(
+            &paths,
+            &config,
+            RpcOperation::ReadContext {
+                selector: selector.clone(),
+                options: ContextOptions {
+                    before: 1,
+                    after: 0,
+                    expand_interactions: false,
+                },
+                offset: 0,
+                max_chars: 3,
+            },
+        ) else {
+            panic!("unexpected bounded-context response");
+        };
+        assert_eq!(context.order, "anchor_first");
+        assert_eq!(context.records.len(), 1);
+        assert_eq!(context.records[0].relation, ContextRelation::Anchor);
+        assert_eq!(context.records[0].record.text, "rec");
+        validate_bounded_context(&context, &selector, 0, Some(3)).unwrap();
+
+        let requests = vec![
+            SessionPageRequest {
+                session_id: "session".to_string(),
+                source_path: "a.jsonl".to_string(),
+                offset: 0,
+                limit: 1,
+            },
+            SessionPageRequest {
+                session_id: "session".to_string(),
+                source_path: "b.jsonl".to_string(),
+                offset: 0,
+                limit: 1,
+            },
+        ];
+        let RpcPayload::BoundedSessionPages { pages } = rpc_handler_round_trip(
+            &paths,
+            &config,
+            RpcOperation::ReadSessionPages {
+                requests: requests.clone(),
+                max_chars: 10,
+            },
+        ) else {
+            panic!("unexpected bounded-session response");
+        };
+        assert_eq!(pages[0].records[0].content.returned_chars, 8);
+        assert_eq!(pages[1].records[0].content.returned_chars, 2);
+        validate_bounded_session_pages(&pages, &requests, Some(10)).unwrap();
+
+        let RpcPayload::BoundedSessionPages { pages } = rpc_handler_round_trip(
+            &paths,
+            &config,
+            RpcOperation::ReadSessionPages {
+                requests: requests.clone(),
+                max_chars: 0,
+            },
+        ) else {
+            panic!("unexpected exhausted-session response");
+        };
+        assert!(pages.iter().all(|page| page.records.is_empty()));
+        assert!(pages.iter().all(|page| page.next_offset == Some(0)));
+        validate_bounded_session_pages(&pages, &requests, Some(0)).unwrap();
+    }
+
+    #[test]
+    fn bounded_response_validation_rejects_identity_and_scope_mismatches() {
+        let selector = ContextSelector::doc_id(1);
+        let record = test_record(1, "session", "source.jsonl", 1);
+        let mut budget = ReadBudget::from_remaining(Some(4));
+        let mut bounded = apply_record_budget(record, &mut budget, None, 0).unwrap();
+
+        bounded.record_id = "rid1_wrong".to_string();
+        assert!(validate_bounded_record(&bounded, &selector, Some(4)).is_err());
+
+        bounded.record_id = canonical_record_id(&bounded.record);
+        bounded.record.doc_id = 2;
+        assert!(validate_bounded_record(&bounded, &selector, Some(4)).is_err());
+
+        let request = SessionPageRequest {
+            session_id: "session".to_string(),
+            source_path: "source.jsonl".to_string(),
+            offset: 0,
+            limit: 1,
+        };
+        bounded.record.doc_id = 1;
+        bounded.record_id = canonical_record_id(&bounded.record);
+        bounded.record.session_id = "other".to_string();
+        let page = BoundedSessionPage {
+            session_id: request.session_id.clone(),
+            source_path: request.source_path.clone(),
+            cwd: None,
+            offset: 0,
+            total: 1,
+            next_offset: None,
+            records: vec![bounded],
+        };
+        assert!(validate_bounded_session_pages(&[page], &[request], Some(4)).is_err());
     }
 
     #[test]
@@ -2420,6 +3648,7 @@ mod tests {
             cost_mode: CostMode::Source,
             include_events: false,
             memo_ttl_ms: 0,
+            kind: None,
         };
 
         let local = usage_spec_for_machine(&spec, "local");
@@ -2440,13 +3669,302 @@ mod tests {
     }
 
     #[test]
+    fn default_usage_review_filter_does_not_require_indexed_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        let mut spec = UsageSpec {
+            source: None,
+            project: None,
+            project_grouping: ProjectGrouping::Flat,
+            session_keys: None,
+            machine_session_keys: None,
+            since_ms: None,
+            until_ms: None,
+            cost_mode: CostMode::Source,
+            include_events: false,
+            memo_ttl_ms: 0,
+            kind: None,
+        };
+        for kind in [
+            None,
+            Some(SessionKindFilter::Regular),
+            Some(SessionKindFilter::All),
+        ] {
+            spec.kind = kind;
+            let query = usage_query(&paths, &spec).expect("query without analytics database");
+            assert!(query.session_keys.is_none());
+            assert_eq!(query.include_reviews, kind == Some(SessionKindFilter::All));
+        }
+        spec.session_keys = Some(vec![("codex".into(), "unindexed".into())]);
+        spec.kind = Some(SessionKindFilter::Regular);
+        assert_eq!(
+            usage_query(&paths, &spec).unwrap().session_keys,
+            Some(HashSet::from([("codex".into(), "unindexed".into())]))
+        );
+    }
+
+    #[test]
+    fn usage_query_resolves_origin_filter_against_analytics() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut analytics =
+            AnalyticsWriter::open(analytics_path(&paths.state)).expect("analytics writer");
+        for (session_id, kind) in [("main-ses", None), ("sub-ses", Some("subagent"))] {
+            analytics
+                .record(&Record {
+                    source: SourceKind::Codex,
+                    doc_id: 1,
+                    ts: 10,
+                    project: "memex".to_string(),
+                    session_id: session_id.to_string(),
+                    turn_id: 1,
+                    role: "user".to_string(),
+                    text: "hello".to_string(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links: RecordLinks {
+                        conversation_kind: kind.map(str::to_string),
+                        ..RecordLinks::default()
+                    },
+                    source_path: format!("{session_id}.jsonl"),
+                })
+                .expect("record session");
+        }
+        analytics.flush().expect("flush analytics");
+
+        let spec = |kind: Option<SessionKindFilter>,
+                    session_keys: Option<Vec<(String, String)>>| {
+            UsageSpec {
+                source: None,
+                project: None,
+                project_grouping: ProjectGrouping::Flat,
+                session_keys,
+                machine_session_keys: None,
+                since_ms: None,
+                until_ms: None,
+                cost_mode: CostMode::Source,
+                include_events: false,
+                memo_ttl_ms: 0,
+                kind,
+            }
+        };
+
+        let sub = usage_query(&paths, &spec(Some(SessionKindFilter::Subagent), None))
+            .expect("subagent query");
+        assert_eq!(
+            sub.session_keys,
+            Some(HashSet::from([(
+                "codex".to_string(),
+                "sub-ses".to_string()
+            )]))
+        );
+
+        let primary = usage_query(&paths, &spec(Some(SessionKindFilter::Primary), None))
+            .expect("primary query");
+        assert_eq!(
+            primary.session_keys,
+            Some(HashSet::from([(
+                "codex".to_string(),
+                "main-ses".to_string()
+            )]))
+        );
+
+        let all =
+            usage_query(&paths, &spec(Some(SessionKindFilter::All), None)).expect("all query");
+        assert!(all.session_keys.is_none());
+
+        let none = usage_query(&paths, &spec(None, None)).expect("unfiltered query");
+        assert!(none.session_keys.is_none());
+
+        // An explicit text-search filter intersects with the origin filter.
+        let both = vec![
+            ("codex".to_string(), "main-ses".to_string()),
+            ("codex".to_string(), "sub-ses".to_string()),
+        ];
+        let intersected = usage_query(&paths, &spec(Some(SessionKindFilter::Subagent), Some(both)))
+            .expect("intersected query");
+        assert_eq!(
+            intersected.session_keys,
+            Some(HashSet::from([(
+                "codex".to_string(),
+                "sub-ses".to_string()
+            )]))
+        );
+    }
+
+    #[test]
+    fn sessions_rpc_preserves_exact_identity_and_canonical_resume_command() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.root.join("config.toml"),
+            "codex_resume_cmd = 'configured-resume {session_id} {source_path_shell}'\n",
+        )
+        .unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for (id, path, ts, source) in [
+            ("shared", "/old session.jsonl", 1, SourceKind::Codex),
+            ("shared", "/new.jsonl", 2, SourceKind::Codex),
+            ("other", "/old session.jsonl", 3, SourceKind::Codex),
+            ("shared", "/old session.jsonl", 4, SourceKind::Claude),
+        ] {
+            let mut record = test_record(ts, id, path, 1);
+            record.source = source;
+            record.ts = ts;
+            analytics.record(&record).unwrap();
+        }
+        analytics.flush().unwrap();
+        for (path, count) in [("/old session.jsonl", 1), ("/absent.jsonl", 0)] {
+            let request: crate::cli::SessionsRequest = serde_json::from_value(serde_json::json!({
+                "source": "codex", "session_id": "shared", "source_path": path,
+                "origin": "all", "limit": 1,
+            }))
+            .unwrap();
+            let encoded = serde_json::to_vec(&RpcOperation::Sessions {
+                input: SessionsInput::Request {
+                    request: request.clone(),
+                },
+            })
+            .unwrap();
+            let decoded: RpcOperation = serde_json::from_slice(&encoded).unwrap();
+            let RpcPayload::Sessions { sessions } = handle_rpc(&paths, &config, decoded).unwrap()
+            else {
+                panic!("expected sessions metadata");
+            };
+            assert_eq!(sessions.len(), count);
+            let mcp = crate::cli::mcp_sessions(Some(paths.root.clone()), request).unwrap();
+            assert_eq!(mcp["results"].as_array().unwrap().len(), count);
+            if count == 1 {
+                assert_eq!(sessions[0]["source"], "codex");
+                assert_eq!(sessions[0]["session_id"], "shared");
+                assert_eq!(sessions[0]["source_path"], path);
+                assert_eq!(
+                    sessions[0]["resume_cmd"],
+                    "configured-resume shared '/old session.jsonl'"
+                );
+                assert_eq!(mcp["results"][0]["resume_cmd"], sessions[0]["resume_cmd"]);
+            }
+        }
+    }
+
+    #[test]
+    fn session_count_rpc_counts_exact_identities_with_filters_and_missing_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        let mut records = Vec::new();
+        for (doc, source, path, kind, project) in [
+            (1, SourceKind::Codex, "a.jsonl", None, "memex"),
+            (2, SourceKind::Codex, "b.jsonl", Some("subagent"), "memex"),
+            (3, SourceKind::Claude, "a.jsonl", None, "memex"),
+            (
+                4,
+                SourceKind::Codex,
+                "review.jsonl",
+                Some("guardian_review"),
+                "memex",
+            ),
+            (5, SourceKind::Codex, "other.jsonl", None, "other"),
+        ] {
+            let mut record = test_record(doc, "shared", path, 1);
+            record.source = source;
+            record.project = project.into();
+            record.text = "needle".into();
+            record.ts = 1_700_000_000_000 + doc * 1000;
+            record.links.conversation_kind = kind.map(str::to_string);
+            records.push(record);
+        }
+        let mut duplicate = records[0].clone();
+        duplicate.doc_id = 6;
+        records.push(duplicate);
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for record in &records {
+            analytics.record(record).unwrap();
+        }
+        analytics.flush().unwrap();
+        // Listing groups by repository metadata; lexical search uses indexed project.
+        rusqlite::Connection::open(analytics_path(&paths.state))
+            .unwrap()
+            .execute("UPDATE sessions SET repo_project = project", [])
+            .unwrap();
+        write_test_index(&paths, &records);
+        let count = |filters: serde_json::Value, query: Option<&str>| {
+            let request = serde_json::from_value(filters).unwrap();
+            let encoded = serde_json::to_vec(&RpcOperation::SessionCount {
+                request,
+                query: query.map(str::to_string),
+            })
+            .unwrap();
+            let decoded = serde_json::from_slice(&encoded).unwrap();
+            let RpcPayload::SessionCount { count } = handle_rpc(&paths, &config, decoded).unwrap()
+            else {
+                panic!("expected count");
+            };
+            count.total
+        };
+        for query in [None, Some("needle")] {
+            for (origin, expected) in [
+                ("all", 5),
+                ("regular", 4),
+                ("interactive", 3),
+                ("subagent", 1),
+            ] {
+                assert_eq!(
+                    count(serde_json::json!({"origin": origin, "limit": 1}), query),
+                    Some(expected)
+                );
+            }
+            assert_eq!(
+                count(
+                    serde_json::json!({"source": "codex", "project": "memex"}),
+                    query
+                ),
+                Some(2)
+            );
+            assert_eq!(
+                count(
+                    serde_json::json!({"source": "claude", "session_id": "shared", "source_path": "a.jsonl"}),
+                    query
+                ),
+                Some(1)
+            );
+            assert_eq!(
+                count(
+                    serde_json::json!({"since": "1700000003000", "origin": "all"}),
+                    query
+                ),
+                Some(3)
+            );
+            assert_eq!(
+                count(serde_json::json!({"source_path": "missing"}), query),
+                Some(0)
+            );
+        }
+        assert_eq!(count(serde_json::json!({}), Some("absent")), Some(0));
+        let mut missing = test_record(7, "uncached", "uncached.jsonl", 1);
+        missing.text = "needle".into();
+        records.push(missing);
+        write_test_index(&paths, &records);
+        assert_eq!(count(serde_json::json!({}), Some("needle")), None);
+        assert_eq!(
+            count(serde_json::json!({"origin": "all"}), Some("needle")),
+            Some(6)
+        );
+    }
+
+    #[test]
     fn session_activity_rpc_reads_complete_analytics_history() {
         let tmp = TempDir::new().unwrap();
         let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
         paths.ensure_dirs().unwrap();
         let mut analytics =
             AnalyticsWriter::open(analytics_path(&paths.state)).expect("analytics writer");
-        for (session_id, ts) in [("old", 10), ("new", 20)] {
+        for (session_id, ts) in [("old", 10), ("new", 20), ("review", 30)] {
             analytics
                 .record(&Record {
                     source: SourceKind::Codex,
@@ -2460,7 +3978,11 @@ mod tests {
                     tool_name: None,
                     tool_input: None,
                     tool_output: None,
-                    links: RecordLinks::default(),
+                    links: RecordLinks {
+                        conversation_kind: (session_id == "review")
+                            .then(|| "guardian_review".into()),
+                        ..RecordLinks::default()
+                    },
                     source_path: format!("{session_id}.jsonl"),
                 })
                 .expect("record session");
@@ -2475,6 +3997,7 @@ mod tests {
                 project_grouping: ProjectGrouping::Flat,
                 since_ms: None,
                 until_ms: None,
+                kind: None,
             },
         )
         .expect("session activity");
@@ -2482,21 +4005,39 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].timestamp_ms, 10);
         assert_eq!(points[1].timestamp_ms, 20);
+        let all = session_activity_local(
+            &paths,
+            &SessionActivitySpec {
+                source: Some(SourceFilter::Codex),
+                project: None,
+                project_grouping: ProjectGrouping::Flat,
+                since_ms: None,
+                until_ms: None,
+                kind: Some(SessionKindFilter::All),
+            },
+        )
+        .unwrap();
+        assert_eq!(all.len(), 3);
     }
 
     #[test]
     fn session_feed_keeps_successes_and_machine_provenance() {
-        let session = |id: &str, last_at: u64| SessionDetailRow {
-            source: SourceKind::Codex,
-            session_id: id.to_string(),
-            source_path: format!("{id}.jsonl"),
-            project: "memex".to_string(),
-            repo_project: None,
-            cwd: None,
-            git_root: None,
-            started_at: last_at.saturating_sub(1),
-            last_at,
-            message_count: 1,
+        let session = |id: &str, last_at: u64| SessionListing {
+            resume_cmd: None,
+            session: SessionDetailRow {
+                label: None,
+                conversation_kind: None,
+                source: SourceKind::Codex,
+                session_id: id.to_string(),
+                source_path: format!("{id}.jsonl"),
+                project: "memex".to_string(),
+                repo_project: None,
+                cwd: None,
+                git_root: None,
+                started_at: last_at.saturating_sub(1),
+                last_at,
+                message_count: 1,
+            },
         };
         let result = merge_sessions(
             vec![

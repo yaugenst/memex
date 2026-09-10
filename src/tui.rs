@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionRow, analytics_path};
-use crate::config::{Paths, UserConfig, default_claude_source};
+use crate::config::{Paths, UserConfig, default_claude_sources};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
@@ -73,6 +73,7 @@ enum SearchUpdate {
         range: TimelineRange,
         grouping: ProjectDisplayMode,
         query: String,
+        kind: crate::analytics::SessionKindFilter,
     },
     SearchError {
         request_id: u64,
@@ -140,6 +141,7 @@ struct SearchRequest {
     source: SourceChoice,
     since: Option<u64>,
     grouping: ProjectGrouping,
+    kind: crate::analytics::SessionKindFilter,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -396,6 +398,7 @@ enum HomeDropdown {
     Range,
     Machine,
     Source,
+    Kind,
     Project,
 }
 
@@ -412,6 +415,9 @@ enum SourceChoice {
     Copilot,
     Grok,
     Hermes,
+    Jcode,
+    Muse,
+    Antigravity,
 }
 
 impl SourceChoice {
@@ -427,7 +433,10 @@ impl SourceChoice {
             SourceChoice::OpenClaw => SourceChoice::Copilot,
             SourceChoice::Copilot => SourceChoice::Grok,
             SourceChoice::Grok => SourceChoice::Hermes,
-            SourceChoice::Hermes => SourceChoice::All,
+            SourceChoice::Hermes => SourceChoice::Jcode,
+            SourceChoice::Jcode => SourceChoice::Muse,
+            SourceChoice::Muse => SourceChoice::Antigravity,
+            SourceChoice::Antigravity => SourceChoice::All,
         }
     }
 
@@ -444,6 +453,9 @@ impl SourceChoice {
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
             SourceChoice::Grok => Some(SourceFilter::Grok),
             SourceChoice::Hermes => Some(SourceFilter::Hermes),
+            SourceChoice::Jcode => Some(SourceFilter::Jcode),
+            SourceChoice::Muse => Some(SourceFilter::Muse),
+            SourceChoice::Antigravity => Some(SourceFilter::Antigravity),
         }
     }
 
@@ -460,6 +472,9 @@ impl SourceChoice {
             SourceChoice::Copilot => "copilot",
             SourceChoice::Grok => "grok",
             SourceChoice::Hermes => "hermes",
+            SourceChoice::Jcode => "jcode",
+            SourceChoice::Muse => "muse",
+            SourceChoice::Antigravity => "antigravity",
         }
     }
 
@@ -475,6 +490,9 @@ impl SourceChoice {
             SourceKind::Copilot => SourceChoice::Copilot,
             SourceKind::Grok => SourceChoice::Grok,
             SourceKind::Hermes => SourceChoice::Hermes,
+            SourceKind::Jcode => SourceChoice::Jcode,
+            SourceKind::Muse => SourceChoice::Muse,
+            SourceKind::Antigravity => SourceChoice::Antigravity,
         }
     }
 }
@@ -488,9 +506,12 @@ struct SessionSummary {
     last_ts: u64,
     hit_count: usize,
     top_score: f32,
+    title: String,
     snippet: String,
     source_path: String,
     source_dir: String,
+    label: Option<String>,
+    conversation_kind: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -517,10 +538,13 @@ struct App {
     index: SearchIndex,
     focus: Focus,
     query: String,
+    render_matcher_query: Option<String>,
+    render_matchers: Vec<regex::Regex>,
     project: String,
     machine: String,
     home_machines: Vec<String>,
     source: SourceChoice,
+    session_kind: crate::analytics::SessionKindFilter,
     all_projects: Vec<String>,
     project_options: Vec<String>,
     project_selected: usize,
@@ -541,8 +565,20 @@ struct App {
     timeline_rows: Vec<ProjectTimelineRow>,
     timeline_scroll: usize,
     timeline_selected: usize,
-    timeline_loaded: Option<(SourceChoice, TimelineRange, ProjectDisplayMode, String)>,
-    timeline_displayed: Option<(SourceChoice, TimelineRange, ProjectDisplayMode, String)>,
+    timeline_loaded: Option<(
+        SourceChoice,
+        TimelineRange,
+        ProjectDisplayMode,
+        String,
+        crate::analytics::SessionKindFilter,
+    )>,
+    timeline_displayed: Option<(
+        SourceChoice,
+        TimelineRange,
+        ProjectDisplayMode,
+        String,
+        crate::analytics::SessionKindFilter,
+    )>,
     timeline_state: LoadState,
     active_timeline_request: u64,
     home_activity: Vec<HomeChartPoint>,
@@ -564,6 +600,7 @@ struct App {
     home_range_area: Rect,
     home_machine_area: Rect,
     home_source_area: Rect,
+    home_kind_area: Rect,
     home_project_area: Rect,
     home_sources: Vec<SourceChoice>,
     home_projects: Vec<String>,
@@ -618,6 +655,7 @@ enum PreviewLine {
         project: String,
         source: String,
         session_id: String,
+        kind: Option<String>,
     },
     Meta {
         role: String,
@@ -932,6 +970,8 @@ impl App {
             index,
             focus: Focus::Query,
             query: String::new(),
+            render_matcher_query: None,
+            render_matchers: Vec::new(),
             project: String::new(),
             machine: String::new(),
             home_machines,
@@ -954,11 +994,13 @@ impl App {
             home_range_area: Rect::default(),
             home_machine_area: Rect::default(),
             home_source_area: Rect::default(),
+            home_kind_area: Rect::default(),
             home_project_area: Rect::default(),
             home_sources: Vec::new(),
             home_projects: Vec::new(),
             active_home_filters_request: 0,
             source: SourceChoice::All,
+            session_kind: crate::analytics::SessionKindFilter::Primary,
             all_projects: Vec::new(),
             project_options: Vec::new(),
             project_selected: 0,
@@ -1032,11 +1074,19 @@ impl App {
         self.kickoff_search();
     }
 
+    fn refresh_render_matchers(&mut self) {
+        if self.render_matcher_query.as_deref() != Some(self.query.as_str()) {
+            self.render_matchers = crate::cli::build_matchers(&self.query).unwrap_or_default();
+            self.render_matcher_query = Some(self.query.clone());
+        }
+    }
+
     fn home_chart_is_filtered(&self) -> bool {
         !self.query.trim().is_empty()
             || !self.machine.is_empty()
             || self.source != SourceChoice::All
             || !self.project.trim().is_empty()
+            || self.session_kind != crate::analytics::SessionKindFilter::All
     }
 
     fn home_chart_uses_search_results(&self) -> bool {
@@ -1105,7 +1155,8 @@ impl App {
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;
                 let opts = IngestOptions {
-                    claude_source: default_claude_source(),
+                    backfill_embeddings: false,
+                    claude_sources: default_claude_sources(),
                     include_agents: false,
                     include_reasoning: config.include_reasoning_default(),
                     include_codex: true,
@@ -1116,6 +1167,9 @@ impl App {
                     include_openclaw: true,
                     include_copilot: true,
                     include_grok: true,
+                    include_jcode: true,
+                    include_muse: true,
+                    include_antigravity: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     prune_missing: true,
@@ -1243,6 +1297,7 @@ impl App {
             source: self.source,
             since: self.sessions_since,
             grouping: self.project_display.grouping(),
+            kind: self.session_kind,
         };
         if self.search_request_tx.send(request).is_err() {
             let message = "search worker stopped".to_string();
@@ -1326,11 +1381,12 @@ impl App {
         let query = self.query.trim().to_string();
         let paths = self.paths.clone();
         let tx = self.search_tx.clone();
-        self.timeline_loaded = Some((source, range, grouping, query.clone()));
+        let kind = self.session_kind;
+        self.timeline_loaded = Some((source, range, grouping, query.clone(), kind));
         self.set_status("loading timeline...");
         std::thread::spawn(move || {
             let result =
-                build_project_timeline(&paths, source.as_filter(), range, grouping, &query);
+                build_project_timeline(&paths, source.as_filter(), range, grouping, &query, kind);
             match result {
                 Ok(rows) => {
                     let _ = tx.send(SearchUpdate::Timeline {
@@ -1340,6 +1396,7 @@ impl App {
                         range,
                         grouping,
                         query,
+                        kind,
                     });
                 }
                 Err(err) => {
@@ -1365,6 +1422,7 @@ impl App {
         let config = self.config.clone();
         let machines = self.selected_machines();
         let source = self.source.as_filter();
+        let session_kind = self.session_kind;
         let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
         let project_grouping = self.project_display.grouping();
         let tx = self.search_tx.clone();
@@ -1380,6 +1438,7 @@ impl App {
                         None,
                         project.as_deref(),
                         project_grouping,
+                        Some(session_kind),
                     )?;
                     Ok((
                         rows.into_iter()
@@ -1404,6 +1463,7 @@ impl App {
                         project_grouping,
                         since_ms,
                         until_ms: None,
+                        kind: Some(session_kind),
                     },
                 )
                 .map(|(points, partial)| {
@@ -1463,7 +1523,8 @@ impl App {
                 .map(|(_, source, session_id)| (source.clone(), session_id.clone()))
                 .collect()
         });
-        let query = home_token_usage_query(
+        let session_kind = self.session_kind;
+        let mut query = home_token_usage_query(
             self.source,
             &self.project,
             self.project_display.grouping(),
@@ -1472,6 +1533,7 @@ impl App {
             now_ms(),
             self.paths.state.join("usage-cache.sqlite3"),
         );
+        query.include_reviews = session_kind == crate::analytics::SessionKindFilter::All;
         std::thread::spawn(move || {
             if !config.machines.is_empty() {
                 let result = federated_usage_activity(
@@ -1489,6 +1551,7 @@ impl App {
                         cost_mode: query.cost_mode,
                         include_events: false,
                         memo_ttl_ms: query.memo_ttl_ms,
+                        kind: Some(session_kind),
                     },
                 )
                 .map(|(events, partial)| {
@@ -1519,6 +1582,27 @@ impl App {
                     }),
                 };
                 return;
+            }
+            // A text search already restricts `session_keys` to the
+            // origin-filtered results; with an empty query the usage scan
+            // is otherwise unfiltered, so resolve the origin here.
+            if query.session_keys.is_none()
+                && !matches!(
+                    session_kind,
+                    crate::analytics::SessionKindFilter::All
+                        | crate::analytics::SessionKindFilter::Regular
+                )
+            {
+                match crate::machine::usage_session_keys_for_kind(&paths, session_kind) {
+                    Ok(keys) => query.session_keys = Some(keys),
+                    Err(error) => {
+                        let _ = tx.send(SearchUpdate::HomeTokenActivityError {
+                            request_id,
+                            message: error.to_string(),
+                        });
+                        return;
+                    }
+                }
             }
             let result = scan_usage_activity(&query).map(|(events, partial)| {
                 let points = events
@@ -1609,6 +1693,12 @@ impl App {
                 options.extend(self.home_sources.iter().map(|s| s.label().to_string()));
                 options
             }
+            HomeDropdown::Kind => vec![
+                "all".to_string(),
+                "interactive".to_string(),
+                "subagent".to_string(),
+                "regular".to_string(),
+            ],
             HomeDropdown::Project => {
                 let mut options = vec!["all projects".to_string()];
                 options.extend(self.home_projects.iter().cloned());
@@ -1639,6 +1729,12 @@ impl App {
                 .position(|s| *s == self.source)
                 .map(|idx| idx + 1)
                 .unwrap_or(0),
+            HomeDropdown::Kind => match self.session_kind {
+                crate::analytics::SessionKindFilter::All => 0,
+                crate::analytics::SessionKindFilter::Regular => 3,
+                crate::analytics::SessionKindFilter::Primary => 1,
+                crate::analytics::SessionKindFilter::Subagent => 2,
+            },
             HomeDropdown::Project => self
                 .home_projects
                 .iter()
@@ -1671,11 +1767,14 @@ impl App {
             self.close_home_dropdown();
             return;
         };
-        let refresh_activity = self.home_dropdown == HomeDropdown::Range;
+        let range_selection = self.home_dropdown == HomeDropdown::Range;
+        let previous_range = self.home_activity_range;
         let machine_selection = self.home_dropdown == HomeDropdown::Machine;
         let previous_machine = self.machine.clone();
         let source_selection = self.home_dropdown == HomeDropdown::Source;
         let previous_source = self.source;
+        let kind_selection = self.home_dropdown == HomeDropdown::Kind;
+        let previous_kind = self.session_kind;
         let project_selection = self.home_dropdown == HomeDropdown::Project;
         let previous_project = self.project.clone();
         let refresh_search = match self.home_dropdown {
@@ -1684,7 +1783,10 @@ impl App {
                     .get(idx)
                     .copied()
                     .unwrap_or(TimelineRange::Month);
-                false
+                // The timeframe filters the chart and the recent list alike:
+                // sync the list's `since` bound (All clears it back to None).
+                self.sessions_since = self.home_activity_range.since_ms(now_ms());
+                true
             }
             HomeDropdown::Machine => {
                 self.machine = if idx == 0 {
@@ -1705,6 +1807,16 @@ impl App {
                 };
                 true
             }
+            HomeDropdown::Kind => {
+                self.session_kind = match idx {
+                    0 => crate::analytics::SessionKindFilter::All,
+                    1 => crate::analytics::SessionKindFilter::Primary,
+                    2 => crate::analytics::SessionKindFilter::Subagent,
+                    3 => crate::analytics::SessionKindFilter::Regular,
+                    _ => crate::analytics::SessionKindFilter::Primary,
+                };
+                true
+            }
             HomeDropdown::Project => {
                 self.project = if idx == 0 {
                     String::new()
@@ -1717,18 +1829,21 @@ impl App {
         };
         self.close_home_dropdown();
         let source_changed = source_selection && self.source != previous_source;
+        let kind_changed = kind_selection && self.session_kind != previous_kind;
         let project_changed = project_selection && self.project != previous_project;
         let machine_changed = machine_selection && self.machine != previous_machine;
-        let token_filter_changed = machine_changed || source_changed || project_changed;
+        let range_changed = range_selection && self.home_activity_range != previous_range;
+        let token_filter_changed =
+            machine_changed || source_changed || project_changed || kind_changed;
         if token_filter_changed {
             self.invalidate_home_token_activity();
         }
         if refresh_search {
             self.kickoff_search();
-            if token_filter_changed {
+            if token_filter_changed || range_changed {
                 self.kickoff_home_activity();
             }
-        } else if refresh_activity {
+        } else if range_changed {
             self.kickoff_home_activity();
         }
     }
@@ -1951,13 +2066,15 @@ impl App {
                 range,
                 grouping,
                 query,
+                kind,
             } if request_id == self.active_timeline_request
                 && self.timeline_loaded.as_ref().is_some_and(
-                    |(loaded_source, loaded_range, loaded_grouping, loaded_query)| {
+                    |(loaded_source, loaded_range, loaded_grouping, loaded_query, loaded_kind)| {
                         *loaded_source == source
                             && *loaded_range == range
                             && *loaded_grouping == grouping
                             && loaded_query == &query
+                            && *loaded_kind == kind
                     },
                 ) =>
             {
@@ -1969,7 +2086,7 @@ impl App {
                 };
                 self.timeline_scroll = 0;
                 self.timeline_selected = 0;
-                self.timeline_displayed = Some((source, range, grouping, query));
+                self.timeline_displayed = Some((source, range, grouping, query, kind));
                 self.set_status(format!("{} projects", self.timeline_rows.len()));
             }
             SearchUpdate::SearchError {
@@ -2255,6 +2372,35 @@ impl App {
         }
     }
 
+    fn cycle_session_kind(&mut self) {
+        self.session_kind = match self.session_kind {
+            crate::analytics::SessionKindFilter::Primary => {
+                crate::analytics::SessionKindFilter::All
+            }
+            crate::analytics::SessionKindFilter::All => {
+                crate::analytics::SessionKindFilter::Subagent
+            }
+            crate::analytics::SessionKindFilter::Regular => {
+                crate::analytics::SessionKindFilter::Primary
+            }
+            crate::analytics::SessionKindFilter::Subagent => {
+                crate::analytics::SessionKindFilter::Regular
+            }
+        };
+        let label = match self.session_kind {
+            crate::analytics::SessionKindFilter::Primary => "interactive",
+            crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Regular => "regular",
+            crate::analytics::SessionKindFilter::Subagent => "subagent",
+        };
+        self.set_status(format!("sessions: {label}"));
+        if self.layout_mode == LayoutMode::Timeline {
+            self.kickoff_timeline_load();
+        }
+        self.kickoff_search();
+        self.kickoff_home_activity();
+    }
+
     fn scroll_timeline(&mut self, delta: isize) {
         if self.timeline_rows.is_empty() {
             self.timeline_scroll = 0;
@@ -2303,12 +2449,13 @@ impl App {
             return;
         };
         let project = row.project.clone();
-        let Some((source, range, display, query)) = self.timeline_displayed.clone() else {
+        let Some((source, range, display, query, kind)) = self.timeline_displayed.clone() else {
             self.set_status("timeline context unavailable");
             return;
         };
         self.source = source;
         self.project_display = display;
+        self.session_kind = kind;
         self.query = query;
         self.project = project;
         self.sessions_since = range.since_ms(now_ms());
@@ -2509,6 +2656,9 @@ impl App {
             SourceKind::Grok => "grok",
             SourceKind::Omp => "omp",
             SourceKind::Hermes => "hermes",
+            SourceKind::Jcode => "jcode",
+            SourceKind::Muse => "muse",
+            SourceKind::Antigravity => "antigravity",
         };
         let source_path = session.source_path.clone();
 
@@ -2891,6 +3041,9 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                 app.kickoff_home_activity();
             }
         }
+        KeyCode::Char('c') => {
+            app.cycle_session_kind();
+        }
         KeyCode::Char('[') => {
             app.cycle_timeline_range(-1);
         }
@@ -2956,6 +3109,11 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
     if app.home_dropdown != HomeDropdown::None {
         match key.code {
             KeyCode::Esc => {
+                app.close_home_dropdown();
+            }
+            // `c` toggles the kind dropdown closed; `k` must keep moving
+            // the selection up like in every other dropdown.
+            KeyCode::Char('c') if app.home_dropdown == HomeDropdown::Kind => {
                 app.close_home_dropdown();
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -3059,6 +3217,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         KeyCode::Char('s') => {
             app.open_home_dropdown(HomeDropdown::Source);
         }
+        KeyCode::Char('c') => {
+            app.open_home_dropdown(HomeDropdown::Kind);
+        }
         KeyCode::Char('p') => {
             app.open_home_dropdown(HomeDropdown::Project);
         }
@@ -3151,6 +3312,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     app.home_range_area = Rect::default();
     app.home_machine_area = Rect::default();
     app.home_source_area = Rect::default();
+    app.home_kind_area = Rect::default();
     app.home_project_area = Rect::default();
     app.home_dropdown_area = Rect::default();
     if area.width < 8 || area.height < 4 {
@@ -3333,7 +3495,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     );
     y += 4;
 
-    // Header row: label on the left, machine/source/project dropdown anchors on the right.
+    // Header row: label on the left, machine/source/kind/project dropdown anchors on the right.
     let searching = !app.query.trim().is_empty();
     let header_area = col(y, 1);
     let mut header_spans = vec![Span::styled(
@@ -3359,6 +3521,15 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         String::new()
     };
     let source_word = format!("{} ▾", app.source.label());
+    let origin_word = format!(
+        "{} ▾",
+        match app.session_kind {
+            crate::analytics::SessionKindFilter::Primary => "interactive",
+            crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Regular => "regular",
+            crate::analytics::SessionKindFilter::Subagent => "subagent",
+        }
+    );
     let project_word = format!(
         "{} ▾",
         if app.project.trim().is_empty() {
@@ -3369,6 +3540,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     );
     let machine_width = machine_word.chars().count() as u16;
     let source_width = source_word.chars().count() as u16;
+    let origin_width = origin_word.chars().count() as u16;
     let project_width_hdr = project_word.chars().count() as u16;
     let header_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -3378,12 +3550,15 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             Constraint::Length(if machine_width > 0 { 3 } else { 0 }),
             Constraint::Length(source_width),
             Constraint::Length(3),
+            Constraint::Length(origin_width),
+            Constraint::Length(3),
             Constraint::Length(project_width_hdr),
         ])
         .split(header_area);
     app.home_machine_area = header_cols[1];
     app.home_source_area = header_cols[3];
-    app.home_project_area = header_cols[5];
+    app.home_kind_area = header_cols[5];
+    app.home_project_area = header_cols[7];
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header_cols[0]);
     let machine_style = if app.machine.is_empty() {
         theme.muted
@@ -3391,6 +3566,11 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         theme.accent
     };
     let source_style = if app.source == SourceChoice::All {
+        theme.muted
+    } else {
+        theme.accent
+    };
+    let kind_style = if app.session_kind == crate::analytics::SessionKindFilter::All {
         theme.muted
     } else {
         theme.accent
@@ -3411,8 +3591,12 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         header_cols[3],
     );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        Paragraph::new(Line::from(Span::styled(origin_word, kind_style))),
         header_cols[5],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        header_cols[7],
     );
     y += 1;
 
@@ -3446,14 +3630,15 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     }
 
     let (project_width, detail_width) = session_row_layout(&app.results, col_width as usize);
-    let terms = query_terms(&app.query);
+    app.refresh_render_matchers();
+    let matchers = &app.render_matchers;
     let items: Vec<ListItem> = app
         .results
         .iter()
         .map(|session| {
             ListItem::new(session_result_line(
                 session,
-                &terms,
+                matchers,
                 project_width,
                 detail_width,
                 theme,
@@ -3486,20 +3671,15 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
         HomeDropdown::Range => app.home_range_area,
         HomeDropdown::Machine => app.home_machine_area,
         HomeDropdown::Source => app.home_source_area,
+        HomeDropdown::Kind => app.home_kind_area,
         HomeDropdown::Project => app.home_project_area,
         HomeDropdown::None => Rect::default(),
     };
     if anchor.width == 0 {
         return;
     }
-    let width = options
-        .iter()
-        .map(|o| o.chars().count())
-        .max()
-        .unwrap_or(8)
-        .clamp(8, 32) as u16
-        + 2;
-    let width = width.min(area.width);
+    let max_len = options.iter().map(|o| o.chars().count()).max().unwrap_or(8);
+    let width = ((max_len as u16).clamp(8, 42) + 2).min(area.width);
     let x = anchor
         .right()
         .saturating_sub(width)
@@ -3576,6 +3756,7 @@ fn home_token_usage_query(
         // The chart consumes `scan_usage_activity`, which projects points straight from
         // the memoized assembly; full event details are never materialized.
         include_events: false,
+        include_reviews: false,
         cache_path: Some(cache_path),
         // Keystrokes and result updates re-run this query with different post-assembly
         // filters; reuse the assembled scan between them instead of re-reading logs. On a
@@ -3849,40 +4030,12 @@ fn timeline_chart_row_line(cells: &[(char, Color)], selected: bool) -> Line<'sta
     line
 }
 
-fn query_terms(query: &str) -> Vec<Vec<char>> {
-    let mut seen = HashSet::new();
-    let mut terms = Vec::new();
-    for part in query.split_whitespace() {
-        let cleaned = part.trim_matches(|c: char| !c.is_alphanumeric());
-        if cleaned.chars().count() < 2 {
-            continue;
-        }
-        let key = cleaned.to_lowercase();
-        if seen.insert(key.clone()) {
-            terms.push(key.chars().collect());
-        }
-    }
-    terms
-}
-
-fn find_term(hay: &[char], term: &[char], from: usize) -> Option<usize> {
-    if term.is_empty() || hay.len() < term.len() || from > hay.len() - term.len() {
-        return None;
-    }
-    (from..=hay.len() - term.len()).find(|&i| {
-        hay[i..i + term.len()]
-            .iter()
-            .zip(term)
-            .all(|(a, b)| a.to_ascii_lowercase() == *b)
-    })
-}
-
 /// Renders a window of `text` around the first query-term hit, with every
 /// term occurrence inside the window emphasized. Falls back to a plain
 /// truncated snippet when no term matches literally (e.g. embedding hits).
 fn match_context_spans(
     text: &str,
-    terms: &[Vec<char>],
+    matchers: &[regex::Regex],
     width: usize,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
@@ -3890,10 +4043,19 @@ fn match_context_spans(
         return Vec::new();
     }
     let chars: Vec<char> = text.chars().collect();
-    let first = terms
+    let mut matches: Vec<(usize, usize, usize)> = matchers
         .iter()
-        .filter_map(|term| find_term(&chars, term, 0))
-        .min();
+        .enumerate()
+        .flat_map(|(matcher_index, matcher)| {
+            matcher.find_iter(text).map(move |found| {
+                let start = text[..found.start()].chars().count();
+                let len = text[found.start()..found.end()].chars().count();
+                (start, start + len, matcher_index)
+            })
+        })
+        .collect();
+    matches.sort_unstable_by_key(|(start, _, matcher_index)| (*start, *matcher_index));
+    let first = matches.first().map(|(start, _, _)| *start);
     let Some(first) = first else {
         return vec![Span::styled(truncate_end(text, width), theme.muted)];
     };
@@ -3906,24 +4068,18 @@ fn match_context_spans(
     }
     let mut i = start;
     while i < end {
-        let mut best: Option<(usize, usize)> = None;
-        for term in terms {
-            if let Some(pos) = find_term(&chars, term, i)
-                && pos < end
-                && best.is_none_or(|(bp, _)| pos < bp)
-            {
-                best = Some((pos, term.len()));
-            }
-        }
-        match best {
-            Some((pos, len)) => {
+        let next = matches
+            .iter()
+            .find(|(match_start, _, _)| *match_start >= i && *match_start < end);
+        match next {
+            Some(&(pos, match_end, _)) => {
                 if pos > i {
                     spans.push(Span::styled(
                         chars[i..pos].iter().collect::<String>(),
                         theme.muted,
                     ));
                 }
-                let match_end = (pos + len).min(end);
+                let match_end = match_end.min(end);
                 spans.push(Span::styled(
                     chars[pos..match_end].iter().collect::<String>(),
                     theme.text_bold,
@@ -3957,6 +4113,9 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Copilot => label == "copilot",
         SourceChoice::Grok => label == "grok",
         SourceChoice::Hermes => label == "hermes",
+        SourceChoice::Jcode => label == "jcode",
+        SourceChoice::Muse => label == "muse",
+        SourceChoice::Antigravity => label == "antigravity",
         SourceChoice::All => false,
     }
 }
@@ -3973,6 +4132,9 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Copilot => Color::Rgb(140, 160, 220),
         SourceKind::Grok => Color::Rgb(255, 120, 90),
         SourceKind::Hermes => Color::Rgb(190, 150, 220),
+        SourceKind::Jcode => Color::Rgb(220, 140, 180),
+        SourceKind::Muse => Color::Rgb(180, 130, 240),
+        SourceKind::Antigravity => Color::Rgb(120, 200, 140),
     }
 }
 
@@ -4011,7 +4173,7 @@ fn session_row_layout(results: &[SessionSummary], total_width: usize) -> (usize,
 /// (or the session id when there's no snippet to show).
 fn session_result_line(
     session: &SessionSummary,
-    terms: &[Vec<char>],
+    matchers: &[regex::Regex],
     project_width: usize,
     detail_width: usize,
     theme: &Theme,
@@ -4035,14 +4197,47 @@ fn session_result_line(
         ),
         Span::raw("  "),
     ];
+    // Show label/title when there is no search snippet (recent/home view), badge subagents
+    let is_subagent = session
+        .conversation_kind
+        .as_deref()
+        .is_some_and(|k| k != "main");
     if session.snippet.is_empty() {
-        spans.push(Span::styled(
-            truncate_middle(&session.session_id, detail_width),
-            theme.muted,
-        ));
+        if let Some(label) = session.label.as_deref().filter(|s| !s.is_empty()) {
+            let mut detail = truncate_middle(label, detail_width);
+            if is_subagent {
+                // Prepend a subtle subagent indicator; keep width calculation simple
+                detail = format!("[sub] {detail}");
+                if detail.chars().count() > detail_width {
+                    detail = truncate_middle(&detail, detail_width);
+                }
+            }
+            spans.push(Span::styled(detail, theme.text));
+        } else if !session.title.is_empty() {
+            let title = strip_ansi_and_controls(&session.title);
+            let mut detail = truncate_end(&title, detail_width);
+            if is_subagent {
+                detail = format!("[sub] {detail}");
+                if detail.chars().count() > detail_width {
+                    detail = truncate_middle(&detail, detail_width);
+                }
+            }
+            spans.push(Span::styled(detail, theme.text));
+        } else {
+            spans.push(Span::styled(
+                truncate_middle(&session.session_id, detail_width),
+                theme.muted,
+            ));
+        }
     } else {
         let snippet = strip_ansi_and_controls(&session.snippet);
-        spans.extend(match_context_spans(&snippet, terms, detail_width, theme));
+        if is_subagent {
+            spans.push(Span::styled(
+                "[sub] ",
+                Style::default().fg(Color::Rgb(160, 120, 80)),
+            ));
+        }
+        spans.extend(match_context_spans(&snippet, matchers, detail_width, theme));
     }
     Line::from(spans)
 }
@@ -4288,13 +4483,14 @@ fn draw_sessions_panel(
         // Same mini-search-result rows as the home screen list.
         let (project_width, detail_width) =
             session_row_layout(&app.results, content.width as usize);
-        let terms = query_terms(&app.query);
+        app.refresh_render_matchers();
+        let matchers = &app.render_matchers;
         app.results
             .iter()
             .map(|session| {
                 ListItem::new(session_result_line(
                     session,
-                    &terms,
+                    matchers,
                     project_width,
                     detail_width,
                     theme,
@@ -4746,6 +4942,22 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         right_spans.push(Span::styled(app.source.label(), theme.accent));
         right_spans.push(Span::raw("   "));
     }
+    if app.session_kind != crate::analytics::SessionKindFilter::All
+        || app.layout_mode == LayoutMode::Home
+        || app.layout_mode == LayoutMode::List
+        || app.layout_mode == LayoutMode::Split
+    {
+        let kind_label = match app.session_kind {
+            crate::analytics::SessionKindFilter::Primary => "interactive",
+            crate::analytics::SessionKindFilter::Subagent => "subagent",
+            crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Regular => "regular",
+        };
+        right_spans.push(Span::styled("origin ", theme.muted));
+        right_spans.push(Span::styled("(c) ", theme.accent));
+        right_spans.push(Span::styled(kind_label, theme.text));
+        right_spans.push(Span::raw("   "));
+    }
     if app.layout_mode == LayoutMode::Timeline {
         right_spans.push(Span::styled("source", theme.muted));
         right_spans.push(Span::styled("(s) ", theme.accent));
@@ -4841,6 +5053,8 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled(" timeframe  ", theme.muted),
             Span::styled("s", theme.accent),
             Span::styled(" source  ", theme.muted),
+            Span::styled("c", theme.accent),
+            Span::styled(" origin  ", theme.muted),
             Span::styled("p", theme.accent),
             Span::styled(" projects  ", theme.muted),
             Span::styled("/", theme.accent),
@@ -5007,8 +5221,9 @@ fn sessions_from_query(
     };
     let results = index.search(&options)?;
     let mut sessions: HashMap<String, SessionSummary> = HashMap::new();
+    let matchers = crate::cli::build_matchers(query)?;
     for (score, record) in results {
-        add_record_to_session(&mut sessions, score, record);
+        add_record_to_session(&mut sessions, score, record, &matchers);
     }
     let mut out: Vec<SessionSummary> = sessions.into_values().collect();
     out.sort_by(|a, b| {
@@ -5060,7 +5275,7 @@ fn sessions_from_recent(
         {
             continue;
         }
-        add_record_to_session(&mut sessions, 0.0, record);
+        add_record_to_session(&mut sessions, 0.0, record, &[]);
         if sessions.len() >= RECENT_SESSIONS_LIMIT {
             break;
         }
@@ -5070,6 +5285,7 @@ fn sessions_from_recent(
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn sessions_from_analytics(
     paths: &Paths,
     source: Option<SourceFilter>,
@@ -5077,18 +5293,44 @@ fn sessions_from_analytics(
     project: Option<&str>,
     grouping: ProjectGrouping,
 ) -> Result<Vec<SessionSummary>> {
+    sessions_from_analytics_filtered(paths, source, since, project, grouping, None)
+}
+
+fn sessions_from_analytics_filtered(
+    paths: &Paths,
+    source: Option<SourceFilter>,
+    since: Option<u64>,
+    project: Option<&str>,
+    grouping: ProjectGrouping,
+    kind: Option<crate::analytics::SessionKindFilter>,
+) -> Result<Vec<SessionSummary>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-    let rows = store.query_sessions(
-        source,
-        since,
-        project,
-        grouping,
-        Some(RECENT_SESSIONS_LIMIT),
-    )?;
+    let rows = if kind.is_some() {
+        store.query_sessions_filtered(
+            source,
+            since,
+            project,
+            grouping,
+            kind,
+            Some(RECENT_SESSIONS_LIMIT),
+        )?
+    } else {
+        store.query_sessions(
+            source,
+            since,
+            project,
+            grouping,
+            Some(RECENT_SESSIONS_LIMIT),
+        )?
+    };
     if rows.is_empty() {
         anyhow::bail!("no analytics sessions");
     }
     Ok(rows.into_iter().map(session_summary_from_row).collect())
+}
+
+fn session_matches_kind(filter: crate::analytics::SessionKindFilter, kind: Option<&str>) -> bool {
+    filter.matches_kind(kind)
 }
 
 fn session_summary_from_row(row: SessionRow) -> SessionSummary {
@@ -5100,10 +5342,56 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
         last_ts: row.last_at,
         hit_count: row.message_count.max(1) as usize,
         top_score: 0.0,
+        title: String::new(),
         snippet: String::new(),
-        source_dir: row.cwd.unwrap_or_else(|| parent_dir(&row.source_path)),
+        source_dir: row
+            .cwd
+            .clone()
+            .unwrap_or_else(|| parent_dir(&row.source_path)),
         source_path: row.source_path,
+        label: row.label,
+        conversation_kind: row.conversation_kind,
     }
+}
+
+fn enrich_session_titles(index: &SearchIndex, sessions: &mut [SessionSummary]) {
+    let codex_ids = sessions
+        .iter()
+        .filter(|session| session.source == SourceKind::Codex)
+        .map(|session| session.session_id.clone())
+        .collect::<Vec<_>>();
+    let codex_titles = crate::sources::codex::session_titles(&codex_ids);
+
+    for session in sessions {
+        let source_title = match session.source {
+            SourceKind::Codex => codex_titles.get(&session.session_id).cloned(),
+            SourceKind::Claude => crate::sources::claude::session_title(
+                std::path::Path::new(&session.source_path),
+                &session.session_id,
+            ),
+            _ => None,
+        };
+        session.title = source_title
+            .or_else(|| first_user_prompt(index, session))
+            .map(|title| summarize(&title, 120))
+            .unwrap_or_default();
+    }
+}
+
+fn first_user_prompt(index: &SearchIndex, session: &SessionSummary) -> Option<String> {
+    let mut records = index.records_by_session_id(&session.session_id).ok()?;
+    records.retain(|record| {
+        record.source_path == session.source_path
+            && record.role == "user"
+            && !record.text.trim().is_empty()
+    });
+    records.sort_by(|left, right| {
+        left.turn_id
+            .cmp(&right.turn_id)
+            .then_with(|| left.ts.cmp(&right.ts))
+            .then_with(|| left.doc_id.cmp(&right.doc_id))
+    });
+    records.into_iter().next().map(|record| record.text)
 }
 
 fn enrich_session_projects(
@@ -5161,19 +5449,27 @@ fn build_project_timeline(
     range: TimelineRange,
     display: ProjectDisplayMode,
     query: &str,
+    kind: crate::analytics::SessionKindFilter,
 ) -> Result<Vec<ProjectTimelineRow>> {
     let now = now_ms();
     let since = range.since_ms(now);
     let rows: Vec<SessionSummary> = if query.trim().is_empty() {
         let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
         store
-            .query_sessions(source, since, None, display.grouping(), None)?
+            .query_sessions_filtered(source, since, None, display.grouping(), Some(kind), None)?
             .into_iter()
             .map(session_summary_from_row)
             .collect()
     } else {
         let index = SearchIndex::open_or_create(&paths.index)?;
-        let mut sessions = sessions_from_query(&index, query, source, None, since, RESULT_LIMIT)?;
+        let record_limit = if kind == crate::analytics::SessionKindFilter::All {
+            RESULT_LIMIT
+        } else {
+            RESULT_LIMIT * 5
+        };
+        let mut sessions = sessions_from_query(&index, query, source, None, since, record_limit)?;
+        sessions.retain(|session| kind.matches_kind(session.conversation_kind.as_deref()));
+        sessions.truncate(RESULT_LIMIT);
         enrich_session_projects(paths, &mut sessions, display.grouping());
         sessions
     };
@@ -5213,7 +5509,9 @@ fn add_record_to_session(
     sessions: &mut HashMap<String, SessionSummary>,
     score: f32,
     record: Record,
+    matchers: &[regex::Regex],
 ) {
+    let label = record.links.conversation_kind.clone();
     let entry = sessions
         .entry(record.session_id.clone())
         .or_insert(SessionSummary {
@@ -5224,17 +5522,28 @@ fn add_record_to_session(
             last_ts: record.ts,
             hit_count: 0,
             top_score: score,
-            snippet: summarize(&record.text, 160),
+            title: String::new(),
+            snippet: crate::cli::match_preview(&record.text, matchers, 160),
             source_path: record.source_path.clone(),
             source_dir: parent_dir(&record.source_path),
+            label: None,
+            conversation_kind: label.clone(),
         });
     entry.hit_count += 1;
+    // Prefer an explicit "main": sidechain/compaction lines inside a primary
+    // session must not determine the grouped kind (mirrors the analytics
+    // accumulator).
+    let main_claim = record.links.conversation_kind.as_deref() == Some("main");
+    if (entry.conversation_kind.is_none() || main_claim) && record.links.conversation_kind.is_some()
+    {
+        entry.conversation_kind = record.links.conversation_kind.clone();
+    }
     if record.ts > entry.last_ts {
         entry.last_ts = record.ts;
     }
     if score >= entry.top_score {
         entry.top_score = score;
-        let snippet = summarize(&record.text, 160);
+        let snippet = crate::cli::match_preview(&record.text, matchers, 160);
         if !snippet.is_empty() {
             entry.snippet = snippet;
         }
@@ -5246,6 +5555,7 @@ fn add_record_to_session(
 fn add_located_record_to_session(
     sessions: &mut HashMap<String, SessionSummary>,
     located: crate::machine::LocatedRecord,
+    matchers: &[regex::Regex],
 ) {
     let machine = located.machine;
     let score = located.score;
@@ -5265,15 +5575,26 @@ fn add_located_record_to_session(
         last_ts: record.ts,
         hit_count: 0,
         top_score: score,
-        snippet: summarize(&record.text, 160),
+        title: String::new(),
+        snippet: crate::cli::match_preview(&record.text, matchers, 160),
         source_path: record.source_path.clone(),
         source_dir: parent_dir(&record.source_path),
+        label: None,
+        conversation_kind: record.links.conversation_kind.clone(),
     });
     entry.hit_count += 1;
+    // Prefer an explicit "main": sidechain/compaction lines inside a primary
+    // session must not determine the grouped kind (mirrors the analytics
+    // accumulator).
+    let main_claim = record.links.conversation_kind.as_deref() == Some("main");
+    if (entry.conversation_kind.is_none() || main_claim) && record.links.conversation_kind.is_some()
+    {
+        entry.conversation_kind = record.links.conversation_kind.clone();
+    }
     entry.last_ts = entry.last_ts.max(record.ts);
     if score >= entry.top_score {
         entry.top_score = score;
-        let snippet = summarize(&record.text, 160);
+        let snippet = crate::cli::match_preview(&record.text, matchers, 160);
         if !snippet.is_empty() {
             entry.snippet = snippet;
         }
@@ -5365,6 +5686,7 @@ fn run_search_request(
         };
         let failures = federated.failures;
         let mut by_session = HashMap::new();
+        let matchers = crate::cli::build_matchers(&request.query)?;
         for located in federated.items {
             if request.since.is_some_and(|since| located.record.ts < since) {
                 continue;
@@ -5376,7 +5698,7 @@ fn run_search_request(
             {
                 continue;
             }
-            add_located_record_to_session(&mut by_session, located);
+            add_located_record_to_session(&mut by_session, located, &matchers);
         }
         let mut sessions: Vec<_> = by_session.into_values().collect();
         if request.query.is_empty() {
@@ -5393,21 +5715,37 @@ fn run_search_request(
         if let Some(project) = project {
             sessions.retain(|session| session.project == project);
         }
+        sessions.retain(|session| {
+            session_matches_kind(request.kind, session.conversation_kind.as_deref())
+        });
         sessions.truncate(RESULT_LIMIT);
         return Ok((sessions, failures));
     }
     if request.query.is_empty() {
-        return sessions_from_analytics(
+        let mut sessions = sessions_from_analytics_filtered(
             paths,
             request.source.as_filter(),
             request.since,
             project,
             request.grouping,
+            Some(request.kind),
         )
         .or_else(|_| {
-            sessions_from_recent(index, request.source.as_filter(), request.since, project)
-        })
-        .map(|sessions| (sessions, Vec::new()));
+            let mut sessions =
+                sessions_from_recent(index, request.source.as_filter(), request.since, project)?;
+            sessions.retain(|session| {
+                session_matches_kind(request.kind, session.conversation_kind.as_deref())
+            });
+            if sessions.is_empty() {
+                anyhow::bail!("no analytics sessions");
+            }
+            Ok(sessions)
+        })?;
+        enrich_session_titles(index, &mut sessions);
+        sessions.retain(|session| {
+            session_matches_kind(request.kind, session.conversation_kind.as_deref())
+        });
+        return Ok((sessions, Vec::new()));
     }
 
     let tantivy_project = if request.grouping == ProjectGrouping::Flat {
@@ -5415,18 +5753,29 @@ fn run_search_request(
     } else {
         None
     };
+    // Over-fetch when an origin filter is active: the kind filter applies
+    // after grouping, so capping the record query at RESULT_LIMIT first
+    // could starve interactive matches in subagent-heavy corpora.
+    let record_limit = if request.kind == crate::analytics::SessionKindFilter::All {
+        RESULT_LIMIT
+    } else {
+        RESULT_LIMIT * 5
+    };
     let mut sessions = sessions_from_query(
         index,
         &request.query,
         request.source.as_filter(),
         tantivy_project,
         request.since,
-        RESULT_LIMIT,
+        record_limit,
     )?;
     enrich_session_projects(paths, &mut sessions, request.grouping);
     if let Some(project) = project {
         sessions.retain(|session| session.project == project);
     }
+    sessions
+        .retain(|session| session_matches_kind(request.kind, session.conversation_kind.as_deref()));
+    sessions.truncate(RESULT_LIMIT);
     Ok((sessions, Vec::new()))
 }
 
@@ -5506,6 +5855,7 @@ fn build_detail_lines_from_records(
             format!("{}:{}", session.machine, session.source.label())
         },
         session_id: session.session_id.clone(),
+        kind: session.conversation_kind.clone(),
     }];
     if records.is_empty() {
         lines.push(PreviewLine::Text("no records in session".to_string()));
@@ -6157,16 +6507,25 @@ fn render_preview_line<'a>(line: &'a PreviewLine, theme: &Theme) -> Line<'a> {
             project,
             source,
             session_id,
-        } => Line::from(vec![
-            Span::styled("project ", theme.muted),
-            Span::styled(project.as_str(), theme.accent),
-            Span::raw("  "),
-            Span::styled("source ", theme.muted),
-            Span::styled(source.as_str(), theme.muted),
-            Span::raw("  "),
-            Span::styled("session ", theme.muted),
-            Span::styled(session_id.as_str(), theme.text),
-        ]),
+            kind,
+        } => {
+            let mut spans = vec![
+                Span::styled("project ", theme.muted),
+                Span::styled(project.as_str(), theme.accent),
+                Span::raw("  "),
+                Span::styled("source ", theme.muted),
+                Span::styled(source.as_str(), theme.muted),
+                Span::raw("  "),
+                Span::styled("session ", theme.muted),
+                Span::styled(session_id.as_str(), theme.text),
+            ];
+            if let Some(kind_str) = kind.as_deref().filter(|s| !s.is_empty()) {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("origin ", theme.muted));
+                spans.push(Span::styled(kind_str, theme.accent));
+            }
+            Line::from(spans)
+        }
         PreviewLine::Meta {
             role,
             ts,
@@ -6486,6 +6845,8 @@ fn handle_home_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut Ap
                 app.open_home_dropdown(HomeDropdown::Machine);
             } else if app.home_source_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Source);
+            } else if app.home_kind_area.contains(pos) {
+                app.open_home_dropdown(HomeDropdown::Kind);
             } else if app.home_project_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Project);
             } else if app.home_list_area.contains(pos) && app.home_list_area.height > 0 {
@@ -6742,7 +7103,9 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 mod tests {
     use super::*;
     use crate::types::{RecordLinks, SourceKind};
-    use ratatui::{backend::TestBackend, buffer::Buffer, widgets::Widget};
+    use ratatui::{
+        TerminalOptions, Viewport, backend::TestBackend, buffer::Buffer, widgets::Widget,
+    };
     use std::hint::black_box;
 
     fn create_stale_schema_index(dir: &std::path::Path) {
@@ -6823,6 +7186,117 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
         }
+    }
+
+    #[test]
+    fn grouped_search_previews_keep_late_matches_visible() {
+        let theme = Theme::new();
+        let matchers = crate::cli::build_matchers("fireduck").unwrap();
+        for federated in [false, true] {
+            let mut sessions = HashMap::new();
+            // Exercise both initial insertion and replacement by a better hit.
+            for (score, word) in [(1.0, "fireduck"), (2.0, "FIREDUCK")] {
+                let text = format!(
+                    "{} {word} matching output",
+                    "Script completed 日志 ".repeat(100)
+                );
+                let hit = record("tool", &text);
+                if federated {
+                    add_located_record_to_session(
+                        &mut sessions,
+                        crate::machine::LocatedRecord {
+                            machine: "remote".to_string(),
+                            score,
+                            record: hit,
+                        },
+                        &matchers,
+                    );
+                } else {
+                    add_record_to_session(&mut sessions, score, hit, &matchers);
+                }
+                let summary = sessions.values().next().unwrap();
+                assert!(summary.snippet.contains(word));
+                assert!(summary.snippet.chars().count() <= 160);
+                let spans = match_context_spans(&summary.snippet, &matchers, 50, &theme);
+                assert!(spans.iter().any(|span| {
+                    span.content == word && span.style.add_modifier.contains(Modifier::BOLD)
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn fielded_query_session_row_keeps_late_match_visible_at_minimum_width() {
+        let theme = Theme::new();
+        let matchers = crate::cli::build_matchers("text:fireduck").unwrap();
+        let text = format!(
+            "{}fireduck matching output",
+            "far away context ".repeat(100)
+        );
+        let mut sessions = HashMap::new();
+        add_record_to_session(&mut sessions, 1.0, record("assistant", &text), &matchers);
+
+        let line = session_result_line(&sessions["session"], &matchers, 8, 16, &theme);
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(rendered.contains("fireduck"));
+        assert!(line.spans.iter().any(|span| {
+            span.content == "fireduck" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn plain_quoted_query_keeps_component_matches_highlighted() {
+        let theme = Theme::new();
+        let matchers = crate::cli::build_matchers("\"fireduck engine\"").unwrap();
+        let spans = match_context_spans(
+            "context before fireduck engine context after",
+            &matchers,
+            40,
+            &theme,
+        );
+
+        for expected in ["fireduck", "engine"] {
+            assert!(spans.iter().any(|span| {
+                span.content == expected && span.style.add_modifier.contains(Modifier::BOLD)
+            }));
+        }
+    }
+
+    #[test]
+    fn grouped_preview_without_literal_match_keeps_prefix() {
+        for query in ["", "project:memex", "absent"] {
+            let matchers = crate::cli::build_matchers(query).unwrap();
+            let mut sessions = HashMap::new();
+            add_record_to_session(
+                &mut sessions,
+                1.0,
+                record("assistant", "Readable message prefix"),
+                &matchers,
+            );
+            assert_eq!(sessions["session"].snippet, "Readable message prefix");
+        }
+    }
+
+    #[test]
+    fn grouped_session_prefers_main_over_side_records() {
+        let mut sessions = std::collections::HashMap::new();
+        let mut side = record("assistant", "sidechain output");
+        side.links.conversation_kind = Some("sidechain".to_string());
+        add_record_to_session(&mut sessions, 1.0, side, &[]);
+        let mut main = record("user", "please fix the parser");
+        main.links.conversation_kind = Some("main".to_string());
+        add_record_to_session(&mut sessions, 0.5, main, &[]);
+        let summary = sessions.get("session").expect("grouped");
+        assert_eq!(summary.conversation_kind.as_deref(), Some("main"));
+        assert!(session_matches_kind(
+            crate::analytics::SessionKindFilter::Primary,
+            summary.conversation_kind.as_deref()
+        ));
     }
 
     fn markdown_perf_records() -> Vec<Record> {
@@ -6998,6 +7472,62 @@ mod tests {
     }
 
     #[test]
+    fn render_matcher_cache_refreshes_for_exact_query_changes() {
+        let (_tmp, mut app) = test_app();
+        app.query = "text:fireduck".to_string();
+        app.refresh_render_matchers();
+        assert_eq!(app.render_matcher_query.as_deref(), Some("text:fireduck"));
+        assert!(
+            app.render_matchers
+                .iter()
+                .any(|matcher| matcher.is_match("FIREDUCK"))
+        );
+
+        app.query = "text:needlé".to_string();
+        app.refresh_render_matchers();
+        assert_eq!(app.render_matcher_query.as_deref(), Some("text:needlé"));
+        assert!(
+            app.render_matchers
+                .iter()
+                .any(|matcher| matcher.is_match("NEEDLÉ"))
+        );
+        assert!(
+            !app.render_matchers
+                .iter()
+                .any(|matcher| matcher.is_match("fireduck"))
+        );
+    }
+
+    #[test]
+    fn recent_session_row_shows_title_instead_of_uuid() {
+        let session = SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            session_id: "01a00000-0000-0000-0000-000000000000".to_string(),
+            project: "memex".to_string(),
+            source: SourceKind::Codex,
+            last_ts: 1,
+            hit_count: 1,
+            top_score: 0.0,
+            title: "Readable session title".to_string(),
+            snippet: String::new(),
+            source_path: "source.jsonl".to_string(),
+            source_dir: String::new(),
+            label: None,
+            conversation_kind: None,
+        };
+
+        let line = session_result_line(&session, &[], 8, 40, &Theme::new());
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("Readable session title"));
+        assert!(!rendered.contains("01a00000"));
+    }
+
+    #[test]
     fn enter_browse_switches_to_split_and_selects_first() {
         let (_tmp, mut app) = test_app();
         app.results.push(SessionSummary {
@@ -7008,9 +7538,12 @@ mod tests {
             last_ts: 1,
             hit_count: 1,
             top_score: 0.0,
+            title: String::new(),
             snippet: String::new(),
             source_path: "source.jsonl".to_string(),
             source_dir: String::new(),
+            label: None,
+            conversation_kind: None,
         });
         app.enter_browse();
         assert_eq!(app.layout_mode, LayoutMode::Split);
@@ -7127,6 +7660,7 @@ mod tests {
         assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
 
         app.source = SourceChoice::All;
+        app.session_kind = crate::analytics::SessionKindFilter::All;
         app.config.machines.push(crate::config::MachineConfig {
             id: "mini".to_string(),
             label: None,
@@ -7138,6 +7672,9 @@ mod tests {
         });
         assert!(!app.home_chart_is_filtered());
         assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
+
+        app.session_kind = crate::analytics::SessionKindFilter::Primary;
+        assert!(app.home_chart_is_filtered());
     }
 
     #[test]
@@ -7154,9 +7691,12 @@ mod tests {
                 last_ts: 42,
                 hit_count: 1,
                 top_score: 1.0,
+                title: String::new(),
                 snippet: String::new(),
                 source_path: "source.jsonl".to_string(),
                 source_dir: String::new(),
+                label: None,
+                conversation_kind: None,
             }],
             failures: Vec::new(),
         });
@@ -7338,9 +7878,12 @@ mod tests {
                 last_ts: 1,
                 hit_count: 1,
                 top_score: 1.0,
+                title: String::new(),
                 snippet: String::new(),
                 source_path: "codex.jsonl".into(),
                 source_dir: String::new(),
+                label: None,
+                conversation_kind: None,
             },
             SessionSummary {
                 machine: LOCAL_MACHINE_ID.to_string(),
@@ -7350,9 +7893,12 @@ mod tests {
                 last_ts: 1,
                 hit_count: 1,
                 top_score: 1.0,
+                title: String::new(),
                 snippet: String::new(),
                 source_path: "claude.jsonl".into(),
                 source_dir: String::new(),
+                label: None,
+                conversation_kind: None,
             },
             SessionSummary {
                 machine: "mini".into(),
@@ -7362,9 +7908,12 @@ mod tests {
                 last_ts: 1,
                 hit_count: 1,
                 top_score: 1.0,
+                title: String::new(),
                 snippet: String::new(),
                 source_path: "remote-codex.jsonl".into(),
                 source_dir: String::new(),
+                label: None,
+                conversation_kind: None,
             },
         ];
 
@@ -7422,8 +7971,8 @@ mod tests {
     #[test]
     fn match_context_spans_bolds_the_hit() {
         let theme = Theme::new();
-        let terms = query_terms("sqlite");
-        let spans = match_context_spans("we fixed the sqlite reads today", &terms, 40, &theme);
+        let matchers = crate::cli::build_matchers("sqlite").unwrap();
+        let spans = match_context_spans("we fixed the sqlite reads today", &matchers, 40, &theme);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "we fixed the sqlite reads today");
         assert!(
@@ -7436,9 +7985,9 @@ mod tests {
     #[test]
     fn match_context_spans_windows_long_text() {
         let theme = Theme::new();
-        let terms = query_terms("needle");
+        let matchers = crate::cli::build_matchers("needle").unwrap();
         let text = format!("{} needle {}", "x".repeat(100), "y".repeat(100));
-        let spans = match_context_spans(&text, &terms, 30, &theme);
+        let spans = match_context_spans(&text, &matchers, 30, &theme);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(joined.starts_with('…'));
         assert!(joined.ends_with('…'));
@@ -7448,8 +7997,8 @@ mod tests {
     #[test]
     fn match_context_spans_fall_back_without_literal_hit() {
         let theme = Theme::new();
-        let terms = query_terms("zzz");
-        let spans = match_context_spans("completely unrelated text", &terms, 12, &theme);
+        let matchers = crate::cli::build_matchers("zzz").unwrap();
+        let spans = match_context_spans("completely unrelated text", &matchers, 12, &theme);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "completely …");
     }
@@ -7463,6 +8012,85 @@ mod tests {
         app.move_home_dropdown_selection(2);
         app.apply_home_dropdown();
         assert_eq!(app.source, SourceChoice::Codex);
+        assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
+    fn kind_dropdown_applies_selection() {
+        let (_tmp, mut app) = test_app();
+        // Default filter is primary, which sits at index 1 in all/primary/subagent order.
+        app.open_home_dropdown(HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        app.move_home_dropdown_selection(1);
+        app.apply_home_dropdown();
+        assert_eq!(
+            app.session_kind,
+            crate::analytics::SessionKindFilter::Subagent
+        );
+        assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
+    fn kind_dropdown_change_reloads_token_chart() {
+        let (_tmp, mut app) = test_app();
+        app.config.token_usage = Some(true);
+        app.home_chart_mode = HomeChartMode::Tokens;
+        app.home_token_activity_state = LoadState::Loaded;
+        // Default filter is primary at index 1 in all/interactive/subagent order.
+        app.open_home_dropdown(HomeDropdown::Kind);
+        app.move_home_dropdown_selection(1);
+        app.apply_home_dropdown();
+        assert_eq!(
+            app.session_kind,
+            crate::analytics::SessionKindFilter::Subagent
+        );
+        // The origin change must kick a token reload, not leave stale totals.
+        assert_eq!(app.home_token_activity_state, LoadState::Loading);
+    }
+
+    #[test]
+    fn kind_dropdown_lists_all_first() {
+        let (_tmp, mut app) = test_app();
+        app.open_home_dropdown(HomeDropdown::Kind);
+        assert_eq!(
+            app.home_dropdown_options(),
+            vec!["all", "interactive", "subagent", "regular"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_dropdown_k_navigates_instead_of_closing() {
+        let (_tmp, mut app) = test_app();
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("devnull");
+        // Fixed viewport: `Terminal::new` queries the real terminal size,
+        // which fails without a TTY (sandbox, CI). Key handling never draws.
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(devnull),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("terminal");
+        app.open_home_dropdown(HomeDropdown::Kind);
+        // Default filter is primary at index 1 in all/primary/subagent order.
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        // `j` moves down like in every other dropdown.
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
+        assert_eq!(app.home_dropdown, HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(2));
+        // `k` moves back up and leaves the dropdown open.
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
+        assert_eq!(app.home_dropdown, HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        // `c` toggles the kind dropdown closed.
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
         assert_eq!(app.home_dropdown, HomeDropdown::None);
     }
 
@@ -7493,7 +8121,7 @@ mod tests {
     }
 
     #[test]
-    fn range_dropdown_changes_chart_without_restarting_search() {
+    fn range_dropdown_filters_list_and_chart() {
         let (_tmp, mut app) = test_app();
         app.active_search_request = 7;
         app.open_home_dropdown(HomeDropdown::Range);
@@ -7502,9 +8130,20 @@ mod tests {
         app.move_home_dropdown_selection(1);
         app.apply_home_dropdown();
 
+        // "All" clears the list's `since` bound and restarts the search.
         assert_eq!(app.home_activity_range, TimelineRange::All);
-        assert_eq!(app.active_search_request, 7);
+        assert_eq!(app.sessions_since, None);
+        assert_ne!(app.active_search_request, 7);
         assert_eq!(app.home_activity_state, LoadState::Loading);
+
+        // A bounded range syncs the list's `since` bound to the same cutoff.
+        app.open_home_dropdown(HomeDropdown::Range);
+        app.move_home_dropdown_selection(-2);
+        app.apply_home_dropdown();
+        assert_eq!(app.home_activity_range, TimelineRange::Week);
+        let since = app.sessions_since.expect("bounded range sets since");
+        let now = now_ms();
+        assert!(since <= now && since > now.saturating_sub(8 * 86_400_000));
     }
 
     #[test]
@@ -7549,6 +8188,67 @@ mod tests {
     }
 
     #[test]
+    fn timeline_origin_filters_analytics_and_search_counts() {
+        use crate::analytics::{AnalyticsWriter, SessionKindFilter};
+
+        let (_tmp, app) = test_app();
+        let mut writer = app.index.writer().unwrap();
+        let mut analytics = AnalyticsWriter::open(analytics_path(&app.paths.state)).unwrap();
+        for (id, kind) in [(1, "main"), (2, "subagent"), (3, "guardian_review")] {
+            let mut event = record("user", "needle");
+            event.doc_id = id;
+            event.ts = id;
+            event.session_id = format!("session-{id}");
+            event.source_path = format!("session-{id}.jsonl");
+            event.links.conversation_kind = Some(kind.into());
+            app.index.add_record(&mut writer, &event).unwrap();
+            analytics.record(&event).unwrap();
+        }
+        writer.commit().unwrap();
+        app.index.publish_generation().unwrap();
+        analytics.flush().unwrap();
+        for query in ["", "needle"] {
+            for (kind, expected) in [
+                (SessionKindFilter::Regular, 2),
+                (SessionKindFilter::All, 3),
+                (SessionKindFilter::Primary, 1),
+                (SessionKindFilter::Subagent, 1),
+            ] {
+                let rows = build_project_timeline(
+                    &app.paths,
+                    None,
+                    TimelineRange::All,
+                    ProjectDisplayMode::Flat,
+                    query,
+                    kind,
+                )
+                .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].session_count, expected,
+                    "query={query:?} kind={kind:?}"
+                );
+                assert_eq!(rows[0].session_events.len(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn changing_origin_refreshes_visible_timeline() {
+        let (_tmp, mut app) = test_app();
+        app.layout_mode = LayoutMode::Timeline;
+        app.session_kind = crate::analytics::SessionKindFilter::Primary;
+        let previous_request = app.active_timeline_request;
+        app.cycle_session_kind();
+        assert!(app.active_timeline_request > previous_request);
+        assert_eq!(app.timeline_state, LoadState::Loading);
+        assert_eq!(
+            app.timeline_loaded.as_ref().unwrap().4,
+            crate::analytics::SessionKindFilter::All
+        );
+    }
+
+    #[test]
     fn timeline_result_uses_captured_query_while_search_buffer_is_edited() {
         let (_tmp, mut app) = test_app();
         app.active_timeline_request = 7;
@@ -7558,6 +8258,7 @@ mod tests {
             TimelineRange::All,
             ProjectDisplayMode::NestedWorktrees,
             String::new(),
+            app.session_kind,
         ));
         app.query = "draft search".to_string();
 
@@ -7568,6 +8269,7 @@ mod tests {
             range: TimelineRange::All,
             grouping: ProjectDisplayMode::NestedWorktrees,
             query: String::new(),
+            kind: app.session_kind,
         });
 
         assert_eq!(app.timeline_state, LoadState::Empty);
@@ -7800,12 +8502,14 @@ mod tests {
             TimelineRange::Week,
             ProjectDisplayMode::Flat,
             "needle".to_string(),
+            crate::analytics::SessionKindFilter::All,
         ));
         app.timeline_loaded = Some((
             SourceChoice::All,
             TimelineRange::All,
             ProjectDisplayMode::NestedWorktrees,
             "pending query".to_string(),
+            app.session_kind,
         ));
         app.query = "draft query".to_string();
         app.list_area = Rect::new(0, 0, 80, 3); // legend plus two rows
@@ -7822,6 +8526,7 @@ mod tests {
         assert!(matches!(app.focus, Focus::List));
         assert_eq!(app.project, "project-3");
         assert_eq!(app.query, "needle");
+        assert_eq!(app.session_kind, crate::analytics::SessionKindFilter::All);
         assert_eq!(app.source, SourceChoice::Claude);
         assert_eq!(app.project_display, ProjectDisplayMode::Flat);
         assert!(app.sessions_since.is_some());

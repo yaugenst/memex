@@ -15,10 +15,13 @@ pub enum SourceKind {
     Omp,
     Grok,
     Hermes,
+    Jcode,
+    Muse,
+    Antigravity,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 10] = [
+    pub const ALL: [SourceKind; 13] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -29,6 +32,9 @@ impl SourceKind {
         SourceKind::Omp,
         SourceKind::Grok,
         SourceKind::Hermes,
+        SourceKind::Jcode,
+        SourceKind::Muse,
+        SourceKind::Antigravity,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -44,6 +50,9 @@ impl SourceKind {
             SourceKind::Omp => 7,
             SourceKind::Grok => 8,
             SourceKind::Hermes => 9,
+            SourceKind::Jcode => 10,
+            SourceKind::Muse => 11,
+            SourceKind::Antigravity => 12,
         }
     }
 
@@ -59,6 +68,9 @@ impl SourceKind {
             7 => Some(SourceKind::Omp),
             8 => Some(SourceKind::Grok),
             9 => Some(SourceKind::Hermes),
+            10 => Some(SourceKind::Jcode),
+            11 => Some(SourceKind::Muse),
+            12 => Some(SourceKind::Antigravity),
             _ => None,
         }
     }
@@ -75,6 +87,9 @@ impl SourceKind {
             SourceKind::Omp => "omp",
             SourceKind::Grok => "grok",
             SourceKind::Hermes => "hermes",
+            SourceKind::Jcode => "jcode",
+            SourceKind::Muse => "muse",
+            SourceKind::Antigravity => "antigravity",
         }
     }
 
@@ -90,6 +105,9 @@ impl SourceKind {
             SourceKind::Omp => "omp",
             SourceKind::Grok => "grok",
             SourceKind::Hermes => "hermes",
+            SourceKind::Jcode => "jcode",
+            SourceKind::Muse => "muse",
+            SourceKind::Antigravity => "antigravity",
         }
     }
 
@@ -109,6 +127,9 @@ impl SourceKind {
             "omp" => Some(SourceKind::Omp),
             "grok" => Some(SourceKind::Grok),
             "hermes" => Some(SourceKind::Hermes),
+            "jcode" => Some(SourceKind::Jcode),
+            "muse" => Some(SourceKind::Muse),
+            "antigravity" => Some(SourceKind::Antigravity),
             _ => None,
         }
     }
@@ -129,6 +150,9 @@ pub enum SourceFilter {
     Omp,
     Grok,
     Hermes,
+    Jcode,
+    Muse,
+    Antigravity,
 }
 
 impl SourceFilter {
@@ -144,6 +168,9 @@ impl SourceFilter {
             SourceFilter::Omp => source == SourceKind::Omp,
             SourceFilter::Grok => source == SourceKind::Grok,
             SourceFilter::Hermes => source == SourceKind::Hermes,
+            SourceFilter::Jcode => source == SourceKind::Jcode,
+            SourceFilter::Muse => source == SourceKind::Muse,
+            SourceFilter::Antigravity => source == SourceKind::Antigravity,
         }
     }
 
@@ -159,6 +186,9 @@ impl SourceFilter {
             SourceFilter::Omp => &["omp"],
             SourceFilter::Grok => &["grok"],
             SourceFilter::Hermes => &["hermes"],
+            SourceFilter::Jcode => &["jcode"],
+            SourceFilter::Muse => &["muse"],
+            SourceFilter::Antigravity => &["antigravity"],
         }
     }
 
@@ -174,11 +204,14 @@ impl SourceFilter {
             SourceFilter::Omp => "omp",
             SourceFilter::Grok => "grok",
             SourceFilter::Hermes => "hermes",
+            SourceFilter::Jcode => "jcode",
+            SourceFilter::Muse => "muse",
+            SourceFilter::Antigravity => "antigravity",
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordLinks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
@@ -222,11 +255,134 @@ pub struct Record {
     pub source_path: String,
 }
 
+/// Lowercase substrings marking a first user message as a spawned-worker
+/// directive rather than an interactive prompt. Shared by the jcode parser
+/// and the analytics backstop so the two can never disagree.
+pub const JCODE_SUBAGENT_MARKERS: &[&str] = &[
+    "you are a low-effort fact-checker",
+    "you are a low effort",
+    "you are a subagent",
+    "you are downstream",
+    "you are the downstream",
+    "investigation subagent",
+    "deep validation:",
+    "bossmode task",
+    // The trailing colon is load-bearing: without it, ordinary prose such
+    // as "add a `role: manager` column" would match. Only the colon
+    // form ("Role: Manager: ...") marks a spawned worker.
+    "role: manager:",
+];
+
+/// Leaf-name tokens marking a /tmp working directory as a spawned-worker
+/// sandbox (e.g. `/private/tmp/bossmode-hygiene-v2-worker-docs`). A bare
+/// /tmp cwd alone is not evidence — users legitimately work in /tmp — so
+/// the sandbox cue needs one of these tokens in the leaf directory name.
+pub const JCODE_WORKER_SANDBOX_TOKENS: &[&str] =
+    &["worker", "agent", "swarm", "sandbox", "spawn", "subagent"];
+
+/// Returns true when `cwd` is a spawned-worker sandbox under the system
+/// temp dir. Shared by the jcode parser and the analytics backstop so the
+/// two can never disagree.
+pub fn jcode_tmp_cwd_is_worker_sandbox(cwd: &str) -> bool {
+    let under_tmp = cwd == "/tmp"
+        || cwd == "/private/tmp"
+        || cwd.starts_with("/tmp/")
+        || cwd.starts_with("/private/tmp/");
+    if !under_tmp {
+        return false;
+    }
+    let leaf = cwd.rsplit('/').next().unwrap_or("").to_lowercase();
+    JCODE_WORKER_SANDBOX_TOKENS
+        .iter()
+        .any(|token| leaf.contains(token))
+}
+
+/// Returns true when lowercase first-directive text identifies a spawned
+/// worker. Compound rules keep precision against ordinary prompts:
+/// - "implementation worker" needs a role assignment ("for <task>" or
+///   "you are") so "review the implementation worker pool sizing" stays out.
+/// - "0 repo writes" needs the read-only constraint form ("outside …" or
+///   sentence-final) so "0 repo writes from forks" stays out.
+pub fn jcode_text_is_subagent_directive(lower: &str) -> bool {
+    if JCODE_SUBAGENT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    if lower.contains("implementation worker")
+        && (lower.contains("implementation worker for") || lower.contains("you are"))
+    {
+        return true;
+    }
+    if let Some(pos) = lower.find("0 repo writes") {
+        let rest = lower[pos + "0 repo writes".len()..].trim_start();
+        if rest.starts_with("outside") || rest.starts_with('.') {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SourceFilter, SourceKind};
+    use super::{
+        SourceFilter, SourceKind, jcode_text_is_subagent_directive, jcode_tmp_cwd_is_worker_sandbox,
+    };
     use clap::ValueEnum;
     use std::collections::HashSet;
+
+    #[test]
+    fn subagent_directive_markers_match_worker_roles() {
+        for text in [
+            "You are downstream A8 mapper. Read-only.",
+            "You are the focused implementation worker for Bossmode task task_abc.",
+            "You are an investigation subagent. Triage the failure.",
+            "Deep validation: Orchestration ORIGIN steady. Read-only.",
+            "Act as an independent reviewer for Bossmode task task_abc.",
+            "Role: Manager: Repo Hygiene. You are the coordinator.",
+            "FRESH run. 0 repo writes outside /tmp.",
+            "FRESH run. 0 repo writes.",
+        ] {
+            assert!(
+                jcode_text_is_subagent_directive(&text.to_lowercase()),
+                "should match: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_directive_markers_reject_ordinary_prose() {
+        for text in [
+            "Add a `role: manager` column to the users table.",
+            "Please review the implementation worker pool sizing.",
+            "Our CI policy says 0 repo writes from forks.",
+            "take over and fully complete the interrupted session",
+            "Perform a final independent read-only review of the release.",
+        ] {
+            assert!(
+                !jcode_text_is_subagent_directive(&text.to_lowercase()),
+                "should not match: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_sandbox_cwd_needs_token_leaf_under_tmp() {
+        for cwd in [
+            "/private/tmp/bossmode-hygiene-v2-worker-docs",
+            "/tmp/swarm-run-12",
+            "/tmp/agent-scratch",
+        ] {
+            assert!(jcode_tmp_cwd_is_worker_sandbox(cwd), "should match: {cwd}");
+        }
+        for cwd in ["/tmp", "/private/tmp", "/tmp/work", "/repo/example", ""] {
+            assert!(
+                !jcode_tmp_cwd_is_worker_sandbox(cwd),
+                "should not match: {cwd}"
+            );
+        }
+    }
 
     #[test]
     fn source_indices_and_storage_labels_are_unique() {

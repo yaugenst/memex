@@ -7,7 +7,13 @@ pub mod index;
 pub mod ingest;
 pub mod lease;
 pub mod machine;
+pub mod mcp;
+pub mod memory;
+pub mod memory_search;
+#[cfg(unix)]
+mod native;
 pub mod progress;
+pub mod read_budget;
 pub mod resume;
 pub mod retrieval;
 pub mod retrieval_eval;
@@ -19,8 +25,11 @@ pub mod types;
 pub mod usage;
 pub mod vector;
 pub mod vector_backfill;
+pub mod watch;
 pub mod web;
 pub mod web_auth;
 
 #[cfg(test)]
 pub mod test_support;
+
+pub mod migration;

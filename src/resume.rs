@@ -33,6 +33,9 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Copilot => config.copilot_resume_cmd.clone(),
         SourceKind::Grok => config.grok_resume_cmd.clone(),
         SourceKind::Hermes => None,
+        SourceKind::Jcode => config.jcode_resume_cmd.clone(),
+        SourceKind::Muse => config.muse_resume_cmd.clone(),
+        SourceKind::Antigravity => None,
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -46,7 +49,7 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
             Some("codex resume {session_id}".to_string())
         }
         "opencode" if remote || find_in_path("opencode").is_some() => {
-            Some("opencode resume {session_id}".to_string())
+            Some("opencode --session {session_id}".to_string())
         }
         "cursor" => (remote || find_in_path("cursor-agent").is_some())
             .then(|| "cursor-agent --resume {session_id}".to_string()),
@@ -58,6 +61,12 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "copilot" if remote || find_in_path("copilot").is_some() => {
             Some("copilot --resume {session_id}".to_string())
+        }
+        "jcode" if remote || find_in_path("jcode").is_some() => {
+            Some("cd {cwd_shell} && jcode --resume {session_id}".to_string())
+        }
+        "muse" if remote || find_in_path("muse").is_some() => {
+            Some("cd {cwd_shell} && muse resume {session_id}".to_string())
         }
         "grok" if remote || find_in_path("grok").is_some() => {
             Some("cd {cwd_shell} && grok --resume {session_id}".to_string())
@@ -148,6 +157,14 @@ mod tests {
         assert_eq!(
             default_resume_template("omp", true).as_deref(),
             Some("omp --resume {source_path_shell}")
+        );
+    }
+
+    #[test]
+    fn remote_opencode_default_uses_session_flag() {
+        assert_eq!(
+            default_resume_template("opencode", true).as_deref(),
+            Some("opencode --session {session_id}")
         );
     }
 }

@@ -9,18 +9,22 @@ use memchr::{memchr, memmem};
 use memmap2::Mmap;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
-    identity: 2,
-    index: 4,
-    usage: 4,
+    // Recompute persisted identities and usage parents for guardian reviews.
+    identity: 3,
+    // Bumped for role-string subagent source detection: forces a full
+    // re-parse so stored kinds are recomputed on next index.
+    index: 5,
+    usage: 5,
 };
 
 pub fn classify_path(path: &str) -> Option<SourceKind> {
@@ -86,6 +90,76 @@ pub fn history_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Load the human-facing titles maintained by Codex's local thread database.
+/// The rollout JSONL files do not carry this value themselves.
+pub fn session_titles(session_ids: &[String]) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    for home in homes() {
+        for path in state_database_paths(&home) {
+            let Ok(connection) = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) else {
+                continue;
+            };
+            for session_id in session_ids {
+                if titles.contains_key(session_id) {
+                    continue;
+                }
+                if let Some(title) = codex_thread_title(&connection, session_id) {
+                    titles.insert(session_id.clone(), title);
+                }
+            }
+        }
+    }
+    titles
+}
+
+fn state_database_paths(home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(home) else {
+        return Vec::new();
+    };
+    let mut versioned_paths = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let version = name
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u64>()
+                .ok()?;
+            Some((version, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    versioned_paths.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    versioned_paths.into_iter().map(|(_, path)| path).collect()
+}
+
+fn codex_thread_title(connection: &Connection, session_id: &str) -> Option<String> {
+    // Current Codex builds have all three columns. The second query keeps the
+    // reader useful with older databases that only stored `title`.
+    for sql in [
+        "SELECT COALESCE(NULLIF(name, ''), NULLIF(title, ''), NULLIF(first_user_message, '')) FROM threads WHERE id = ?1",
+        "SELECT NULLIF(title, '') FROM threads WHERE id = ?1",
+    ] {
+        let title = connection
+            .query_row(sql, params![session_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty());
+        if title.is_some() {
+            return title;
+        }
+    }
+    None
+}
+
 pub fn session_id_from_path(path: &Path) -> Option<String> {
     static UUID: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
         Regex::new(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
@@ -135,6 +209,19 @@ fn fallback_meta(path: &Path) -> SessionMeta {
     }
 }
 
+fn is_guardian_review(payload: &simd_json::borrowed::Object<'_>) -> bool {
+    payload
+        .get("thread_source")
+        .and_then(|value| value.as_str())
+        == Some("guardian_review")
+        || payload
+            .get("source")
+            .and_then(|value| value.get("subagent"))
+            .and_then(|value| value.get("other"))
+            .and_then(|value| value.as_str())
+            == Some("guardian")
+}
+
 fn apply_meta(payload: &simd_json::borrowed::Object<'_>, metadata: &mut SessionMeta) {
     if let Some(id) = payload.get("id").and_then(|value| value.as_str()) {
         metadata.session_id = id.to_string();
@@ -147,26 +234,45 @@ fn apply_meta(payload: &simd_json::borrowed::Object<'_>, metadata: &mut SessionM
         .get("forked_from_id")
         .and_then(|value| value.as_str())
         .map(str::to_string);
-    let parent_thread_id = payload
+    // Older CLIs record spawned agents as `"source": {"subagent": "<role>"}`
+    // with no `thread_spawn` wrapper or explicit `thread_source`; any
+    // object- or role-string-shaped marker means this thread is a subagent.
+    let subagent_marker = payload
         .get("source")
         .and_then(|value| value.as_object())
-        .and_then(|source| source.get("subagent"))
-        .and_then(|value| value.as_object())
-        .and_then(|subagent| subagent.get("thread_spawn"))
-        .and_then(|value| value.as_object())
-        .and_then(|spawn| spawn.get("parent_thread_id"))
+        .and_then(|source| source.get("subagent"));
+    let subagent_present = subagent_marker.is_some_and(|marker| {
+        marker.as_object().is_some() || marker.as_str().is_some_and(|role| !role.is_empty())
+    });
+    let guardian_review = is_guardian_review(payload);
+    let parent_thread_id = payload
+        .get("parent_thread_id")
         .and_then(|value| value.as_str())
+        .or_else(|| {
+            subagent_marker
+                .and_then(|value| value.as_object())
+                .and_then(|subagent| subagent.get("thread_spawn"))
+                .and_then(|value| value.as_object())
+                .and_then(|spawn| spawn.get("parent_thread_id"))
+                .and_then(|value| value.as_str())
+        })
         .map(str::to_string);
     let thread_source = payload
         .get("thread_source")
         .and_then(|value| value.as_str())
         .map(str::to_string)
-        .or_else(|| parent_thread_id.as_ref().map(|_| "subagent".to_string()))
+        .or_else(|| guardian_review.then(|| "guardian_review".to_string()))
+        .or_else(|| {
+            (parent_thread_id.is_some() && forked_from_id.is_none()).then(|| "subagent".to_string())
+        })
+        .or_else(|| subagent_present.then(|| "subagent".to_string()))
         .or_else(|| forked_from_id.as_ref().map(|_| "fork".to_string()));
     metadata.links.parent_session_id = forked_from_id.clone().or(parent_thread_id);
     metadata.links.thread_source = thread_source.clone();
     metadata.links.conversation_kind = Some(
-        if thread_source.as_deref() == Some("subagent") {
+        if guardian_review {
+            ConversationKind::GuardianReview
+        } else if thread_source.as_deref() == Some("subagent") {
             ConversationKind::Subagent
         } else if forked_from_id.is_some() {
             ConversationKind::Fork
@@ -208,11 +314,49 @@ fn read_meta_until(path: &Path, limit: u64) -> Result<SessionMeta> {
     Ok(metadata)
 }
 
+/// Read session metadata from the indexed prefix, including inherited parent sessions.
+pub(crate) fn migration_session_links(
+    path: &Path,
+    offset: u64,
+) -> Result<Option<HashMap<String, RecordLinks>>> {
+    let file = File::open(path)?;
+    // The existing parsers also map append-only transcript files. Bound reads to committed state.
+    let mmap = unsafe { Mmap::map(&file)? };
+    anyhow::ensure!(
+        offset <= mmap.len() as u64,
+        "transcript shrank during migration"
+    );
+    let mut result = HashMap::new();
+    for line in mmap[..offset as usize].split(|byte| *byte == b'\n') {
+        if memmem::find(line, b"session_meta").is_none() {
+            continue;
+        }
+        let mut buffer = line.to_vec();
+        if let Ok(value) = simd_json::to_borrowed_value(&mut buffer)
+            && value.get("type").and_then(|v| v.as_str()) == Some("session_meta")
+            && let Some(payload) = value.get("payload").and_then(|v| v.as_object())
+        {
+            let mut meta = fallback_meta(path);
+            apply_meta(payload, &mut meta);
+            let links = meta.links.record_links();
+            if result
+                .get(&meta.session_id)
+                .is_some_and(|previous| previous != &links)
+            {
+                return Ok(None);
+            }
+            result.insert(meta.session_id, links);
+        }
+    }
+    Ok((!result.is_empty()).then_some(result))
+}
+
 pub fn probe(path: &Path) -> Result<SourceMetadata> {
     let limit = path.metadata()?.len();
     let metadata = read_meta_until(path, limit)?;
     let kind = match metadata.links.conversation_kind.as_deref() {
         Some("subagent") => ConversationKind::Subagent,
+        Some("guardian_review") => ConversationKind::GuardianReview,
         Some("fork") => ConversationKind::Fork,
         _ => ConversationKind::Main,
     };
@@ -1051,7 +1195,12 @@ fn borrowed_string(value: &BorrowedValue<'_>, aliases: &[&str]) -> Option<String
 fn usage_parent_session_id(payload: &BorrowedValue<'_>) -> Option<String> {
     borrowed_string(
         payload,
-        &["forked_from_id", "parent_session_id", "parentSessionId"],
+        &[
+            "forked_from_id",
+            "parent_session_id",
+            "parentSessionId",
+            "parent_thread_id",
+        ],
     )
     .or_else(|| {
         payload
@@ -1117,6 +1266,7 @@ pub(crate) fn parse_usage_file(
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut session = session_id_from_path(path);
     let mut parent = None;
+    let mut permission_review = false;
     let mut fork_timestamp_ms = None;
     let mut fork_resolved = false;
     let mut parent_deps = Vec::new();
@@ -1158,7 +1308,13 @@ pub(crate) fn parse_usage_file(
         match (kind, payload) {
             ("session_meta", Some(payload)) => {
                 session = borrowed_string(payload, &["id", "session_id"]).or(session);
-                parent = usage_parent_session_id(payload);
+                permission_review = payload.as_object().is_some_and(is_guardian_review);
+                // Review sessions do not inherit the parent task's token counters.
+                parent = if permission_review {
+                    borrowed_string(payload, &["forked_from_id"])
+                } else {
+                    usage_parent_session_id(payload)
+                };
                 if parent.is_some() {
                     fork_timestamp_ms = value.get("timestamp").map(usage_timestamp);
                 }
@@ -1242,6 +1398,7 @@ pub(crate) fn parse_usage_file(
                         || (parent.is_some() && !fork_resolved),
                     cache_chain_excluded: false,
                     sidechain: false,
+                    permission_review,
                     source_order,
                 });
                 event_index += 1;
@@ -1288,6 +1445,7 @@ pub(crate) fn parse_usage_file(
                     conservative_undercount: false,
                     cache_chain_excluded: false,
                     sidechain: false,
+                    permission_review,
                     source_order,
                 });
             }
@@ -1380,6 +1538,40 @@ mod tests {
     }
 
     #[test]
+    fn codex_thread_title_prefers_an_explicit_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state_5.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, first_user_message TEXT);
+                 INSERT INTO threads VALUES ('session-1', 'Pinned name', 'Generated title', 'First prompt');",
+            )
+            .unwrap();
+
+        assert_eq!(
+            codex_thread_title(&connection, "session-1").as_deref(),
+            Some("Pinned name")
+        );
+        assert_eq!(codex_thread_title(&connection, "missing"), None);
+    }
+
+    #[test]
+    fn state_database_paths_prefer_the_newest_schema_version() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["state_2.sqlite", "state_12.sqlite", "state.sqlite"] {
+            fs::write(temp.path().join(name), "").unwrap();
+        }
+
+        let names = state_database_paths(temp.path())
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["state_12.sqlite", "state_2.sqlite"]);
+    }
+
+    #[test]
     fn history_records_use_the_canonical_codex_source() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("history.jsonl");
@@ -1428,6 +1620,157 @@ mod tests {
             ConversationKind::Subagent
         );
         assert_eq!(metadata.project.as_deref(), Some("memex"));
+    }
+
+    #[test]
+    fn probe_marks_role_string_subagent_source() {
+        // Older CLIs write `"source": {"subagent": "review"}` with neither
+        // `thread_spawn` nor an explicit `thread_source`.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("rollout-2026-01-26T13-38-17-019bfb99-7735-77a0-8792-176cdc56fda7.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019bfb99-7735-77a0-8792-176cdc56fda7\",\"cwd\":\"/repo/memex\",\"source\":{\"subagent\":\"review\"}}}\n",
+        )
+        .unwrap();
+        let metadata = probe(&path).unwrap();
+        assert_eq!(
+            metadata.session.conversation_kind,
+            ConversationKind::Subagent
+        );
+        assert_eq!(metadata.session.parent_session_id, None);
+    }
+
+    #[test]
+    fn guardian_reviews_preserve_identity_and_parent_in_both_projections() {
+        for marker in [
+            serde_json::json!({"thread_source": "guardian_review"}),
+            serde_json::json!({"source": {"subagent": {"other": "guardian"}}}),
+            serde_json::json!({"thread_source": "guardian_review", "source": {"subagent": {"other": "guardian"}}}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("guardian.jsonl");
+            let mut payload = marker;
+            payload["id"] = serde_json::json!("guardian-session");
+            payload["parent_thread_id"] = serde_json::json!("parent-session");
+            fs::write(
+                &path,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"type": "session_meta", "payload": payload}),
+                    serde_json::json!({"type": "response_item", "payload": {
+                        "type": "message", "role": "assistant", "content": [
+                            {"type": "output_text", "text": "Permission allowed"}
+                        ]
+                    }})
+                ),
+            )
+            .unwrap();
+            let metadata = probe(&path).unwrap();
+            assert_eq!(
+                metadata.session.conversation_kind,
+                ConversationKind::GuardianReview
+            );
+            assert_eq!(
+                metadata.session.parent_session_id.as_deref(),
+                Some("parent-session")
+            );
+            let mut records = Vec::new();
+            parse_index_records(
+                &path,
+                IndexParseState::default(),
+                false,
+                &AtomicU64::new(1),
+                |record| {
+                    records.push(record);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].links.conversation_kind.as_deref(),
+                Some("guardian_review")
+            );
+            assert_eq!(
+                records[0].links.parent_session_id.as_deref(),
+                Some("parent-session")
+            );
+            let mut bytes = serde_json::to_vec(&payload).unwrap();
+            let borrowed = simd_json::to_borrowed_value(&mut bytes).unwrap();
+            assert_eq!(
+                usage_parent_session_id(&borrowed).as_deref(),
+                Some("parent-session")
+            );
+        }
+    }
+
+    #[test]
+    fn guardian_usage_keeps_initial_tokens_without_inheriting_parent_counters() {
+        for marker in [
+            serde_json::json!({"thread_source": "guardian_review"}),
+            serde_json::json!({"source": {"subagent": {"other": "guardian"}}}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("guardian.jsonl");
+            let mut payload = marker;
+            payload["id"] = serde_json::json!("review");
+            payload["parent_thread_id"] = serde_json::json!("parent");
+            fs::write(&path, format!("{}\n{}\n{}\n",
+                serde_json::json!({"type": "session_meta", "timestamp": 1, "payload": payload}),
+                serde_json::json!({"type": "event_msg", "timestamp": 2, "payload": {
+                    "type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "output_tokens": 2}}
+                }}),
+                serde_json::json!({"type": "response", "timestamp": 3, "usage": {"input_tokens": 20, "output_tokens": 3}})
+            )).unwrap();
+            let parsed = parse_usage_file(&path, &UsageParentIndex::new(&[])).unwrap();
+            assert!(parsed.cacheable);
+            assert!(parsed.deps.is_empty());
+            assert_eq!(parsed.events.len(), 2);
+            assert!(parsed.events.iter().all(|event| event.permission_review));
+            assert_eq!(parsed.events[0].tokens.additive_total(), 12);
+            assert_eq!(parsed.events[1].tokens.additive_total(), 23);
+        }
+    }
+
+    #[test]
+    fn top_level_parents_preserve_ordinary_subagents_and_fork_precedence() {
+        for (payload, expected_kind, expected_parent) in [
+            (
+                serde_json::json!({"source": {"subagent": {"other": "review"}}, "parent_thread_id": "parent"}),
+                ConversationKind::Subagent,
+                "parent",
+            ),
+            (
+                serde_json::json!({"forked_from_id": "fork", "parent_thread_id": "parent"}),
+                ConversationKind::Fork,
+                "fork",
+            ),
+            (
+                serde_json::json!({"thread_source": "guardian_review", "forked_from_id": "fork", "parent_thread_id": "parent"}),
+                ConversationKind::GuardianReview,
+                "fork",
+            ),
+        ] {
+            let mut bytes = serde_json::to_vec(&payload).unwrap();
+            let borrowed = simd_json::to_borrowed_value(&mut bytes).unwrap();
+            let mut metadata = fallback_meta(Path::new("session.jsonl"));
+            apply_meta(borrowed.as_object().unwrap(), &mut metadata);
+            assert_eq!(
+                metadata.links.conversation_kind.as_deref(),
+                Some(expected_kind.as_str())
+            );
+            assert_eq!(
+                metadata.links.parent_session_id.as_deref(),
+                Some(expected_parent)
+            );
+            assert_eq!(
+                usage_parent_session_id(&borrowed).as_deref(),
+                Some(expected_parent)
+            );
+        }
     }
 
     #[test]
