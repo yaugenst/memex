@@ -6,6 +6,7 @@
 
 pub mod antigravity;
 pub mod audit;
+pub mod bob;
 pub mod claude;
 pub mod codex;
 pub mod common;
@@ -14,11 +15,13 @@ pub mod cursor;
 pub mod grok;
 pub mod hermes;
 pub mod jcode;
+mod jsonl;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
+pub mod zcode;
 
 use crate::state::PendingToolCall;
 use crate::types::SourceKind;
@@ -94,6 +97,7 @@ pub struct ParserVersions {
 pub(crate) struct IndexParseState {
     pub offset: u64,
     pub turn_id: u32,
+    pub legacy_turn_id: Option<u32>,
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
 }
 
@@ -101,9 +105,24 @@ pub(crate) struct IndexParseState {
 pub(crate) struct IndexParseOutput {
     pub offset: u64,
     pub turn_id: u32,
+    pub legacy_turn_id: Option<u32>,
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
     pub session_id: Option<String>,
     pub diagnostics: ParseDiagnostics,
+    /// Working directory the transcript records for its session, when the format carries one.
+    /// Analytics resolves repositories from it instead of re-reading the transcript.
+    pub session_cwd: Option<String>,
+}
+
+impl IndexParseState {
+    fn legacy_ordinal(&self) -> anyhow::Result<u32> {
+        if self.offset == 0 {
+            return Ok(0);
+        }
+        self.legacy_turn_id.ok_or_else(|| {
+            anyhow::anyhow!("missing legacy record ordinal; reparse the source from offset zero")
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -117,6 +136,9 @@ pub struct ParseDiagnostics {
     pub encrypted_reasoning_dropped: u64,
     pub truncated_tool_inputs: u64,
     pub truncated_tool_outputs: u64,
+    /// Source stores discovery could not read this refresh (locked, corrupt, or on an
+    /// unsupported schema). Their previously indexed records are kept until they read again.
+    pub unreadable_sources: Vec<String>,
 }
 
 impl ParseDiagnostics {
@@ -152,6 +174,9 @@ impl ParseDiagnostics {
         for (key, count) in other.unknown_semantic_types {
             *self.unknown_semantic_types.entry(key).or_default() += count;
         }
+        self.unreadable_sources.extend(other.unreadable_sources);
+        self.unreadable_sources.sort();
+        self.unreadable_sources.dedup();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -220,8 +245,17 @@ impl UsageDependency {
         })
     }
 
+    #[allow(dead_code)]
     pub fn is_current(&self) -> bool {
         Self::from_path_or_absent(&self.path_from_native()) == *self
+    }
+
+    /// Current on-disk fingerprint for this dependency's path, without comparing.
+    /// Scans cache one observation per distinct path so shared parent rollouts are
+    /// stat'd once per scan instead of once per dependent file.
+    pub(crate) fn observed(&self) -> (u64, i64, bool) {
+        let current = Self::from_path_or_absent(&self.path_from_native());
+        (current.size, current.mtime_ns, current.exists)
     }
 }
 
@@ -257,6 +291,8 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Jcode => jcode::VERSIONS,
         SourceKind::Muse => muse::VERSIONS,
         SourceKind::Antigravity => antigravity::VERSIONS,
+        SourceKind::Bob => bob::VERSIONS,
+        SourceKind::Zcode => zcode::VERSIONS,
     }
 }
 
@@ -279,6 +315,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Muse
                 | SourceKind::Grok
                 | SourceKind::Antigravity
+                | SourceKind::Zcode
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -288,7 +325,11 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
 /// Compatibility classification for persisted records that only carry a source path.
 /// Individual path rules stay beside the source discovery code that defines them.
 pub fn classify_path(path: &str) -> SourceKind {
-    if let Some(source) = codex::classify_path(path) {
+    if bob::matches_path(path) {
+        SourceKind::Bob
+    } else if zcode::matches_path(path) {
+        SourceKind::Zcode
+    } else if let Some(source) = codex::classify_path(path) {
         source
     } else if opencode::matches_path(path) {
         SourceKind::Opencode

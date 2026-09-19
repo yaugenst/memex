@@ -3,7 +3,7 @@
 set -euo pipefail
 if [[ "${1:-}" == --help ]]; then
   echo "Usage: scripts/release_macos_local.sh [--publish-only] VERSION"
-  echo "Build, sign, notarize, upload Memex.app, and update the Homebrew cask from a clean vVERSION tag."
+  echo "Build, sign, notarize, upload the Apple Silicon Memex.app, and update the Homebrew cask from a clean vVERSION tag."
   echo "Requires local CODESIGN_IDENTITY and NOTARY_PROFILE (default: sidequery-notarization)."
   exit 0
 fi
@@ -29,7 +29,7 @@ remote=$(git ls-remote "https://github.com/$repo.git" "refs/tags/$tag" "refs/tag
 gh release view "$tag" --repo "$repo" --json isDraft,isPrerelease |
   jq -e '.isDraft == false and .isPrerelease == false' >/dev/null
 
-artifact="memex-app-${version}-macos-universal.zip"
+artifact="memex-app-${version}-macos-arm64.zip"
 artifacts="$ROOT/apps/macos/build/releases/$tag"
 assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')
 if ! "$publish_only" && grep -Fxq -e "$artifact" -e "$artifact.sha256" <<< "$assets"; then
@@ -75,8 +75,8 @@ app="$scratch/Memex.app"
 codesign --verify --deep --strict "$app"
 xcrun stapler validate "$app"
 spctl --assess --type execute --verbose=2 "$app"
-lipo "$app/Contents/MacOS/Memex" -verify_arch arm64 x86_64
-lipo "$app/Contents/Helpers/memex" -verify_arch arm64 x86_64
+lipo "$app/Contents/MacOS/Memex" -verify_arch arm64
+lipo "$app/Contents/Helpers/memex" -verify_arch arm64
 [[ "$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")" == "$version" ]]
 [[ "$("$app/Contents/Helpers/memex" --version)" == "memex $version" ]]
 gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' > "$scratch/assets"

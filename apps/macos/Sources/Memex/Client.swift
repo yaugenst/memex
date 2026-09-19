@@ -6,7 +6,16 @@ struct ClientError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// Run each request off the UI thread, with cancellation and a bounded lifetime.
+struct ActivityScanProgress: Decodable, Sendable, Equatable {
+    let source: String
+    let done: Int
+    let total: Int
+    var isValid: Bool { !source.isEmpty && source.count <= 100 && done >= 0 && total > 0 && done <= total }
+}
+
+typealias ActivityProgressHandler = @Sendable (ActivityScanProgress) -> Void
+
+/// Run each request off the UI thread, with cancellation and a watchdog.
 /// Files drain both streams without pipe-buffer deadlocks on large transcripts.
 final class CommandRun: @unchecked Sendable {
     private let lock = NSLock()
@@ -18,7 +27,7 @@ final class CommandRun: @unchecked Sendable {
         lock.unlock()
     }
 
-    func execute(executable: URL, arguments: [String], timeout: TimeInterval) throws -> Data {
+    func execute(executable: URL, arguments: [String], timeout: TimeInterval, progress: ActivityProgressHandler? = nil) throws -> Data {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -29,6 +38,8 @@ final class CommandRun: @unchecked Sendable {
         let output = try FileHandle(forWritingTo: outputURL)
         let errors = try FileHandle(forWritingTo: errorURL)
         defer { try? output.close(); try? errors.close() }
+        let progressReader = progress == nil ? nil : try FileHandle(forReadingFrom: errorURL)
+        defer { try? progressReader?.close() }
         let child = Process()
         child.executableURL = executable
         child.arguments = arguments
@@ -50,14 +61,36 @@ final class CommandRun: @unchecked Sendable {
                 kill(childID, signal)
             }
         }
-        let deadline = Date().addingTimeInterval(timeout)
+        var deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        var progressBuffer = Data()
+        var completedBySource: [String: Int] = [:]
+        func consumeProgress() {
+            guard let progressReader, let bytes = try? progressReader.read(upToCount: 65_536), !bytes.isEmpty else { return }
+            progressBuffer.append(bytes)
+            while let newline = progressBuffer.firstIndex(of: 10) {
+                let line = Data(progressBuffer[..<newline])
+                progressBuffer.removeSubrange(...newline)
+                let prefix = Data("MEMEX_PROGRESS ".utf8)
+                guard line.starts(with: prefix),
+                      let update = try? JSONDecoder().decode(ActivityScanProgress.self, from: line.dropFirst(prefix.count)),
+                      update.isValid else { continue }
+                if let previous = completedBySource[update.source], update.done <= previous { continue }
+                completedBySource[update.source] = update.done
+                // A cold usage backfill can outlive a normal read. Keep the same
+                // watchdog duration, measured since the last advancing counter.
+                if update.done > 0 { deadline = ContinuousClock.now.advanced(by: .seconds(timeout)) }
+                progress?(update)
+            }
+            if progressBuffer.count > 65_536 { progressBuffer.removeAll(keepingCapacity: true) }
+        }
         var stoppingSince: Date?
         var timedOut = false
         while child.isRunning {
+            consumeProgress()
             lock.lock()
             let shouldCancel = cancelled
             lock.unlock()
-            if stoppingSince == nil && (shouldCancel || Date() >= deadline) {
+            if stoppingSince == nil && (shouldCancel || ContinuousClock.now >= deadline) {
                 timedOut = !shouldCancel
                 stoppingSince = Date()
                 stop(SIGTERM)
@@ -69,6 +102,7 @@ final class CommandRun: @unchecked Sendable {
             Thread.sleep(forTimeInterval: 0.025)
         }
         child.waitUntilExit()
+        consumeProgress()
         lock.lock()
         let wasCancelled = cancelled
         lock.unlock()
@@ -79,7 +113,9 @@ final class CommandRun: @unchecked Sendable {
         if timedOut { throw ClientError(message: "Memex took too long to respond. Try again.") }
         guard child.terminationStatus == 0 else {
             let message = (try? String(contentsOf: errorURL, encoding: .utf8)) ?? "Memex could not complete the request."
-            throw ClientError(message: String(message.prefix(4000)))
+            let failure = message.split(separator: "\n", omittingEmptySubsequences: false)
+                .filter { !$0.hasPrefix("MEMEX_PROGRESS ") }.joined(separator: "\n")
+            throw ClientError(message: String(failure.prefix(4000)))
         }
         return try Data(contentsOf: outputURL)
     }
@@ -108,7 +144,8 @@ struct MemexClient: Sendable {
         } else { daemon = nil }
     }
 
-    func run(_ arguments: [String], timeout: TimeInterval = 60, daemonRequest: DaemonRequest? = nil) async throws -> Data {
+    func run(_ arguments: [String], timeout: TimeInterval = 60, daemonRequest: DaemonRequest? = nil,
+             progress: ActivityProgressHandler? = nil) async throws -> Data {
         if let daemon, let daemonRequest,
            let response = try await daemon.request(daemonRequest, timeout: timeout) { return response }
         try Task.checkCancellation()
@@ -123,7 +160,7 @@ struct MemexClient: Sendable {
         let arguments = args
         return try await withTaskCancellationHandler {
             try await Task.detached(priority: .userInitiated) {
-                try command.execute(executable: executable, arguments: arguments, timeout: timeout)
+                try command.execute(executable: executable, arguments: arguments, timeout: timeout, progress: progress)
             }.value
         } onCancel: { command.cancel() }
     }
@@ -203,7 +240,7 @@ struct MemexClient: Sendable {
                 since: String? = nil, origin: ConversationOrigin = .all) async throws -> [SearchHit] {
         var args = ["search", "--format", "json", "--machine", machine, "--mode", "lexical",
                     "--unique-session", "--limit", String(limit),
-                    "--fields", "source,session_id,source_path,project,snippet,ts,machine,record_id"]
+                    "--fields", "source,session_id,source_path,project,snippet,ts,machine,record_id,conversation_kind"]
         if let project { args += ["--project", project] }
         if let source { args += ["--source", source] }
         if let since { args += ["--since", since] }
@@ -226,6 +263,58 @@ struct MemexClient: Sendable {
                     "--", session.sessionID]
         return try JSONDecoder().decode([TranscriptRecord].self, from: await run(args,
             daemonRequest: sessionRequest(session, offset: offset, limit: limit)))
+    }
+
+    /// A list count is a hint, not a snapshot: the page response supplies its
+    /// current total, so newly indexed or removed records can correct the offset.
+    func initialRecords(for session: Session, anchor: String?) async throws -> TranscriptPage {
+        let offset: Int
+        if anchor == nil, let count = session.messageCount, count >= 0 {
+            offset = max(0, count - Self.pageSize)
+        } else {
+            offset = try await initialRecordOffset(for: session, anchor: anchor).offset
+        }
+        var page = try await recordPage(for: session, offset: offset)
+        if anchor == nil {
+            let latestOffset = max(0, page.total - Self.pageSize)
+            if latestOffset != page.offset {
+                try Task.checkCancellation()
+                page = try await recordPage(for: session, offset: latestOffset)
+            }
+        }
+        return page
+    }
+
+    func recordPage(for session: Session, offset: Int, limit: Int = Self.pageSize) async throws -> TranscriptPage {
+        let args = ["session", "--machine", session.machineID, "--source-path", session.sourcePath,
+                    "--offset", String(offset), "--limit", String(limit), "--full", "--page-info", "--format", "json",
+                    "--", session.sessionID]
+        var request = DaemonRequest(op: "session_page")
+        request.machine = session.machineID
+        request.sessionID = session.sessionID
+        request.sourcePath = session.sourcePath
+        request.offset = offset
+        request.limit = limit
+        let data: Data
+        do {
+            data = try await run(args, daemonRequest: request)
+        } catch let error as ClientError where error.message.contains("--page-info") &&
+            (error.message.contains("unexpected argument") || error.message.contains("unrecognized option")) {
+            // Older local CLI overrides still work. Older remote peers already
+            // return page totals through the existing SessionPage RPC.
+            let records = try await records(for: session, offset: offset, limit: limit)
+            let metadata = try await recordMetadata(for: session, offset: offset, limit: 1)
+            return TranscriptPage(records: records, offset: offset, total: metadata.total)
+        }
+        let items = try JSONDecoder().decode([TranscriptPageItem].self, from: data)
+        let records = items.compactMap { if case .record(let record) = $0 { record } else { nil } }
+        if let total = items.compactMap({ if case .total(let total) = $0 { total } else { nil } }).last {
+            guard total >= 0 else { throw ClientError(message: "Memex returned an invalid transcript total.") }
+            return TranscriptPage(records: records, offset: offset, total: total)
+        }
+        // Tolerate an older CLI wrapper that accepts but does not emit page info.
+        let metadata = try await recordMetadata(for: session, offset: offset, limit: 1)
+        return TranscriptPage(records: records, offset: offset, total: metadata.total)
     }
 
     /// The CLI has no ID-only session mode. Bound search scans to 256K characters
@@ -267,6 +356,26 @@ struct MemexClient: Sendable {
             }
             offset = next
             page = try await recordMetadata(for: session, offset: offset, limit: 500)
+        }
+    }
+}
+
+struct TranscriptPage: Sendable {
+    let records: [TranscriptRecord]
+    let offset: Int
+    let total: Int
+}
+
+private enum TranscriptPageItem: Decodable {
+    case record(TranscriptRecord)
+    case total(Int)
+    private enum CodingKeys: String, CodingKey { case type, total }
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        if try fields.decodeIfPresent(String.self, forKey: .type) == "page" {
+            self = .total(try fields.decode(Int.self, forKey: .total))
+        } else {
+            self = .record(try TranscriptRecord(from: decoder))
         }
     }
 }

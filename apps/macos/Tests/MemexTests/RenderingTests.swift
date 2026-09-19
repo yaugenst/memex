@@ -5,6 +5,55 @@ import Testing
 
 @Suite(.serialized) @MainActor
 struct RenderingTests {
+    @Test func messagesUseUnlabelledContentSizedBubblesAndKeepAccessibleSpeakers() throws {
+        let controller = TranscriptController()
+        let window = readerWindow(controller)
+        defer { window.close() }
+        let records = ["user", "assistant"].enumerated().map { index, role in
+            TranscriptRecord(recordID: "clean-\(index)", record: Message(role: role, text: "Short reply",
+                toolName: nil, toolInput: nil, toolOutput: nil))
+        }
+        controller.update(sessionID: "clean", records: records, provider: "codex")
+        pump(window)
+        #expect(controller.measurement(at: 0).contentWidth < 150)
+        for row in 0..<2 {
+            let cell = try #require(controller.table.view(atColumn: 0, row: row, makeIfNecessary: true))
+            cell.layoutSubtreeIfNeeded()
+            #expect(descendants(of: cell, as: NSTextField.self).allSatisfy {
+                $0.isHiddenOrHasHiddenAncestor || !["You", "codex"].contains($0.stringValue)
+            })
+            let text = try #require(descendants(of: cell, as: NSTextView.self).first)
+            #expect(text.accessibilityLabel() == (row == 0 ? "You" : "codex"))
+            #expect(text.isSelectable)
+            #expect(text.frame.maxY <= controller.measurement(at: row).height)
+        }
+    }
+
+    @Test func userBubblesWrapWithinReaderAtNarrowAndWideSizes() throws {
+        let controller = TranscriptController()
+        let window = readerWindow(controller)
+        defer { window.close() }
+        let record = TranscriptRecord(recordID: "wrapped", record: Message(role: "user",
+            text: String(repeating: "A longer message that needs room to wrap. ", count: 30),
+            toolName: nil, toolInput: nil, toolOutput: nil))
+        controller.update(sessionID: "wrapped", records: [record], provider: "codex")
+        for width in [350.0, 700.0, 1200.0] {
+            window.setContentSize(NSSize(width: width, height: 600))
+            pump(window)
+            let readerWidth = controller.table.bounds.width
+            let value = controller.measurement(at: 0)
+            #expect(value.contentWidth <= min(800, readerWidth - 60) * 0.77)
+            #expect(abs(value.contentX + value.contentWidth - (readerWidth - 30)) < 1)
+            let cell = try #require(controller.table.view(atColumn: 0, row: 0, makeIfNecessary: true))
+            cell.layoutSubtreeIfNeeded()
+            let text = try #require(descendants(of: cell, as: NSTextView.self).first)
+            let manager = try #require(text.layoutManager)
+            let container = try #require(text.textContainer)
+            manager.ensureLayout(for: container)
+            #expect(manager.usedRect(for: container).height <= value.fullTextHeight + 1)
+        }
+    }
+
     @Test func wideReaderKeepsAssistantAndToolsAtLeftGutter() {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 1600, height: 700)
@@ -59,7 +108,11 @@ struct RenderingTests {
             let manager = try #require(text.layoutManager)
             let container = try #require(text.textContainer)
             manager.ensureLayout(for: container)
-            #expect(manager.usedRect(for: container).height <= measured.textHeight + 1)
+            if let rich = measured.richContent {
+                #expect(rich.height(for: measured.contentWidth) == measured.fullTextHeight)
+            } else {
+                #expect(manager.usedRect(for: container).height <= measured.fullTextHeight + 1)
+            }
             if width == 500, let path = ProcessInfo.processInfo.environment["MEMEX_RENDER_SNAPSHOT"],
                let bitmap = cell.bitmapImageRepForCachingDisplay(in: cell.bounds) {
                 cell.wantsLayer = true
@@ -149,7 +202,7 @@ struct RenderingTests {
         #expect(controller.measurement(at: 0).body == "Complete instructions")
     }
 
-    @Test func messagesShowFullTextWithoutCharacterCounterControls() throws {
+    @Test func longMessagesRetainFullSelectableTextBehindShowAll() throws {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 600)
         let text = String(repeating: "Complete message content. ", count: 400) + "END OF MESSAGE"
@@ -161,7 +214,10 @@ struct RenderingTests {
             #expect(controller.measurement(at: row).body == text)
             let cell = try #require(controller.table.view(atColumn: 0, row: row, makeIfNecessary: true))
             #expect(descendants(of: cell, as: NSTextView.self).contains { $0.string.hasSuffix("END OF MESSAGE") })
-            #expect(descendants(of: cell, as: NSButton.self).allSatisfy { $0.isHidden })
+            #expect(descendants(of: cell, as: NSButton.self).contains { !$0.isHidden && $0.title == "Show all" })
+            #expect(controller.measurement(at: row).textHeight < controller.measurement(at: row).fullTextHeight)
+            controller.toggleFullBody(controller.rows[row].id)
+            #expect(controller.measurement(at: row).textHeight == controller.measurement(at: row).fullTextHeight)
         }
     }
 
@@ -280,6 +336,36 @@ struct RenderingTests {
         #expect(abs(controller.scrollView.contentView.bounds.minY - savedY) < 1)
     }
 
+    @Test func prependingPageReusesUnchangedLayoutsAndInvalidatesChangedText() {
+        let controller = TranscriptController()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 450)
+        controller.update(sessionID: "cache", records: simpleRecords(60..<120), provider: "codex")
+        let cached = controller.measurement(at: 10).attributedBody
+        controller.update(sessionID: "cache", records: simpleRecords(0..<120), provider: "codex")
+        #expect(controller.measurement(at: 70).attributedBody === cached)
+        var edited = simpleRecords(0..<120)
+        var message = edited[70].record
+        message.text = "Updated message"
+        edited[70] = TranscriptRecord(recordID: edited[70].id, record: message)
+        controller.update(sessionID: "cache", records: edited, provider: "codex")
+        #expect(controller.measurement(at: 70).attributedBody !== cached)
+        #expect(controller.measurement(at: 70).attributedBody.string.contains("Updated message"))
+    }
+
+    @Test func prependingDuringTopOverscrollKeepsOldFirstMessageVisible() {
+        let controller = TranscriptController()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 450)
+        controller.scrollView.contentView = OverscrollClipView(frame: controller.scrollView.bounds)
+        controller.scrollView.documentView = controller.table
+        controller.update(sessionID: "overscroll", records: simpleRecords(60..<120), provider: "codex", hasEarlier: true)
+        // Trackpad rubber-banding allows a negative clip origin while the
+        // asynchronous earlier-page request completes.
+        controller.scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: -32))
+        #expect(controller.scrollView.contentView.bounds.minY < 0)
+        controller.update(sessionID: "overscroll", records: simpleRecords(0..<120), provider: "codex")
+        #expect(abs(controller.scrollView.contentView.bounds.minY - controller.table.rect(ofRow: 60).minY) < 1)
+    }
+
     @Test func prependingEarlierMessagesKeepsVisibleMessageAtSameOffset() {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 450)
@@ -310,6 +396,15 @@ struct RenderingTests {
         #expect(abs(controller.scrollView.contentView.bounds.minY - controller.table.rect(ofRow: index).minY) < 1)
     }
 
+    private func readerWindow(_ controller: TranscriptController) -> NSWindow {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
+                              styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentViewController = controller
+        return window
+    }
+
     private func simpleRecords(_ range: Range<Int>) -> [TranscriptRecord] {
         range.map { TranscriptRecord(recordID: "\($0)", record: Message(role: "assistant", text: "Message \($0)", toolName: nil, toolInput: nil, toolOutput: nil)) }
     }
@@ -338,4 +433,9 @@ struct RenderingTests {
 
 @MainActor private func descendants<T: NSView>(of view: NSView, as type: T.Type) -> [T] {
     ((view as? T).map { [$0] } ?? []) + view.subviews.flatMap { descendants(of: $0, as: type) }
+}
+
+/// Model the unconstrained clip bounds AppKit permits during rubber-banding.
+@MainActor private final class OverscrollClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect { proposedBounds }
 }

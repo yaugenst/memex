@@ -9,17 +9,16 @@ use std::path::PathBuf;
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub(super) enum IndexCommand {
-    /// Upgrade 0.12 session metadata while retaining records and embeddings
-    MigrateV019 {
-        #[arg(long)]
-        root: Option<PathBuf>,
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Rebuild the index from scratch
     Rebuild {
         #[command(flatten)]
         index: IndexArgs,
+    },
+    /// Merge segments below 5% of the corpus, excluding the three largest
+    #[command(hide = true)]
+    Compact {
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Reclaim unreachable generations (requires stopped readers)
     Gc {
@@ -104,7 +103,6 @@ impl Commands {
                 action: Some(action),
                 ..
             } => match action {
-                IndexCommand::MigrateV019 { root, dry_run } => Self::MigrateV019 { root, dry_run },
                 IndexCommand::Rebuild { index } => Self::Reindex { index },
                 IndexCommand::Gc {
                     root,
@@ -115,6 +113,7 @@ impl Commands {
                     dry_run,
                     offline,
                 },
+                IndexCommand::Compact { root } => Self::IndexCompact { root },
                 IndexCommand::Embed { model, root } => Self::Embed { model, root },
                 IndexCommand::Stats { root } => Self::Stats { root },
             },
@@ -183,6 +182,8 @@ pub(super) enum IndexSource {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
+    Zcode,
 }
 
 impl IndexArgs {
@@ -200,6 +201,8 @@ impl IndexArgs {
             IndexSource::Jcode => self.jcode && !self.no_jcode,
             IndexSource::Muse => self.muse && !self.no_muse,
             IndexSource::Antigravity => self.antigravity && !self.no_antigravity,
+            IndexSource::Bob => self.bob && !self.no_bob,
+            IndexSource::Zcode => self.zcode && !self.no_zcode,
         };
         legacy_enabled
             && (self.only_source.is_empty() || self.only_source.contains(&source))
@@ -446,6 +449,8 @@ mod tests {
             "--no-jcode",
             "--no-muse",
             "--no-antigravity",
+            "--no-bob",
+            "--no-zcode",
         ]);
         assert_eq!(
             selected.source.as_deref(),

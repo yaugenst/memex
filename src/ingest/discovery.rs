@@ -1,0 +1,1909 @@
+use super::*;
+use crate::state::checkpoint::FileLoadScope;
+
+pub(super) const FILE_IDENTITY_PREFIX_BYTES: usize = 4096;
+
+pub(super) struct TranscriptDiscovery {
+    pub tasks: Vec<FileTask>,
+    pub unchanged_identities: Vec<(String, FileIdentity)>,
+    pub files_scanned: usize,
+    pub files_skipped: usize,
+    pub total_bytes: u64,
+    pub session_ids: HashSet<String>,
+    pub superseded_projections: HashSet<String>,
+}
+
+pub(super) fn discover_transcripts(
+    options: &IngestOptions,
+    excluder: &PathExcluder,
+    state: &mut CheckpointSession,
+    pool: &rayon::ThreadPool,
+    selected: Option<&[crate::sources::SourceFile]>,
+    mut walk: Option<&mut directories::StampedWalk>,
+) -> Result<TranscriptDiscovery> {
+    let full_scan = selected.is_none();
+    let mut files = selected.unwrap_or_default().to_vec();
+    for root in options.claude_sources.iter().filter(|_| full_scan) {
+        if root.exists() {
+            files.extend(crate::sources::claude::discover(
+                root,
+                options.include_agents,
+                walk.as_deref_mut(),
+            )?);
+        }
+    }
+    if options.include_codex && full_scan {
+        files.extend(crate::sources::codex::discover_rollouts(
+            walk.as_deref_mut(),
+        ));
+        files.extend(
+            crate::sources::codex::history_paths()
+                .into_iter()
+                .map(|path| crate::sources::SourceFile {
+                    source: SourceKind::Codex,
+                    path,
+                }),
+        );
+    }
+    if options.include_cursor && full_scan {
+        files.extend(crate::sources::cursor::discover_transcripts());
+    }
+    if options.include_pi && full_scan {
+        files.extend(crate::sources::pi::discover(walk.as_deref_mut()));
+    }
+    if options.include_omp && full_scan {
+        files.extend(crate::sources::omp::discover(walk.as_deref_mut()));
+    }
+    if options.include_openclaw && full_scan {
+        files.extend(crate::sources::openclaw::discover());
+    }
+    if options.include_copilot && full_scan {
+        files.extend(crate::sources::copilot::discover_sessions());
+    }
+    if options.include_grok && full_scan {
+        files.extend(crate::sources::grok::discover_sessions());
+    }
+    if options.include_jcode && full_scan {
+        files.extend(crate::sources::jcode::discover());
+    }
+    if options.include_muse && full_scan {
+        files.extend(crate::sources::muse::discover(walk));
+    }
+    if options.include_antigravity && full_scan {
+        files.extend(crate::sources::antigravity::discover());
+    }
+
+    // A watcher hint names the file that changed, not necessarily the projection
+    // that owns its conversation. Resolve ownership here for both scan modes.
+    let mut superseded_projections = HashSet::new();
+    for file in &mut files {
+        if file.source != SourceKind::Antigravity {
+            continue;
+        }
+        let Some(session) = crate::sources::antigravity::projection_session_id(&file.path) else {
+            continue;
+        };
+        let projections = crate::sources::antigravity::projection_paths(&session);
+        let mut winner = None;
+        for candidate in &projections {
+            if discovered_metadata(candidate)?.is_some_and(|metadata| metadata.is_file()) {
+                winner = Some(candidate.clone());
+                break;
+            }
+        }
+        if let Some(winner) = winner {
+            file.path = winner.clone();
+            if !excluder.is_excluded(&winner) {
+                superseded_projections.extend(
+                    projections
+                        .into_iter()
+                        .filter(|path| *path != winner)
+                        .map(|path| path.to_string_lossy().into_owned()),
+                );
+            }
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup();
+
+    state.preload(
+        &files
+            .iter()
+            .filter(|file| !excluder.is_excluded(&file.path))
+            .map(|file| file.path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        if full_scan {
+            FileLoadScope::Bulk
+        } else {
+            FileLoadScope::Targeted
+        },
+    )?;
+    let loaded = &state.loaded;
+    let session_ids = selected
+        .filter(|files| {
+            files.iter().any(|file| {
+                file.source == SourceKind::Codex
+                    && crate::sources::codex::is_history_path(&file.path)
+            })
+        })
+        .map(|files| selection::codex_session_ids(options, state, files))
+        .transpose()?
+        .unwrap_or_default();
+
+    enum Observed {
+        Excluded,
+        Missing {
+            session_id: Option<String>,
+        },
+        File {
+            task: Box<FileTask>,
+            skip: bool,
+            session_id: Option<String>,
+        },
+    }
+    let observations = pool.install(|| {
+        files
+            .into_par_iter()
+            .map(|file| -> Result<Observed> {
+                let path = file.path;
+                if excluder.is_excluded(&path) {
+                    return Ok(Observed::Excluded);
+                }
+                let session_id = (file.source == SourceKind::Codex
+                    && !crate::sources::codex::is_history_path(&path))
+                .then(|| crate::sources::codex::session_id_from_path(&path))
+                .flatten();
+                let Some(metadata) = discovered_metadata(&path)? else {
+                    return Ok(Observed::Missing { session_id });
+                };
+                let key = path.to_string_lossy().into_owned();
+                let (task, skip) = prepare_file_task(
+                    path,
+                    file.source,
+                    options.include_reasoning,
+                    &metadata,
+                    loaded
+                        .get(&key)
+                        .expect("checkpoint path must be preloaded")
+                        .as_ref(),
+                );
+                Ok(Observed::File {
+                    task: Box::new(task),
+                    skip,
+                    session_id,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let mut result = TranscriptDiscovery {
+        tasks: Vec::new(),
+        unchanged_identities: Vec::new(),
+        files_scanned: 0,
+        files_skipped: 0,
+        total_bytes: 0,
+        session_ids,
+        superseded_projections,
+    };
+    for observation in observations {
+        match observation {
+            Observed::Excluded => result.files_skipped += 1,
+            Observed::Missing { session_id } => {
+                result.session_ids.extend(session_id);
+                result.files_skipped += 1;
+            }
+            Observed::File {
+                task,
+                skip,
+                session_id,
+            } => {
+                result.session_ids.extend(session_id);
+                result.files_scanned += 1;
+                result.total_bytes += task.size;
+                if skip {
+                    result.files_skipped += 1;
+                    result
+                        .unchanged_identities
+                        .push((task.path.to_string_lossy().into_owned(), task.identity));
+                } else {
+                    result.tasks.push(*task);
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Directory stamps are only reusable while the roots and filters that produced them hold.
+fn discovery_fingerprint(options: &IngestOptions) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"memex-directory-stamps-v2");
+    let mut feed = |bytes: &[u8]| {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    for root in &options.claude_sources {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    for root in crate::sources::codex::rollout_roots() {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    feed(
+        crate::sources::pi::sessions_root()
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    for root in crate::sources::omp::session_roots() {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    feed(
+        crate::sources::muse::sessions_root()
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    for flag in [
+        options.include_agents,
+        options.include_codex,
+        options.include_pi,
+        options.include_omp,
+        options.include_muse,
+    ] {
+        feed(&[u8::from(flag)]);
+    }
+    for pattern in &options.exclude_patterns {
+        feed(pattern.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+/// Start replaying the file-system event journal from the cursor persisted by the last
+/// committed refresh, on its own thread, before the checkpoint is opened.
+pub(crate) fn start_journal_replay(
+    paths: &Paths,
+    options: &IngestOptions,
+) -> journal::ReplayHandle {
+    let roots = crate::watch::watch_roots(options)
+        .into_iter()
+        .filter(|root| root.exists())
+        .collect::<Vec<_>>();
+    let fingerprint = journal_fingerprint(options, &roots);
+    let state_path = paths.state.join("ingest.json");
+    journal::ReplayHandle::spawn(roots, fingerprint, move |fingerprint| {
+        CheckpointReader::open(&state_path)
+            .and_then(|reader| reader.load_journal_cursor(fingerprint))
+            .ok()
+            .flatten()
+    })
+}
+
+/// Collect the replay. Returns the cursor to persist with this refresh and, when the journal
+/// was complete within budget, the paths that may have changed. `None` hints mean the caller
+/// must walk.
+fn journal_hints(
+    journal: journal::ReplayHandle,
+    state: &CheckpointSession,
+    options: &IngestOptions,
+) -> Result<(
+    Option<journal::JournalCursorUpdate>,
+    Option<HashSet<PathBuf>>,
+)> {
+    let (fingerprint, replay) = journal.wait(journal::REPLAY_BUDGET);
+    let cursor = replay.next.map(|cursor| journal::JournalCursorUpdate {
+        fingerprint,
+        cursor,
+    });
+    let hints = match replay.outcome {
+        journal::Replay::Changed(mut paths) => {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(crate::watch::HOT_WINDOW.as_secs()) as i64;
+            paths.extend(
+                state
+                    .sweep_candidate_keys(since)?
+                    .into_iter()
+                    .map(PathBuf::from),
+            );
+            // A Bob database with no indexed task yet has no checkpoint to sweep from;
+            // its first WAL-only commits still need a look on every journal refresh.
+            if options.include_bob {
+                paths.extend(
+                    crate::sources::bob::database_paths()
+                        .into_iter()
+                        .filter(|database| database.is_file()),
+                );
+            }
+            // The zcode store is in the same position: WAL-only commits leave no
+            // checkpoint to sweep from until the first full index sees it.
+            if options.include_zcode {
+                paths.extend(
+                    crate::sources::zcode::db_paths()
+                        .into_iter()
+                        .filter(|database| database.is_file()),
+                );
+            }
+            crate::profiling::count!("journal.hints", paths.len());
+            Some(paths)
+        }
+        journal::Replay::Unusable(_) => {
+            crate::profiling::count!("journal.fallbacks", 1);
+            None
+        }
+    };
+    Ok((cursor, hints))
+}
+
+/// A cursor is only meaningful for the roots that existed when it was captured: a root that
+/// appears later was never watched and needs a walk.
+fn journal_fingerprint(options: &IngestOptions, roots: &[PathBuf]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"memex-journal-v1");
+    hash.update(discovery_fingerprint(options).as_bytes());
+    for root in roots.iter().filter(|root| root.exists()) {
+        let bytes = root.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+pub(super) fn modified_ns(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|time| time.as_nanos().min(i64::MAX as u128) as i64)
+}
+
+pub(super) fn changed_ns(metadata: &std::fs::Metadata) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.ctime_nsec() != 0).then(|| {
+            metadata
+                .ctime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(metadata.ctime_nsec())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+pub(super) fn unchanged_file_metadata(
+    previous: &FileState,
+    metadata: &std::fs::Metadata,
+    parser_version: u32,
+) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        previous.size == metadata.len()
+            && previous.parser_version == parser_version
+            && previous.identity.device == Some(metadata.dev())
+            && previous.identity.inode == Some(metadata.ino())
+            && previous.identity.modified_ns.is_some()
+            && previous.identity.modified_ns == modified_ns(metadata)
+            && previous.identity.changed_ns.is_some()
+            && previous.identity.changed_ns == changed_ns(metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (previous, metadata, parser_version);
+        false
+    }
+}
+
+pub(super) fn file_identity(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    prefix_bytes: usize,
+) -> FileIdentity {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let prefix_sha256 = if metadata.is_file() {
+        File::open(path).ok().and_then(|mut file| {
+            let mut bytes = vec![0; prefix_bytes];
+            let read = file.read(&mut bytes).ok()?;
+            crate::profiling::count!("ingest.prefix_reads", 1);
+            crate::profiling::count!("ingest.prefix_bytes", read);
+            bytes.truncate(read);
+            Some(format!("{:x}", Sha256::digest(&bytes)))
+        })
+    } else {
+        None
+    };
+
+    FileIdentity {
+        bob_database: None,
+        zcode_database: None,
+        sqlite_wal: None,
+        #[cfg(unix)]
+        device: Some(metadata.dev()),
+        #[cfg(not(unix))]
+        device: None,
+        #[cfg(unix)]
+        inode: Some(metadata.ino()),
+        #[cfg(not(unix))]
+        inode: None,
+        prefix_sha256,
+        prefix_bytes: prefix_bytes as u64,
+        modified_ns: modified_ns(metadata),
+        changed_ns: changed_ns(metadata),
+    }
+}
+
+pub(super) fn prepare_file_task(
+    path: PathBuf,
+    source: SourceKind,
+    include_reasoning: bool,
+    metadata: &std::fs::Metadata,
+    previous: Option<&FileState>,
+) -> (FileTask, bool) {
+    crate::profiling::span!("ingest.file_check");
+    let size = metadata.len();
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let prefix_bytes = previous
+        .map(|state| {
+            if state.identity.prefix_bytes > 0 {
+                state.identity.prefix_bytes
+            } else {
+                state.size.min(FILE_IDENTITY_PREFIX_BYTES as u64)
+            }
+        })
+        .unwrap_or_else(|| size.min(FILE_IDENTITY_PREFIX_BYTES as u64))
+        .min(size) as usize;
+    let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
+    let mut identity = previous
+        .filter(|previous| unchanged_file_metadata(previous, metadata, parser_version))
+        .map(|previous| previous.identity.clone())
+        .unwrap_or_else(|| file_identity(&path, metadata, prefix_bytes));
+    if (source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path))
+        || source == SourceKind::Zcode
+    {
+        identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
+    }
+    let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);
+    let (mut offset, mut turn_id, mut pending_tool_calls) = match (change, previous) {
+        (FileChange::Append | FileChange::Unchanged, Some(previous)) => (
+            previous.offset,
+            previous.turn_id,
+            previous.pending_tool_calls.clone(),
+        ),
+        _ => (0, 0, HashMap::new()),
+    };
+    let claude = resolve_claude_background(&path, source, size, previous, change);
+    if claude.reparse {
+        change = FileChange::Replaced;
+        offset = 0;
+        turn_id = 0;
+        pending_tool_calls.clear();
+    }
+    let claude_background = claude.background;
+
+    (
+        FileTask {
+            path,
+            source,
+            offset,
+            turn_id,
+            legacy_turn_id: if matches!(source, SourceKind::Claude | SourceKind::Codex)
+                && offset == 0
+            {
+                Some(0)
+            } else {
+                previous.and_then(|previous| previous.legacy_turn_id)
+            },
+            size,
+            mtime,
+            change,
+            pending_tool_calls,
+            identity,
+            parser_version,
+            codex_metadata_offsets: previous
+                .filter(|_| source == SourceKind::Codex && offset > 0 && !change.replaces_records())
+                .and_then(|state| state.codex_metadata_offsets.clone()),
+            claude_background,
+        },
+        change == FileChange::Unchanged,
+    )
+}
+
+/// Claude marks a whole transcript as a background session with a file-level flag that can
+/// appear long after its first records were indexed. Discovering it late reclassifies every
+/// record in the file, so the transcript is reparsed from zero when the marker turns up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClaudeBackground {
+    background: Option<bool>,
+    reparse: bool,
+}
+
+fn resolve_claude_background(
+    path: &Path,
+    source: SourceKind,
+    size: u64,
+    previous: Option<&FileState>,
+    change: FileChange,
+) -> ClaudeBackground {
+    if source != SourceKind::Claude {
+        return ClaudeBackground::default();
+    }
+    if change.replaces_records() {
+        // A replacement must rediscover the marker from the new contents.
+        return ClaudeBackground::default();
+    }
+    let mut resolved = ClaudeBackground {
+        background: previous.and_then(|state| state.claude_background),
+        reparse: false,
+    };
+    match resolved.background {
+        Some(true) => {}
+        Some(false) if size > previous.map_or(0, |state| state.offset) => {
+            match crate::sources::claude::has_background_session_kind_since(
+                path,
+                previous.map_or(0, |state| state.offset),
+                size,
+            ) {
+                // If the tail cannot be inspected, fail safe by reparsing; parsing
+                // will surface a persistent read failure.
+                Ok(true) | Err(_) => {
+                    resolved.background = None;
+                    resolved.reparse = true;
+                }
+                Ok(false) => {}
+            }
+        }
+        None if previous.is_some() => {
+            // State written before this was tracked needs a one-time full check;
+            // later appends inspect only their own tail.
+            resolved.background =
+                crate::sources::claude::has_background_session_kind_since(path, 0, size).ok();
+            if resolved.background == Some(true) && previous.is_some_and(|state| state.offset > 0) {
+                resolved.reparse = true;
+            }
+        }
+        _ => {}
+    }
+    resolved
+}
+
+pub(super) fn discovered_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match path.metadata() {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read metadata for {}", path.display())),
+    }
+}
+
+pub(super) fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+pub(super) struct OpenCodeDiscovery {
+    pub ready_databases: Vec<PreparedOpencodeDatabase>,
+    pub ready_owned_sessions: HashMap<String, HashSet<String>>,
+    pub diagnostics: crate::sources::ParseDiagnostics,
+    pub scope_targets: Vec<SessionScope>,
+    pub session_cwds: HashMap<SessionScope, String>,
+    pub database_states: HashMap<String, crate::state::OpencodeDatabaseState>,
+    pub database_paths_to_delete: Vec<String>,
+    pub database_outcomes: HashMap<String, OpencodeDatabaseOutcome>,
+    pub legacy_paths_to_delete: Vec<String>,
+    pub tasks: Vec<FileTask>,
+    pub unchanged_identities: Vec<(String, FileIdentity)>,
+    pub files_scanned: usize,
+    pub files_skipped: usize,
+    pub total_bytes: u64,
+    pub deferred_pending_scopes: Vec<SessionScope>,
+}
+
+#[derive(Default)]
+pub(super) struct SessionDatabaseDiscovery {
+    pub tasks: Vec<FileTask>,
+    pub unchanged_identities: Vec<(String, FileIdentity)>,
+    pub files_scanned: usize,
+    pub files_skipped: usize,
+    pub total_bytes: u64,
+    /// Virtual paths whose session vanished from a readable database, or whose database
+    /// was itself deleted.
+    pub missing_paths: Vec<String>,
+    /// Databases that exist but could not be read this refresh. Their sessions must not be
+    /// deleted on any path (pending recovery included) because no replacement is coming.
+    pub unreadable_databases: Vec<PathBuf>,
+    pub diagnostics: crate::sources::ParseDiagnostics,
+}
+
+/// Bob keeps every task in one SQLite database; each task becomes the virtual file
+/// `<db>/<task_id>` so state, deletes and session metadata stay per source path. The
+/// database is never stat'ed as a transcript: task aggregates drive change detection,
+/// and `plan::classify_file` maps any growth to a delete-first replay of that task.
+///
+/// `selected` narrows a refresh to the databases a watcher saw change; `None` covers
+/// every configured database.
+pub(super) fn discover_bob(
+    options: &IngestOptions,
+    excluder: &PathExcluder,
+    state: &mut CheckpointSession,
+    selected: Option<&[crate::sources::SourceFile]>,
+) -> Result<SessionDatabaseDiscovery> {
+    let mut result = SessionDatabaseDiscovery::default();
+    if !options.include_bob {
+        return Ok(result);
+    }
+    let databases = match selected {
+        Some(files) => files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+        None => crate::sources::bob::database_paths(),
+    };
+    if databases.is_empty() {
+        return Ok(result);
+    }
+    crate::profiling::span!("bob.discover");
+    let parser_version =
+        crate::sources::index_state_version_for(SourceKind::Bob, options.include_reasoning);
+    let mut readable: Vec<PathBuf> = Vec::new();
+    let mut absent: Vec<PathBuf> = Vec::new();
+    let mut current: HashSet<String> = HashSet::new();
+    for database in databases {
+        let canonical_database =
+            crate::sources::bob::canonical_alias(&database).filter(|alias| *alias != database);
+        if excluder.is_excluded(&database)
+            || canonical_database
+                .as_ref()
+                .is_some_and(|alias| excluder.is_excluded(alias))
+        {
+            // Exclusion is authoritative even when the store is locked or unavailable.
+            // Reconcile all previously owned tasks without opening the database.
+            result.files_skipped += 1;
+            absent.push(database);
+            continue;
+        }
+        match database.metadata() {
+            // Like the generic sweep, a deletion counts only while the containing
+            // directory is still readable; an unmounted volume must not purge history,
+            // and a pending replay must wait for it like any other unavailable database.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if database.parent().is_some_and(|parent| parent.is_dir()) {
+                    absent.push(database);
+                } else {
+                    result.unreadable_databases.push(database);
+                }
+                continue;
+            }
+            Err(_) => {
+                result
+                    .diagnostics
+                    .unreadable_sources
+                    .push(database.to_string_lossy().into_owned());
+                result.files_skipped += 1;
+                result.unreadable_databases.push(database);
+                continue;
+            }
+            Ok(metadata) if !metadata.is_file() => continue,
+            Ok(_) => {}
+        }
+        let tasks = match crate::sources::bob::enumerate_tasks(&database) {
+            Ok(tasks) => tasks,
+            // A locked or mid-migration database must not fail the refresh; its indexed
+            // tasks stay until it can be read again.
+            Err(_) => {
+                result
+                    .diagnostics
+                    .unreadable_sources
+                    .push(database.to_string_lossy().into_owned());
+                result.files_skipped += 1;
+                result.unreadable_databases.push(database);
+                continue;
+            }
+        };
+        let keys = tasks
+            .iter()
+            .map(|task| {
+                crate::sources::bob::virtual_path(&database, &task.id)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        // Point lookups: Bob keys are a small share of the files table even on a full scan.
+        state.preload(&keys, FileLoadScope::Targeted)?;
+        current.extend(keys.iter().cloned());
+        // A virtual path cannot be canonicalized (`ENOTDIR`), so exclusions written against
+        // the real directory of a symlinked database are checked on the alias explicitly.
+        for (task, key) in tasks.iter().zip(keys) {
+            let path = PathBuf::from(&key);
+            let excluded = excluder.is_excluded(&path)
+                || canonical_database
+                    .as_ref()
+                    .is_some_and(|alias| excluder.is_excluded(&alias.join(&task.id)));
+            if excluded {
+                result.files_skipped += 1;
+                // The generic exclusion cleanup only sees the configured spelling.
+                if state.file(&key).is_some() {
+                    state.delete_file(&key);
+                    result.missing_paths.push(key);
+                }
+                continue;
+            }
+            result.files_scanned += 1;
+            result.total_bytes += task.message_count;
+            let identity = FileIdentity {
+                bob_database: Some(database.to_string_lossy().into_owned()),
+                prefix_sha256: Some(task.fingerprint()),
+                prefix_bytes: 1,
+                ..FileIdentity::default()
+            };
+            let size = task.message_count;
+            let mtime = (task.updated_at / 1000) as i64;
+            let change = plan::classify_file(
+                SourceKind::Bob,
+                size,
+                mtime,
+                &identity,
+                parser_version,
+                state.file(&key),
+            );
+            if change == FileChange::Unchanged {
+                result.files_skipped += 1;
+                result.unchanged_identities.push((key, identity));
+                continue;
+            }
+            result.tasks.push(FileTask {
+                path,
+                source: SourceKind::Bob,
+                offset: 0,
+                turn_id: 0,
+                legacy_turn_id: None,
+                size,
+                mtime,
+                change,
+                pending_tool_calls: HashMap::new(),
+                identity,
+                parser_version,
+                codex_metadata_offsets: None,
+                claude_background: None,
+            });
+        }
+        readable.push(database);
+    }
+    // The generic missing-file sweep skips virtual paths (they stat as `ENOTDIR`), so
+    // tasks deleted from a readable database, and every task of a deleted database, are
+    // reconciled here in one pass over the tracked keys.
+    if !readable.is_empty() || !absent.is_empty() {
+        for key in state.file_keys()? {
+            let Some((owner, _)) = crate::sources::bob::split_virtual_path(Path::new(&key)) else {
+                continue;
+            };
+            let vanished =
+                absent.contains(&owner) || (readable.contains(&owner) && !current.contains(&key));
+            if vanished {
+                state.delete_file(&key);
+                result.missing_paths.push(key);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// ZCode sessions own independent checkpoints. Hash conversation rows rather than
+/// the database/WAL so accounting-only commits never schedule transcript replay.
+pub(super) fn discover_zcode(
+    options: &IngestOptions,
+    excluder: &PathExcluder,
+    state: &mut CheckpointSession,
+    selected: Option<&[crate::sources::SourceFile]>,
+) -> Result<SessionDatabaseDiscovery> {
+    let mut result = SessionDatabaseDiscovery::default();
+    if !options.include_zcode {
+        return Ok(result);
+    }
+    let databases = match selected {
+        Some(files) => files.iter().map(|file| file.path.clone()).collect(),
+        None => crate::sources::zcode::roots()
+            .into_iter()
+            .map(|root| root.join("cli/db/db.sqlite"))
+            .collect::<Vec<_>>(),
+    };
+    let parser_version =
+        crate::sources::index_state_version_for(SourceKind::Zcode, options.include_reasoning);
+    for database in databases {
+        let alias = database.canonicalize().ok();
+        let excluded = excluder.is_excluded(&database)
+            || alias
+                .as_ref()
+                .is_some_and(|path| excluder.is_excluded(path));
+        let absent = database.metadata().is_err_and(|error| {
+            error.kind() == std::io::ErrorKind::NotFound
+                && database.parent().is_some_and(Path::is_dir)
+        });
+        let sessions = if excluded || absent {
+            Vec::new()
+        } else {
+            match crate::sources::zcode::enumerate_sessions(&database) {
+                Ok(sessions) => sessions,
+                Err(_) => {
+                    result
+                        .diagnostics
+                        .unreadable_sources
+                        .push(database.to_string_lossy().into_owned());
+                    result.unreadable_databases.push(database);
+                    result.files_skipped += 1;
+                    continue;
+                }
+            }
+        };
+        let mut current = HashSet::new();
+        let keys = sessions
+            .iter()
+            .map(|session| {
+                crate::sources::zcode::virtual_path(&database, &session.id)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        state.preload(&keys, FileLoadScope::Targeted)?;
+        for (session, key) in sessions.into_iter().zip(keys) {
+            let path = PathBuf::from(&key);
+            if excluder.is_excluded(&path)
+                || alias.as_ref().is_some_and(|alias| {
+                    excluder.is_excluded(&crate::sources::zcode::virtual_path(alias, &session.id))
+                })
+            {
+                result.files_skipped += 1;
+                continue;
+            }
+            current.insert(key.clone());
+            result.files_scanned += 1;
+            result.total_bytes += session.size;
+            let identity = FileIdentity {
+                zcode_database: Some(database.to_string_lossy().into_owned()),
+                prefix_sha256: Some(session.fingerprint),
+                prefix_bytes: 1,
+                ..FileIdentity::default()
+            };
+            let change = plan::classify_file(
+                SourceKind::Zcode,
+                session.size,
+                0,
+                &identity,
+                parser_version,
+                state.file(&key),
+            );
+            if change == FileChange::Unchanged {
+                result.files_skipped += 1;
+                result.unchanged_identities.push((key, identity));
+                continue;
+            }
+            result.tasks.push(FileTask {
+                path,
+                source: SourceKind::Zcode,
+                offset: 0,
+                turn_id: 0,
+                legacy_turn_id: None,
+                size: session.size,
+                mtime: 0,
+                change,
+                pending_tool_calls: HashMap::new(),
+                identity,
+                parser_version,
+                codex_metadata_offsets: None,
+                claude_background: None,
+            });
+        }
+        // Reconcile only after a successful inventory (or confirmed removal).
+        // The raw database key is the pre-session-scoped checkpoint; replace it once.
+        let database_key = database.to_string_lossy().into_owned();
+        for key in state.file_keys()? {
+            let owned = key == database_key
+                || crate::sources::zcode::split_virtual_path(Path::new(&key))
+                    .is_some_and(|(owner, _)| owner == database);
+            if owned && !current.contains(&key) {
+                state.delete_file(&key);
+                result.missing_paths.push(key);
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub(super) fn discover_opencode(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    selected: Option<&[crate::sources::SourceFile]>,
+    state: &mut CheckpointSession,
+    pending_recovery: &Option<PendingIngest>,
+    next_doc_id: &Arc<AtomicU64>,
+) -> Result<Option<OpenCodeDiscovery>> {
+    let full_scan = selected.is_none();
+    let excluder = build_path_excluder(options)?;
+    let mut tasks = Vec::new();
+    let mut unchanged_identities = Vec::new();
+    let mut files_scanned = 0;
+    let mut files_skipped = 0;
+    let mut total_bytes = 0;
+    let mut opencode_discovered_database_paths = HashSet::new();
+    let mut deferred_pending_scopes = pending_recovery
+        .as_ref()
+        .map(|pending| pending.session_scopes.clone())
+        .unwrap_or_default();
+    let mut opencode_ready_databases: Vec<PreparedOpencodeDatabase> = Vec::new();
+    let mut opencode_ready_owned_sessions: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut opencode_diagnostics: crate::sources::ParseDiagnostics = Default::default();
+    let mut opencode_scope_targets: Vec<SessionScope> = Vec::new();
+    let mut opencode_session_cwds: HashMap<SessionScope, String> = HashMap::new();
+    let mut opencode_database_states: HashMap<String, crate::state::OpencodeDatabaseState> =
+        HashMap::new();
+    let mut opencode_database_paths_to_delete: Vec<String> = Vec::new();
+    let mut opencode_database_outcomes: HashMap<String, OpencodeDatabaseOutcome> = HashMap::new();
+    let mut opencode_legacy_paths_to_delete: Vec<String> = Vec::new();
+    if options.include_opencode && selected.is_none_or(|databases| !databases.is_empty()) {
+        let database_files = if let Some(databases) = selected {
+            databases.to_vec()
+        } else {
+            crate::sources::opencode::discover_databases()?
+        };
+        let mut planned_databases = Vec::new();
+        for source_file in database_files {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let key = path.to_string_lossy().to_string();
+            opencode_discovered_database_paths.insert(key.clone());
+            let Some(meta) = (match discovered_metadata(&path) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    if !full_scan {
+                        return Err(error)
+                            .with_context(|| format!("stat changed database {}", path.display()));
+                    }
+                    opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
+                    files_skipped += 1;
+                    continue;
+                }
+            }) else {
+                if !full_scan {
+                    return Ok(None);
+                }
+                opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let previous = state.opencode_databases.get(&key);
+            match crate::sources::opencode::scan_database(&path, previous) {
+                Ok(scan) => {
+                    if !full_scan
+                        && previous.is_none_or(|previous| {
+                            let sessions = scan
+                                .sessions
+                                .iter()
+                                .map(|session| session.id.clone())
+                                .collect::<HashSet<_>>();
+                            sessions != previous.owned_session_ids
+                        })
+                    {
+                        return Ok(None);
+                    }
+                    opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Planned);
+                    planned_databases.push(PlannedOpencodeDatabase { path, scan });
+                }
+                Err(error) => {
+                    if !full_scan {
+                        return Err(error)
+                            .with_context(|| format!("scan changed database {}", path.display()));
+                    }
+                    // A bad/locked modern database must not hide the compatible JSON store.
+                    opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
+                    files_skipped += 1;
+                }
+            }
+        }
+        planned_databases.sort_by(|left, right| left.path.cmp(&right.path));
+
+        for database in planned_databases {
+            let path = database.path.to_string_lossy().to_string();
+            let mut hydration_session_ids = database.scan.dirty_session_ids.clone();
+            if let Some(pending) = &pending_recovery {
+                hydration_session_ids.extend(
+                    pending
+                        .session_scopes
+                        .iter()
+                        .filter(|scope| scope.source_path == path)
+                        .map(|scope| scope.session_id.clone()),
+                );
+                hydration_session_ids.sort();
+                hydration_session_ids.dedup();
+            }
+            match prehydrate_opencode_database(
+                &database.path,
+                &database.scan,
+                &hydration_session_ids,
+                next_doc_id,
+                &paths.state,
+            ) {
+                Ok(prepared) => {
+                    opencode_database_outcomes.insert(path, OpencodeDatabaseOutcome::Ready);
+                    opencode_diagnostics.merge(prepared.diagnostics.clone());
+                    opencode_ready_databases.push(prepared);
+                }
+                Err(error) => {
+                    if !full_scan {
+                        return Err(error).with_context(|| {
+                            format!("parse changed database {}", database.path.display())
+                        });
+                    }
+                    opencode_database_outcomes.insert(path, OpencodeDatabaseOutcome::Failed);
+                    files_skipped += 1;
+                }
+            }
+        }
+        opencode_ready_databases.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut owner_by_session = HashMap::<String, String>::new();
+        let mut failed_previous = state
+            .opencode_databases
+            .iter()
+            .filter(|(path, _)| {
+                matches!(
+                    classify_opencode_database_outcome(
+                        opencode_database_outcomes.get(*path).copied(),
+                        opencode_discovered_database_paths.contains(*path),
+                        full_scan,
+                    ),
+                    OpencodeDatabaseOutcome::Failed
+                )
+            })
+            .collect::<Vec<_>>();
+        failed_previous.sort_by_key(|(path, _)| *path);
+        for (path, previous) in failed_previous {
+            for session_id in &previous.owned_session_ids {
+                claim_opencode_session_owner(&mut owner_by_session, session_id.clone(), path);
+            }
+        }
+        for database in &opencode_ready_databases {
+            let path = database.path.to_string_lossy().to_string();
+            for session in &database.scan.sessions {
+                claim_opencode_session_owner(&mut owner_by_session, session.id.clone(), &path);
+            }
+        }
+        for (path, previous) in &state.opencode_databases {
+            let outcome = classify_opencode_database_outcome(
+                opencode_database_outcomes.get(path).copied(),
+                opencode_discovered_database_paths.contains(path),
+                full_scan,
+            );
+            if outcome != OpencodeDatabaseOutcome::Ready {
+                if outcome == OpencodeDatabaseOutcome::ConfirmedAbsent {
+                    opencode_database_paths_to_delete.push(path.clone());
+                }
+                continue;
+            }
+            for session_id in &previous.owned_session_ids {
+                if owner_by_session.get(session_id) != Some(path) {
+                    opencode_scope_targets.push(SessionScope {
+                        source_path: path.clone(),
+                        session_id: session_id.clone(),
+                    });
+                }
+            }
+        }
+
+        for database in &opencode_ready_databases {
+            let path = database.path.to_string_lossy().to_string();
+            let owned_sessions = database
+                .scan
+                .sessions
+                .iter()
+                .filter(|session| owner_by_session.get(&session.id) == Some(&path))
+                .collect::<Vec<_>>();
+            let owned_session_ids = owned_sessions
+                .iter()
+                .map(|session| session.id.clone())
+                .collect::<HashSet<_>>();
+            opencode_ready_owned_sessions.insert(path.clone(), owned_session_ids.clone());
+            for session in &owned_sessions {
+                opencode_session_cwds.insert(
+                    SessionScope {
+                        source_path: path.clone(),
+                        session_id: session.id.clone(),
+                    },
+                    session.directory.clone(),
+                );
+            }
+            for session_id in &database.scan.dirty_session_ids {
+                if owner_by_session.get(session_id) == Some(&path) {
+                    opencode_scope_targets.push(SessionScope {
+                        source_path: path.clone(),
+                        session_id: session_id.clone(),
+                    });
+                }
+            }
+            opencode_database_states.insert(
+                path,
+                crate::state::OpencodeDatabaseState {
+                    parser_version: crate::sources::opencode::DATABASE_STATE_VERSION,
+                    event_rowid: database.scan.cursor.event_rowid,
+                    event_id: database.scan.cursor.event_id.clone(),
+                    owned_session_ids,
+                    session_cursors: database.scan.session_cursors.clone(),
+                },
+            );
+        }
+        if let Some(pending) = &pending_recovery {
+            deferred_pending_scopes = pending
+                .session_scopes
+                .iter()
+                .filter(|scope| {
+                    classify_opencode_database_outcome(
+                        opencode_database_outcomes.get(&scope.source_path).copied(),
+                        opencode_discovered_database_paths.contains(&scope.source_path),
+                        full_scan,
+                    ) == OpencodeDatabaseOutcome::Failed
+                })
+                .cloned()
+                .collect();
+            for scope in &pending.session_scopes {
+                if matches!(
+                    opencode_database_outcomes.get(&scope.source_path),
+                    Some(OpencodeDatabaseOutcome::Ready)
+                ) {
+                    opencode_scope_targets.push(scope.clone());
+                }
+            }
+        }
+        opencode_scope_targets.sort_by(|left, right| {
+            left.source_path
+                .cmp(&right.source_path)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        opencode_scope_targets.dedup();
+        opencode_database_paths_to_delete.sort();
+        opencode_database_paths_to_delete.dedup();
+
+        let opencode_files = if full_scan {
+            crate::sources::opencode::discover_sessions()?
+        } else {
+            Vec::new()
+        };
+        // A healthy v2 database owns its root's history, including sessions deleted
+        // before this scan. Frozen JSON must not recreate those absent sessions.
+        // Only ready databases qualify, preserving fallback after a database failure.
+        let v2_roots = opencode_ready_databases
+            .iter()
+            .filter(|database| database.scan.v2)
+            .filter_map(|database| database.path.parent().map(Path::to_path_buf))
+            .collect::<HashSet<_>>();
+        let database_owns_legacy = |path: &Path| {
+            path.ancestors()
+                .nth(3)
+                .is_some_and(|root| v2_roots.contains(root))
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|session| owner_by_session.contains_key(session))
+        };
+        let legacy_candidates = opencode_files
+            .iter()
+            .filter(|file| !excluder.is_excluded(&file.path) && database_owns_legacy(&file.path))
+            .map(|file| file.path.to_string_lossy().into_owned())
+            .collect::<HashSet<_>>();
+        state.preload(
+            &opencode_files
+                .iter()
+                .filter(|file| {
+                    !excluder.is_excluded(&file.path) && !database_owns_legacy(&file.path)
+                })
+                .map(|file| file.path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            if full_scan {
+                FileLoadScope::Bulk
+            } else {
+                FileLoadScope::Targeted
+            },
+        )?;
+        let mut legacy_cleanup = index.source_paths_with_records(&legacy_candidates)?;
+        if !legacy_candidates.is_empty() {
+            let analytics = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+            legacy_cleanup.extend(analytics.source_paths(&legacy_candidates)?);
+        }
+        for source_file in opencode_files {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            if database_owns_legacy(&path) {
+                let path_key = path.to_string_lossy().to_string();
+                if state.contains_file(&path_key)? || legacy_cleanup.contains(&path_key) {
+                    state.delete_file(&path_key);
+                    opencode_legacy_paths_to_delete.push(path_key);
+                }
+                files_skipped += 1;
+                continue;
+            }
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Opencode,
+                options.include_reasoning,
+                &meta,
+                state.file(&key),
+            );
+            if skip {
+                unchanged_identities.push((key, task.identity));
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
+    Ok(Some(OpenCodeDiscovery {
+        ready_databases: opencode_ready_databases,
+        ready_owned_sessions: opencode_ready_owned_sessions,
+        diagnostics: opencode_diagnostics,
+        scope_targets: opencode_scope_targets,
+        session_cwds: opencode_session_cwds,
+        database_states: opencode_database_states,
+        database_paths_to_delete: opencode_database_paths_to_delete,
+        database_outcomes: opencode_database_outcomes,
+        legacy_paths_to_delete: opencode_legacy_paths_to_delete,
+        tasks,
+        unchanged_identities,
+        files_scanned,
+        files_skipped,
+        total_bytes,
+        deferred_pending_scopes,
+    }))
+}
+
+/// Glob-based path exclusion applied at discovery time so matched
+/// transcripts never enter the index. Empty pattern sets disable matching.
+#[derive(Debug, Clone)]
+pub(crate) struct PathExcluder {
+    pub(super) set: Option<globset::GlobSet>,
+}
+
+impl PathExcluder {
+    pub(crate) fn build(patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            return Ok(Self { set: None });
+        }
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in patterns {
+            builder.add(
+                globset::GlobBuilder::new(pattern)
+                    .literal_separator(false)
+                    .build()
+                    .with_context(|| format!("invalid exclude pattern: {pattern}"))?,
+            );
+        }
+        let set = builder
+            .build()
+            .context("failed to compile exclude patterns")?;
+        Ok(Self { set: Some(set) })
+    }
+
+    pub(crate) fn is_excluded(&self, path: &Path) -> bool {
+        let Some(set) = &self.set else {
+            return false;
+        };
+        set.is_match(path)
+            || path
+                .canonicalize()
+                .is_ok_and(|canonical| canonical != path && set.is_match(&canonical))
+    }
+}
+
+pub(crate) fn build_path_excluder(options: &IngestOptions) -> Result<PathExcluder> {
+    let expanded = crate::config::expand_exclude_patterns(options.exclude_patterns.clone());
+    PathExcluder::build(&expanded)
+}
+
+pub(super) struct PreparedRefresh {
+    pub records_pruned: usize,
+    pub files_pruned: usize,
+    pub full_scan: bool,
+    pub scan_cache: Option<ScanCache>,
+    pub state: CheckpointSession,
+    pub recovering_pending_ingest: bool,
+    pub empty_index_rebuild: bool,
+    pub next_doc_id: Arc<AtomicU64>,
+    pub tasks: Vec<FileTask>,
+    pub files_scanned: usize,
+    pub files_skipped: usize,
+    pub total_bytes: u64,
+    pub session_ids: HashSet<String>,
+    pub deferred_pending_scopes: Vec<SessionScope>,
+    pub opencode_ready_databases: Vec<PreparedOpencodeDatabase>,
+    pub opencode_ready_owned_sessions: HashMap<String, HashSet<String>>,
+    pub opencode_diagnostics: crate::sources::ParseDiagnostics,
+    pub opencode_scope_targets: Vec<SessionScope>,
+    pub opencode_session_cwds: HashMap<SessionScope, String>,
+    pub opencode_database_paths_to_delete: Vec<String>,
+    pub opencode_session_links: HashMap<String, crate::sources::opencode::SessionLinks>,
+    pub recover_embeddings: bool,
+    pub reconcile_pending_vector_ids: bool,
+    pub recover_vector_cleanup: bool,
+    pub delete_paths: Vec<String>,
+    pub vector_delete_paths: HashSet<String>,
+    pub installed_opencode_states: HashMap<String, crate::state::OpencodeDatabaseState>,
+    pub opencode_database_state_changed: bool,
+    pub identities_changed: bool,
+}
+
+/// How a refresh limits discovery: to event hints from a watcher, to a journal replay started
+/// before the checkpoint was opened, or not at all.
+pub(super) enum Narrowing<'a> {
+    Dirty(&'a HashSet<PathBuf>),
+    Journal(journal::ReplayHandle),
+    None,
+}
+
+pub(super) fn prepare_refresh(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    pool: &rayon::ThreadPool,
+    recovered: publication::RecoveredCheckpoint,
+    narrowing: Narrowing<'_>,
+    mut scan_cache: Option<ScanCache>,
+) -> Result<PreparedRefresh> {
+    let (dirty, journal) = match narrowing {
+        Narrowing::Dirty(dirty) => (Some(dirty), None),
+        Narrowing::Journal(journal) => (None, Some(journal)),
+        Narrowing::None => (None, None),
+    };
+    let publication::RecoveredCheckpoint {
+        mut state,
+        pending_recovery,
+        empty_index_rebuild,
+    } = recovered;
+    let recovering_pending_ingest = pending_recovery.is_some();
+    let state_path = paths.state.join("ingest.json");
+    let selected = if let Some(dirty) = dirty
+        && !recovering_pending_ingest
+        && !empty_index_rebuild
+        && state_path.exists()
+    {
+        match selection::resolve_dirty(options, dirty, &state)? {
+            selection::DirtySelection::Paths { files, databases } => Some((files, databases)),
+            selection::DirtySelection::Resync => None,
+        }
+    } else {
+        None
+    };
+    let mut journal_cursor = state.journal_cursor.take();
+    let mut journal_narrowed = false;
+    let selected = match (selected, journal) {
+        (None, Some(journal))
+            if dirty.is_none()
+                && !recovering_pending_ingest
+                && !empty_index_rebuild
+                && state_path.exists()
+                && !state.clears_files() =>
+        {
+            let (cursor, hints) = journal_hints(journal, &state, options)?;
+            journal_cursor = cursor;
+            match hints {
+                Some(hints) => match selection::resolve_dirty(options, &hints, &state)? {
+                    selection::DirtySelection::Paths { files, databases } => {
+                        crate::profiling::count!("journal.narrowed_refreshes", 1);
+                        journal_narrowed = true;
+                        Some((files, databases))
+                    }
+                    selection::DirtySelection::Resync => None,
+                },
+                None => None,
+            }
+        }
+        (selected, Some(journal)) => {
+            // The hints cannot be used here, but the cursor was captured before anything was
+            // read, so it still describes what this refresh is about to cover. Dropping it
+            // would make the next refresh replay an interval this scan already handled.
+            let (cursor, _) = journal_hints(journal, &state, options)?;
+            journal_cursor = cursor;
+            selected
+        }
+        (selected, None) => selected,
+    };
+    let full_scan = selected.is_none();
+    state.journal_cursor = journal_cursor;
+
+    // Index-time exclusion: matched transcripts never enter the index, and
+    // records previously indexed from now-excluded paths are removed.
+    #[cfg(feature = "profiling")]
+    let discovery_profile = crate::profiling::Scope::enter("ingest.discovery");
+    let excluder = build_path_excluder(options)?;
+    let mut excluded_state_paths: Vec<String> = Vec::new();
+    if full_scan && excluder.set.is_some() {
+        for key in state.file_keys()? {
+            if excluder.is_excluded(Path::new(&key)) {
+                state.delete_file(&key);
+                excluded_state_paths.push(key);
+            }
+        }
+    }
+    let next_doc_id = Arc::new(AtomicU64::new(state.next_doc_id));
+
+    let mut tasks = Vec::new();
+    let mut unchanged_identities = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut files_skipped = 0usize;
+    let mut total_bytes = 0u64;
+    // A dirty-set refresh sees only what it was handed; the others cover the whole interval
+    // and may re-arm the scan-cache TTL.
+    if !(full_scan || journal_narrowed) {
+        scan_cache = None;
+    } else if scan_cache.is_none() {
+        scan_cache = Some(std::mem::take(&mut state.scan_cache));
+    }
+    // Reuse reconstructs an unchanged directory from the rows the last successful refresh
+    // persisted. Session-level deletes (pending-intent recovery) and clears must not hide files
+    // that are still on disk, so they never feed the walk.
+    let mut walk = if full_scan {
+        let fingerprint = discovery_fingerprint(options);
+        let (previous, known) = if state.clears_files() {
+            (HashMap::new(), Vec::new())
+        } else {
+            (
+                state.load_directory_stamps(&fingerprint)?,
+                state.persisted_file_keys()?,
+            )
+        };
+        // Bob and ZCode virtual paths sit "under" a database file, never under a walked directory.
+        let known = known.into_iter().filter(|key| {
+            !crate::sources::bob::matches_path(key)
+                && crate::sources::zcode::split_virtual_path(Path::new(key)).is_none()
+        });
+        Some((
+            directories::StampedWalk::new(previous, known.map(PathBuf::from)),
+            fingerprint,
+        ))
+    } else {
+        None
+    };
+    let transcripts = discovery::discover_transcripts(
+        options,
+        &excluder,
+        &mut state,
+        pool,
+        selected.as_ref().map(|(files, _)| files.as_slice()),
+        walk.as_mut().map(|(walk, _)| walk),
+    )?;
+    if let Some((walk, fingerprint)) = walk {
+        crate::profiling::count!("discovery.directories_reused", walk.counters().reused);
+        crate::profiling::count!(
+            "discovery.directories_enumerated",
+            walk.counters().enumerated
+        );
+        state.directory_stamps = Some(walk.finish(fingerprint));
+    }
+    tasks.extend(transcripts.tasks);
+    unchanged_identities.extend(transcripts.unchanged_identities);
+    files_scanned += transcripts.files_scanned;
+    files_skipped += transcripts.files_skipped;
+    total_bytes += transcripts.total_bytes;
+    let session_ids = transcripts.session_ids;
+    let mut superseded_paths =
+        index.source_paths_with_records(&transcripts.superseded_projections)?;
+    if !transcripts.superseded_projections.is_empty() && analytics_path(&paths.state).exists() {
+        let analytics = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+        superseded_paths.extend(analytics.source_paths(&transcripts.superseded_projections)?);
+    }
+    for path in transcripts.superseded_projections {
+        if state.contains_file(&path)? {
+            superseded_paths.insert(path);
+        }
+    }
+    for path in &superseded_paths {
+        state.delete_file(path);
+    }
+
+    // Route narrowed refreshes to the owning database adapter.
+    let (bob_selected, zcode_selected, opencode_selected) = match selected.as_ref() {
+        Some((_, databases)) => {
+            let (bob, opencode): (Vec<_>, Vec<_>) = databases
+                .iter()
+                .cloned()
+                .partition(|file| file.source == SourceKind::Bob);
+            let (zcode, opencode): (Vec<_>, Vec<_>) = opencode
+                .into_iter()
+                .partition(|file| file.source == SourceKind::Zcode);
+            (Some(bob), Some(zcode), Some(opencode))
+        }
+        None => (None, None, None),
+    };
+    let discovery::SessionDatabaseDiscovery {
+        tasks: mut bob_tasks,
+        unchanged_identities: bob_unchanged_identities,
+        files_scanned: bob_files_scanned,
+        files_skipped: bob_files_skipped,
+        total_bytes: bob_total_bytes,
+        missing_paths: bob_missing_paths,
+        unreadable_databases: bob_unreadable_databases,
+        diagnostics: bob_diagnostics,
+    } = discovery::discover_bob(options, &excluder, &mut state, bob_selected.as_deref())?;
+    if let Some(pending) = &pending_recovery {
+        // Recovery replays every task named by the pending intent from scratch (its state
+        // was already dropped), so an unreadable database would publish the deletions
+        // with no replacement. Nothing has been committed yet: abort and retry once it
+        // reads again.
+        if let Some(path) = pending.source_paths.iter().find(|path| {
+            crate::sources::bob::split_virtual_path(Path::new(path))
+                .is_some_and(|(database, _)| bob_unreadable_databases.contains(&database))
+        }) {
+            anyhow::bail!(
+                "Bob task {path} has an interrupted replay to recover but its database cannot be read; refresh aborted so its indexed records survive"
+            );
+        }
+        // The same tasks look brand-new to discovery, yet their records may still be
+        // indexed: mark them as replacements so a parse failure refuses to publish the
+        // pending deletion on its own.
+        for task in &mut bob_tasks {
+            if pending
+                .source_paths
+                .iter()
+                .any(|path| *path == task.path.to_string_lossy())
+            {
+                task.change = FileChange::Replaced;
+            }
+        }
+    }
+    tasks.extend(bob_tasks);
+    unchanged_identities.extend(bob_unchanged_identities);
+    files_scanned += bob_files_scanned;
+    files_skipped += bob_files_skipped;
+    total_bytes += bob_total_bytes;
+
+    let mut zcode = discover_zcode(options, &excluder, &mut state, zcode_selected.as_deref())?;
+    if let Some(pending) = &pending_recovery {
+        for path in &pending.source_paths {
+            let database = crate::sources::zcode::split_virtual_path(Path::new(path))
+                .map(|(database, _)| database)
+                .unwrap_or_else(|| PathBuf::from(path));
+            if zcode.unreadable_databases.contains(&database) {
+                anyhow::bail!(
+                    "ZCode source {path} has an interrupted replay but its database cannot be read"
+                );
+            }
+        }
+        for task in &mut zcode.tasks {
+            let database = crate::sources::zcode::split_virtual_path(&task.path)
+                .unwrap()
+                .0;
+            if pending.source_paths.iter().any(|path| {
+                *path == task.path.to_string_lossy() || *path == database.to_string_lossy()
+            }) {
+                task.change = FileChange::Replaced;
+            }
+        }
+    }
+    tasks.extend(zcode.tasks);
+    unchanged_identities.extend(zcode.unchanged_identities);
+    files_scanned += zcode.files_scanned;
+    files_skipped += zcode.files_skipped;
+    total_bytes += zcode.total_bytes;
+
+    let Some(opencode) = discovery::discover_opencode(
+        paths,
+        index,
+        options,
+        opencode_selected.as_deref(),
+        &mut state,
+        &pending_recovery,
+        &next_doc_id,
+    )?
+    else {
+        return prepare_refresh(
+            paths,
+            index,
+            options,
+            pool,
+            publication::RecoveredCheckpoint {
+                state,
+                pending_recovery,
+                empty_index_rebuild,
+            },
+            Narrowing::None,
+            scan_cache,
+        );
+    };
+    tasks.extend(opencode.tasks);
+    unchanged_identities.extend(opencode.unchanged_identities);
+    files_scanned += opencode.files_scanned;
+    files_skipped += opencode.files_skipped;
+    total_bytes += opencode.total_bytes;
+    let deferred_pending_scopes = opencode.deferred_pending_scopes;
+    let opencode_ready_databases = opencode.ready_databases;
+    let opencode_ready_owned_sessions = opencode.ready_owned_sessions;
+    let mut opencode_diagnostics = opencode.diagnostics;
+    opencode_diagnostics.merge(bob_diagnostics);
+    opencode_diagnostics.merge(zcode.diagnostics);
+    let opencode_scope_targets = opencode.scope_targets;
+    let opencode_session_cwds = opencode.session_cwds;
+    let opencode_database_states = opencode.database_states;
+    let opencode_database_paths_to_delete = opencode.database_paths_to_delete;
+    let opencode_database_outcomes = opencode.database_outcomes;
+    let opencode_legacy_paths_to_delete = opencode.legacy_paths_to_delete;
+
+    let mut missing_state_paths = if full_scan && options.prune_missing {
+        let prune_options = prune::PruneOptions::from(options);
+        prune::missing_state_paths(
+            state.file_keys()?,
+            &prune::authoritative_roots(&prune_options),
+        )
+    } else {
+        Vec::new()
+    };
+    for path in &missing_state_paths {
+        state.delete_file(path);
+    }
+    missing_state_paths.extend(bob_missing_paths);
+    missing_state_paths.extend(zcode.missing_paths);
+    let files_pruned = missing_state_paths.len();
+    let records_pruned = index.count_by_source_paths(&missing_state_paths)?;
+
+    // Previously indexed records under now-excluded paths must be deleted even
+    // when there is no ingest state entry for them (e.g. state loss or legacy runs).
+    let mut excluded_index_paths: Vec<String> = Vec::new();
+    if full_scan && excluder.set.is_some() {
+        index.for_each_record(|record| {
+            if excluder.is_excluded(Path::new(&record.source_path)) {
+                excluded_index_paths.push(record.source_path.clone());
+            }
+            Ok(())
+        })?;
+        excluded_index_paths.sort();
+        excluded_index_paths.dedup();
+    }
+    files_skipped += excluded_state_paths.len();
+
+    let opencode_session_links = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
+        crate::sources::opencode::session_links_by_id()
+    } else {
+        HashMap::new()
+    };
+
+    // Resume inference only if the interrupted operation requested it. A lexical-only
+    // reparse may remove obsolete IDs, but leaves new IDs for the resumable backfill.
+    let recover_embeddings = pending_recovery.as_ref().is_some_and(|pending| {
+        pending
+            .embedding_publication
+            .unwrap_or(pending.vector_publication)
+    });
+    // Pure deletion recovery needs no embedder, but it still crossed the vector
+    // publication boundary and must remove every vector that is no longer live.
+    let reconcile_pending_vector_ids = pending_recovery
+        .as_ref()
+        .is_some_and(|pending| pending.vector_publication);
+    let pending_ready_scope_recovery = pending_recovery.as_ref().is_some_and(|pending| {
+        pending.session_scopes.iter().any(|scope| {
+            matches!(
+                opencode_database_outcomes.get(&scope.source_path),
+                Some(OpencodeDatabaseOutcome::Ready)
+            )
+        })
+    });
+    let recover_vector_cleanup = pending_ready_scope_recovery
+        || pending_recovery.as_ref().is_some_and(|pending| {
+            pending
+                .source_paths
+                .iter()
+                .any(|path| crate::sources::opencode::is_database_path(path))
+        });
+    let mut vector_delete_paths: HashSet<String> = pending_recovery
+        .as_ref()
+        .map(|pending| pending.vector_delete_paths.iter().cloned().collect())
+        .unwrap_or_default();
+    // Markers written before `vector_delete_paths` existed only recorded OpenCode
+    // database deletions; preserve that recovery behavior.
+    if let Some(pending) = &pending_recovery {
+        vector_delete_paths.extend(
+            pending
+                .source_paths
+                .iter()
+                .filter(|path| crate::sources::opencode::is_database_path(path))
+                .cloned(),
+        );
+    }
+    vector_delete_paths.extend(opencode_database_paths_to_delete.iter().cloned());
+    vector_delete_paths.extend(opencode_legacy_paths_to_delete.iter().cloned());
+    vector_delete_paths.extend(missing_state_paths.iter().cloned());
+    vector_delete_paths.extend(superseded_paths.iter().cloned());
+    // A newly excluded transcript loses its indexed records, so its embeddings have to go
+    // with them; otherwise they stay live and keep matching semantic searches.
+    vector_delete_paths.extend(excluded_state_paths.iter().cloned());
+    vector_delete_paths.extend(excluded_index_paths.iter().cloned());
+    vector_delete_paths.extend(
+        tasks
+            .iter()
+            .filter(|task| task.delete_first())
+            .map(|task| task.path.to_string_lossy().into_owned()),
+    );
+    let mut delete_paths = pending_recovery
+        .as_ref()
+        .map(|pending| pending.source_paths.clone())
+        .unwrap_or_default();
+    delete_paths.extend(opencode_database_paths_to_delete.clone());
+    delete_paths.extend(opencode_legacy_paths_to_delete.clone());
+    delete_paths.extend(missing_state_paths);
+    delete_paths.extend(superseded_paths);
+    delete_paths.extend(excluded_state_paths);
+    delete_paths.extend(excluded_index_paths);
+    delete_paths.extend(
+        tasks
+            .iter()
+            .filter(|task| task.delete_first())
+            .map(|task| task.path.to_string_lossy().to_string()),
+    );
+    delete_paths.sort();
+    delete_paths.dedup();
+    let mut installed_opencode_states = state.opencode_databases.clone();
+    for path in &opencode_database_paths_to_delete {
+        installed_opencode_states.remove(path);
+    }
+    installed_opencode_states.extend(opencode_database_states.clone());
+    let opencode_database_state_changed = installed_opencode_states != state.opencode_databases;
+
+    #[cfg(feature = "profiling")]
+    drop(discovery_profile);
+    crate::profiling::count!("ingest.files_scanned", files_scanned);
+    crate::profiling::count!("ingest.files_skipped", files_skipped);
+    crate::profiling::count!("ingest.parse_tasks", tasks.len());
+    crate::profiling::count!(
+        "opencode.legacy_deletes_scheduled",
+        opencode_legacy_paths_to_delete.len()
+    );
+    crate::profiling::count!(
+        "opencode.scope_deletes_scheduled",
+        opencode_scope_targets.len()
+    );
+    crate::profiling::count!(
+        "opencode.database_deletes_scheduled",
+        opencode_database_paths_to_delete.len()
+    );
+    let mut identities_changed = false;
+    for (path, identity) in unchanged_identities {
+        if let Some(previous) = state.file(&path)
+            && previous.identity != identity
+        {
+            let mut updated = previous.clone();
+            updated.identity = identity;
+            state.upsert_file(path, updated);
+            identities_changed = true;
+        }
+    }
+
+    Ok(PreparedRefresh {
+        records_pruned,
+        files_pruned,
+        full_scan,
+        scan_cache,
+        state,
+        recovering_pending_ingest,
+        empty_index_rebuild,
+        next_doc_id,
+        tasks,
+        files_scanned,
+        files_skipped,
+        total_bytes,
+        session_ids,
+        deferred_pending_scopes,
+        opencode_ready_databases,
+        opencode_ready_owned_sessions,
+        opencode_diagnostics,
+        opencode_scope_targets,
+        opencode_session_cwds,
+        opencode_database_paths_to_delete,
+        opencode_session_links,
+        recover_embeddings,
+        reconcile_pending_vector_ids,
+        recover_vector_cleanup,
+        delete_paths,
+        vector_delete_paths,
+        installed_opencode_states,
+        opencode_database_state_changed,
+        identities_changed,
+    })
+}
+
+pub(super) fn can_skip_fresh_scan(
+    header: &CheckpointHeader,
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    ttl_seconds: u64,
+) -> Result<bool> {
+    if header.pending.is_some() {
+        return Ok(false);
+    }
+    if options.include_opencode {
+        let databases = match crate::sources::opencode::discover_databases() {
+            Ok(databases) => databases,
+            Err(_) => return Ok(false),
+        };
+        if !databases.is_empty() {
+            return Ok(false);
+        }
+    }
+    if index.doc_count()? == 0 {
+        return Ok(false);
+    }
+    if !header.scan_cache.is_fresh(ttl_seconds) {
+        return Ok(false);
+    }
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state))?;
+    if !analytics.complete()? && index.doc_count()? > 0 {
+        return Ok(false);
+    }
+    can_skip_noop_index(paths, index, options)
+}
+
+pub(super) fn can_skip_noop_index(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+) -> Result<bool> {
+    crate::profiling::span!("vectors.compatibility");
+    if !options.embeddings {
+        return Ok(true);
+    }
+    let Some(dimensions) = options.model.known_dimensions() else {
+        return Ok(false);
+    };
+    if !crate::vector::VectorIndex::exists(&paths.vectors) {
+        return Ok(false);
+    }
+    let vector_index = crate::vector::VectorIndex::open(&paths.vectors)?;
+    if vector_index.model() != Some(options.model.as_str())
+        || vector_index.dimensions() != dimensions
+    {
+        return Ok(false);
+    }
+    vector_index_covers_embeddable_records(index, &vector_index)
+}
+
+pub(super) fn vector_index_covers_embeddable_records(
+    index: &SearchIndex,
+    vector_index: &crate::vector::VectorIndex,
+) -> Result<bool> {
+    crate::profiling::span!("vectors.coverage_check");
+    let mut covers_all = true;
+    index.for_each_record(|record| {
+        if record_needs_embedding(&record) && !vector_index.contains(record.doc_id) {
+            covers_all = false;
+        }
+        Ok(())
+    })?;
+    Ok(covers_all)
+}
+
+pub(super) fn record_needs_embedding(record: &Record) -> bool {
+    is_embedding_role(&record.role) && !record.text.is_empty()
+}

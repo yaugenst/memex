@@ -268,6 +268,7 @@ impl<'a> ContextReader<'a> {
         record.text.shrink_to_fit();
         record.tool_input = None;
         record.tool_output = None;
+        record.links.source_content = None;
         Ok(ContextEntry {
             id,
             record,

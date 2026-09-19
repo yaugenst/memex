@@ -1,3 +1,4 @@
+use crate::repository::{RepositoryResolution, RepositoryResolver};
 use crate::state::SessionScope;
 use crate::types::{
     Record, SourceFilter, SourceKind, jcode_text_is_subagent_directive,
@@ -8,11 +9,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 6;
-const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+// Reconcile legacy catalogs that survived a rebuilt search index.
+const SCHEMA_VERSION: i64 = 7;
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
 const REPOSITORY_PROJECT_SQL: &str = "COALESCE(NULLIF(repo_project, ''), 'Unfiled')";
@@ -101,10 +102,10 @@ pub struct AnalyticsStore {
 pub struct AnalyticsWriter {
     store: AnalyticsStore,
     sessions: HashMap<SessionKey, SessionAccumulator>,
-    deleted_source_paths: HashSet<String>,
     metadata_cache: HashMap<SessionKey, SessionMetadata>,
-    git_cache: HashMap<String, GitMetadata>,
+    repositories: Arc<RepositoryResolver>,
     cwd_overrides: HashMap<SessionKey, String>,
+    codex_checkpoints: HashMap<String, (u64, Vec<u64>)>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -122,6 +123,7 @@ struct SessionAccumulator {
     last_at: u64,
     message_count: u64,
     first_user_text: Option<String>,
+    first_user_order: Option<(u32, u64, u64)>,
     conversation_kind: Option<String>,
 }
 
@@ -203,7 +205,8 @@ impl AnalyticsStore {
         }
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS sessions_conversation_kind_idx ON sessions(conversation_kind);
-             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);",
+             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);
+             CREATE INDEX IF NOT EXISTS sessions_source_path_idx ON sessions(source_path);",
         )?;
         let previous_schema_version: Option<i64> = self
             .conn
@@ -265,15 +268,14 @@ impl AnalyticsStore {
     }
 
     pub fn complete(&self) -> Result<bool> {
-        let value: Option<String> = self
-            .conn
+        self.conn
             .query_row(
-                "SELECT value FROM meta WHERE key = 'analytics_complete'",
-                [],
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'analytics_complete' AND value = '1')
+                 AND EXISTS(SELECT 1 FROM meta WHERE key = 'schema_version' AND value = ?1)",
+                [SCHEMA_VERSION.to_string()],
                 |row| row.get(0),
             )
-            .optional()?;
-        Ok(value.as_deref() == Some("1"))
+            .map_err(Into::into)
     }
 
     pub fn mark_complete(&self) -> Result<()> {
@@ -292,28 +294,38 @@ impl AnalyticsStore {
     }
 
     pub fn clear(&self) -> Result<()> {
+        self.mark_incomplete()?;
         self.conn.execute("DELETE FROM sessions", [])?;
         Ok(())
     }
 
+    pub(crate) fn source_paths(&self, candidates: &HashSet<String>) -> Result<HashSet<String>> {
+        crate::profiling::span!("analytics.source_inventory");
+        let candidates = candidates.iter().collect::<Vec<_>>();
+        let mut present = HashSet::new();
+        for batch in candidates.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT DISTINCT source_path FROM sessions WHERE source_path IN ({placeholders})"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            crate::profiling::count!("analytics.source_inventory_scans", 1);
+            let rows = statement.query_map(params_from_iter(batch.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            present.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        Ok(present)
+    }
+
     pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM sessions WHERE source_path = ?1",
-            params![source_path],
-        )?;
-        Ok(())
+        delete_path(&self.conn, source_path)
     }
 
     pub fn delete_session_scope(&self, scope: &SessionScope) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM sessions WHERE source = ?1 AND source_path = ?2 AND session_id = ?3",
-            params![
-                SourceKind::Opencode.storage_label(),
-                scope.source_path,
-                scope.session_id
-            ],
-        )?;
-        Ok(())
+        delete_scope(&self.conn, scope)
     }
 
     pub fn query_sessions(
@@ -429,6 +441,15 @@ impl AnalyticsStore {
         for row in rows {
             out.push(row?);
         }
+        let titles = SessionTitleLookup::new(out.iter().map(|row| (row.source, &row.session_id)));
+        for row in &mut out {
+            row.label = titles.resolve(
+                row.source,
+                &row.session_id,
+                &row.source_path,
+                row.label.as_deref(),
+            );
+        }
         Ok(out)
     }
 
@@ -519,6 +540,15 @@ impl AnalyticsStore {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        let titles = SessionTitleLookup::new(out.iter().map(|row| (row.source, &row.session_id)));
+        for row in &mut out {
+            row.label = titles.resolve(
+                row.source,
+                &row.session_id,
+                &row.source_path,
+                row.label.as_deref(),
+            );
         }
         Ok(out)
     }
@@ -930,13 +960,20 @@ impl AnalyticsStore {
 
 impl AnalyticsWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_repositories(path, Arc::new(RepositoryResolver::default()))
+    }
+
+    pub(crate) fn with_repositories(
+        path: impl AsRef<Path>,
+        repositories: Arc<RepositoryResolver>,
+    ) -> Result<Self> {
         Ok(Self {
             store: AnalyticsStore::open(path)?,
             sessions: HashMap::new(),
-            deleted_source_paths: HashSet::new(),
             metadata_cache: HashMap::new(),
-            git_cache: HashMap::new(),
+            repositories,
             cwd_overrides: HashMap::new(),
+            codex_checkpoints: HashMap::new(),
         })
     }
 
@@ -944,13 +981,22 @@ impl AnalyticsWriter {
         self.store.clear()
     }
 
-    pub fn delete_source_path(&mut self, source_path: &str) -> Result<()> {
-        self.deleted_source_paths.insert(source_path.to_string());
-        Ok(())
+    pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
+        self.store.delete_source_path(source_path)
     }
 
     pub fn delete_session_scope(&self, scope: &SessionScope) -> Result<()> {
         self.store.delete_session_scope(scope)
+    }
+
+    pub(crate) fn set_codex_metadata_checkpoint(
+        &mut self,
+        source_path: String,
+        offset: u64,
+        metadata_offsets: Vec<u64>,
+    ) {
+        self.codex_checkpoints
+            .insert(source_path, (offset, metadata_offsets));
     }
 
     pub fn set_session_cwd(
@@ -986,6 +1032,7 @@ impl AnalyticsWriter {
                 last_at: record.ts,
                 message_count: 0,
                 first_user_text: None,
+                first_user_order: None,
                 conversation_kind: None,
             });
         if record.ts < entry.started_at {
@@ -998,12 +1045,16 @@ impl AnalyticsWriter {
             }
         }
         entry.message_count = entry.message_count.saturating_add(1);
-        if entry.first_user_text.is_none()
+        let order = (record.turn_id, record.ts, record.doc_id);
+        if entry
+            .first_user_order
+            .is_none_or(|previous| order < previous)
             && record.role == "user"
             && !record.text.trim().is_empty()
             && !sanitize_label(&record.text).is_empty()
         {
             entry.first_user_text = Some(record.text.clone());
+            entry.first_user_order = Some(order);
         }
         // Prefer an explicit "main" over per-record non-main kinds: Pi and
         // OpenClaw stamp compaction/branch on entries inside otherwise-main
@@ -1019,41 +1070,159 @@ impl AnalyticsWriter {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.flush_inner(false, false)
+        self.prepare().commit(&[], &[])
     }
 
-    fn replace_all_and_mark_complete(&mut self) -> Result<()> {
-        self.flush_inner(true, true)
-    }
-
-    fn flush_inner(&mut self, replace_all: bool, mark_complete: bool) -> Result<()> {
-        if self.sessions.is_empty()
-            && self.deleted_source_paths.is_empty()
-            && !replace_all
-            && !mark_complete
-        {
-            return Ok(());
-        }
-        let pending_sessions: Vec<SessionAccumulator> = self.sessions.values().cloned().collect();
-        let sessions: Vec<(SessionAccumulator, SessionMetadata)> = pending_sessions
+    pub(crate) fn prepare(&mut self) -> PreparedAnalytics<'_> {
+        crate::profiling::span!("analytics.prepare");
+        let pending = self.sessions.values().cloned().collect::<Vec<_>>();
+        let mut opencode_cache = OpencodeLookupCache::default();
+        let rows = pending
             .into_iter()
             .map(|session| {
                 let metadata = self.resolve_metadata(&session.key);
-                (session, metadata)
+                let label = extract_session_label(
+                    session.key.source,
+                    &session.key.source_path,
+                    &session.key.session_id,
+                    session.first_user_text.as_deref(),
+                    metadata.cwd.as_deref(),
+                    &mut opencode_cache,
+                );
+                let conversation_kind = infer_session_kind(
+                    session.key.source,
+                    &session.key.source_path,
+                    &session.key.session_id,
+                    session.conversation_kind.as_deref(),
+                    metadata.cwd.as_deref(),
+                    session.first_user_text.as_deref(),
+                    &mut opencode_cache,
+                );
+                PreparedSession {
+                    session,
+                    metadata,
+                    label,
+                    conversation_kind,
+                }
             })
             .collect();
-        let tx = self.store.conn.transaction()?;
+        PreparedAnalytics { writer: self, rows }
+    }
+
+    fn resolve_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
+        crate::profiling::span!("analytics.resolve_metadata");
+        if let Some(cached) = self.metadata_cache.get(key) {
+            return cached.clone();
+        }
+        let metadata = self.resolve_uncached_metadata(key);
+        self.metadata_cache.insert(key.clone(), metadata.clone());
+        metadata
+    }
+
+    fn resolve_uncached_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
+        let cwd = self.cwd_overrides.get(key).cloned().or_else(|| {
+            if key.source == SourceKind::Codex
+                && let Some((offset, metadata_offsets)) =
+                    self.codex_checkpoints.get(&key.source_path)
+            {
+                crate::sources::codex::cwd_with_metadata_checkpoint(
+                    Path::new(&key.source_path),
+                    *offset,
+                    metadata_offsets,
+                )
+                .ok()
+                .flatten()
+                .map(|path| path.to_string_lossy().into_owned())
+            } else {
+                resolve_session_cwd_from_parts(key.source, &key.source_path, &key.session_id)
+            }
+        });
+        let Some(cwd) = cwd else {
+            return SessionMetadata {
+                resolution_status: "no-cwd".to_string(),
+                ..SessionMetadata::default()
+            };
+        };
+        let git = GitMetadata::from(self.repositories.resolve(Path::new(&cwd)));
+        SessionMetadata {
+            cwd: Some(cwd),
+            git_root: git.git_root,
+            git_common_dir: git.git_common_dir,
+            repo_project: git.repo_project,
+            resolution_status: git.status,
+        }
+    }
+}
+
+fn delete_path(conn: &Connection, source_path: &str) -> Result<()> {
+    crate::profiling::span!("analytics.delete_path");
+    crate::profiling::count!("analytics.delete_path.calls", 1);
+    let _rows_deleted = conn.execute(
+        "DELETE FROM sessions WHERE source_path = ?1",
+        params![source_path],
+    )?;
+    crate::profiling::count!("analytics.delete_path.rows", _rows_deleted);
+    Ok(())
+}
+
+fn delete_scope(conn: &Connection, scope: &SessionScope) -> Result<()> {
+    crate::profiling::span!("analytics.delete_scope");
+    crate::profiling::count!("analytics.delete_scope.calls", 1);
+    let _rows_deleted = conn.execute(
+        "DELETE FROM sessions WHERE source = ?1 AND source_path = ?2 AND session_id = ?3",
+        params![
+            SourceKind::Opencode.storage_label(),
+            scope.source_path,
+            scope.session_id
+        ],
+    )?;
+    crate::profiling::count!("analytics.delete_scope.rows", _rows_deleted);
+    Ok(())
+}
+
+struct PreparedSession {
+    session: SessionAccumulator,
+    metadata: SessionMetadata,
+    label: Option<String>,
+    conversation_kind: Option<String>,
+}
+
+pub(crate) struct PreparedAnalytics<'a> {
+    writer: &'a mut AnalyticsWriter,
+    rows: Vec<PreparedSession>,
+}
+
+impl PreparedAnalytics<'_> {
+    pub(crate) fn commit(self, delete_paths: &[String], scopes: &[SessionScope]) -> Result<()> {
+        self.commit_inner(delete_paths, scopes, false)
+    }
+
+    fn replace_all_and_mark_complete(self) -> Result<()> {
+        self.commit_inner(&[], &[], true)
+    }
+
+    fn commit_inner(
+        self,
+        delete_paths: &[String],
+        scopes: &[SessionScope],
+        replace_all: bool,
+    ) -> Result<()> {
+        crate::profiling::span!("analytics.persist");
+        if self.rows.is_empty() && delete_paths.is_empty() && scopes.is_empty() && !replace_all {
+            return Ok(());
+        }
+        let tx = self.writer.store.conn.transaction()?;
         if replace_all {
             tx.execute("DELETE FROM sessions", [])?;
-        } else {
-            let mut delete_stmt = tx.prepare("DELETE FROM sessions WHERE source_path = ?1")?;
-            for source_path in &self.deleted_source_paths {
-                delete_stmt.execute(params![source_path])?;
-            }
+        }
+        for scope in scopes {
+            delete_scope(&tx, scope)?;
+        }
+        for path in delete_paths {
+            delete_path(&tx, path)?;
         }
         {
-            let mut stmt = tx.prepare(
-                r#"
+            let mut stmt = tx.prepare(r#"
                 INSERT INTO sessions(
                     source, session_id, source_path, project, cwd, git_root, git_common_dir,
                     repo_project, started_at, last_at, message_count, resolution_status,
@@ -1076,30 +1245,14 @@ impl AnalyticsWriter {
                     -- which delete the row first (delete_first) and recompute.
                     label = COALESCE(sessions.label, excluded.label),
                     conversation_kind = COALESCE(sessions.conversation_kind, excluded.conversation_kind)
-                "#,
-            )?;
-            // OpenCode title/agent lookups hit the source SQLite database. Sessions
-            // from one database share the same file, so memoize per flush to
-            // avoid reopening it once per session during large index scans.
-            let mut opencode_cache = OpencodeLookupCache::default();
-            for (session, metadata) in sessions {
-                let label = extract_session_label(
-                    session.key.source,
-                    &session.key.source_path,
-                    &session.key.session_id,
-                    session.first_user_text.as_deref(),
-                    metadata.cwd.as_deref(),
-                    &mut opencode_cache,
-                );
-                let conversation_kind = infer_session_kind(
-                    session.key.source,
-                    &session.key.source_path,
-                    &session.key.session_id,
-                    session.conversation_kind.as_deref(),
-                    metadata.cwd.as_deref(),
-                    session.first_user_text.as_deref(),
-                    &mut opencode_cache,
-                );
+                "#)?;
+            for PreparedSession {
+                session,
+                metadata,
+                label,
+                conversation_kind,
+            } in self.rows
+            {
                 stmt.execute(params![
                     session.key.source.storage_label(),
                     session.key.session_id,
@@ -1118,7 +1271,7 @@ impl AnalyticsWriter {
                 ])?;
             }
         }
-        if mark_complete {
+        if replace_all {
             tx.execute(
                 "INSERT INTO meta(key, value) VALUES('analytics_complete', '1')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1126,42 +1279,8 @@ impl AnalyticsWriter {
             )?;
         }
         tx.commit()?;
-        self.sessions.clear();
-        self.deleted_source_paths.clear();
+        self.writer.sessions.clear();
         Ok(())
-    }
-
-    fn resolve_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
-        if let Some(cached) = self.metadata_cache.get(key) {
-            return cached.clone();
-        }
-        let metadata = self.resolve_uncached_metadata(key);
-        self.metadata_cache.insert(key.clone(), metadata.clone());
-        metadata
-    }
-
-    fn resolve_uncached_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
-        let cwd = self.cwd_overrides.get(key).cloned().or_else(|| {
-            resolve_session_cwd_from_parts(key.source, &key.source_path, &key.session_id)
-        });
-        let Some(cwd) = cwd else {
-            return SessionMetadata {
-                resolution_status: "no-cwd".to_string(),
-                ..SessionMetadata::default()
-            };
-        };
-        let git = self
-            .git_cache
-            .entry(cwd.clone())
-            .or_insert_with(|| git_metadata_for_cwd(&cwd))
-            .clone();
-        SessionMetadata {
-            cwd: Some(cwd),
-            git_root: git.git_root,
-            git_common_dir: git.git_common_dir,
-            repo_project: git.repo_project,
-            resolution_status: git.status,
-        }
     }
 }
 
@@ -1173,134 +1292,47 @@ struct GitMetadata {
     status: String,
 }
 
+impl From<RepositoryResolution> for GitMetadata {
+    fn from(resolution: RepositoryResolution) -> Self {
+        let project = resolution.project().map(str::to_owned);
+        match resolution {
+            RepositoryResolution::Found(facts) => Self {
+                git_root: facts
+                    .worktree
+                    .map(|path| path.to_string_lossy().into_owned()),
+                git_common_dir: Some(facts.common_dir.to_string_lossy().into_owned()),
+                status: if project.is_some() {
+                    "ok"
+                } else {
+                    "git-partial"
+                }
+                .to_owned(),
+                repo_project: project,
+            },
+            _ => Self {
+                status: if project.is_some() {
+                    "path-fallback"
+                } else {
+                    "not-git"
+                }
+                .to_owned(),
+                repo_project: project,
+                ..Self::default()
+            },
+        }
+    }
+}
+
+#[cfg(test)]
 fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
-    let deadline = Instant::now() + GIT_METADATA_TIMEOUT;
-    let root = git_rev_parse(cwd, &["rev-parse", "--show-toplevel"], deadline);
-    let common_dir = git_rev_parse(
-        cwd,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        deadline,
-    );
-    let path_repo_project =
-        claude_worktree_repo_project(cwd).or_else(|| codex_worktree_repo_project(cwd));
-    let repo_project = common_dir
-        .as_deref()
-        .and_then(common_dir_project_name)
-        .or_else(|| root.as_deref().and_then(path_file_name))
-        .or_else(|| path_repo_project.clone());
-
-    let status = if repo_project.is_some() && root.is_none() && common_dir.is_none() {
-        "path-fallback"
-    } else if repo_project.is_some() {
-        "ok"
-    } else if root.is_some() || common_dir.is_some() {
-        "git-partial"
-    } else {
-        "not-git"
-    }
-    .to_string();
-
-    GitMetadata {
-        git_root: root,
-        git_common_dir: common_dir,
-        repo_project,
-        status,
-    }
+    RepositoryResolver::default().resolve(Path::new(cwd)).into()
 }
 
 pub(crate) fn repository_project_for_cwd(cwd: &str) -> Option<String> {
-    git_metadata_for_cwd(cwd).repo_project
-}
-
-fn claude_worktree_repo_project(cwd: &str) -> Option<String> {
-    for ancestor in Path::new(cwd).ancestors() {
-        if ancestor.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
-            continue;
-        }
-        let claude_dir = ancestor.parent()?;
-        if claude_dir.file_name().and_then(|n| n.to_str()) != Some(".claude") {
-            continue;
-        }
-        let repo_dir = claude_dir.parent()?;
-        return path_file_name(repo_dir.to_string_lossy().as_ref());
-    }
-    None
-}
-
-fn codex_worktree_repo_project(cwd: &str) -> Option<String> {
-    let cwd = Path::new(cwd);
-    for ancestor in cwd.ancestors() {
-        if ancestor.file_name().and_then(|name| name.to_str()) != Some("worktrees") {
-            continue;
-        }
-        let codex_dir = ancestor.parent()?;
-        if codex_dir.file_name().and_then(|name| name.to_str()) != Some(".codex") {
-            continue;
-        }
-        let mut relative = cwd.strip_prefix(ancestor).ok()?.components();
-        relative.next()?;
-        return relative
-            .next()
-            .and_then(|component| component.as_os_str().to_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string);
-    }
-    None
-}
-
-fn git_rev_parse(cwd: &str, args: &[&str], deadline: Instant) -> Option<String> {
-    if Instant::now() >= deadline {
-        return None;
-    }
-    let child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let output = child_output_before(child, deadline)?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
-fn child_output_before(mut child: Child, deadline: Instant) -> Option<Output> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-}
-
-fn common_dir_project_name(path: &str) -> Option<String> {
-    let path = Path::new(path);
-    if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
-        return path
-            .parent()
-            .and_then(|p| path_file_name(p.to_string_lossy().as_ref()));
-    }
-    path_file_name(path.to_string_lossy().as_ref())
+    RepositoryResolver::default()
+        .resolve(Path::new(cwd))
+        .project()
+        .map(str::to_owned)
 }
 
 fn display_project_name(project: &str) -> String {
@@ -1379,14 +1411,6 @@ fn encoded_tail_display(tail: &[&str]) -> String {
     tail.join("-")
 }
 
-fn path_file_name(path: &str) -> Option<String> {
-    Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|name| !name.is_empty())
-        .map(|name| name.to_string())
-}
-
 fn resolve_session_cwd_from_parts(
     source: SourceKind,
     source_path: &str,
@@ -1421,6 +1445,16 @@ fn resolve_session_cwd_from_parts(
     }
     if source == SourceKind::Antigravity
         && let Some(cwd) = crate::sources::antigravity::session_cwd(Path::new(source_path))
+    {
+        return Some(cwd.to_string_lossy().to_string());
+    }
+    if source == SourceKind::Bob {
+        // Virtual `<db>/<task_id>` paths cannot be opened as transcripts.
+        return crate::sources::bob::session_cwd(Path::new(source_path))
+            .map(|cwd| cwd.to_string_lossy().to_string());
+    }
+    if source == SourceKind::Zcode
+        && let Some(cwd) = crate::sources::zcode::session_cwd(Path::new(source_path), session_id)
     {
         return Some(cwd.to_string_lossy().to_string());
     }
@@ -1524,66 +1558,27 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 
 #[allow(clippy::while_let_loop)]
 pub fn sanitize_label(raw: &str) -> String {
+    // Reference previews are context; only the explicit request following them
+    // belongs in a prompt-derived title. Preserve it before collapsing lines.
+    let trimmed = raw.trim_start();
+    let raw = if starts_ascii_ci(trimmed, "## Referenced ChatGPT conversation:")
+        || starts_ascii_ci(trimmed, "## Referenced chats with Codex:")
+    {
+        let mut lines = trimmed.split_inclusive('\n');
+        if !lines.any(|line| line.trim().eq_ignore_ascii_case("## My request:")) {
+            return String::new();
+        }
+        &trimmed[trimmed.len() - lines.clone().map(str::len).sum::<usize>()..]
+    } else {
+        raw
+    };
     // Comprehensive stripping of system wrappers (case-insensitive).
     // Fast path: neither the tag stripper nor the generic unwrap can match
     // without a '<', so ordinary prose skips the owned buffer entirely and
     // goes straight to the single-allocation finish pass. This keeps the
     // per-record emptiness check in `record` cheap during index scans.
     if raw.contains('<') {
-        let mut current = raw.to_string();
-        const DROP_TAGS: &[&str] = &[
-            "system-reminder",
-            "command-message",
-            "command-name",
-            "local-command-stdout",
-            "local-command-caveat",
-            "local-command-output",
-            "instructions",
-            "environment_context",
-            "cwd",
-            "approval_policy",
-            "shell",
-            "user_instructions",
-            "recommended_plugins",
-            "skill",
-            "user_action",
-            "context",
-            "task-notification",
-            "task-id",
-            "tool-use-id",
-            "subagent_notification",
-            "turn_aborted",
-            "current_date",
-            "timezone",
-            "epoch",
-            "collaboration_mode",
-            "apps_instructions",
-            "permissions",
-            "total_tokens",
-        ];
-        for tag in DROP_TAGS {
-            let open = format!("<{tag}");
-            let close = format!("</{tag}>");
-            loop {
-                let Some(start) = find_ascii_ci(&current, &open) else {
-                    break;
-                };
-                let open_end = match current[start..].find('>') {
-                    Some(p) => start + p + 1,
-                    None => {
-                        current.truncate(start);
-                        break;
-                    }
-                };
-                if let Some(end_offset) = find_ascii_ci(&current[open_end..], &close) {
-                    let abs_end = open_end + end_offset + close.len();
-                    current.replace_range(start..abs_end, " ");
-                } else {
-                    current.truncate(start);
-                    break;
-                }
-            }
-        }
+        let mut current = strip_drop_tags(raw);
         // Generic unwrap: remove any remaining <...> tags but keep inner text.
         let mut search_start = 0;
         loop {
@@ -1649,6 +1644,7 @@ fn finish_label(text: &str) -> String {
         return String::new();
     }
     if starts_ascii_ci(&collapsed, "# agents.md")
+        || starts_ascii_ci(&collapsed, "## referenced chatgpt conversation:")
         || find_ascii_ci(&collapsed, "global agent preferences").is_some()
         || starts_ascii_ci(&collapsed, "you are a reminder observer")
     {
@@ -1702,6 +1698,67 @@ fn finish_label(text: &str) -> String {
 /// offsets (e.g. U+0130 folds 2 bytes into 3), which would make `replace_range`
 /// or `truncate` panic on a non-char-boundary. Every match starts at a `<`
 /// byte, which is always a char boundary in UTF-8.
+const DROP_TAGS: &[&str] = &[
+    "system-reminder",
+    "command-message",
+    "command-name",
+    "local-command-stdout",
+    "local-command-caveat",
+    "local-command-output",
+    "instructions",
+    "environment_context",
+    "cwd",
+    "approval_policy",
+    "shell",
+    "user_instructions",
+    "recommended_plugins",
+    "skill",
+    "user_action",
+    "context",
+    "task-notification",
+    "task-id",
+    "tool-use-id",
+    "subagent_notification",
+    "turn_aborted",
+    "current_date",
+    "timezone",
+    "epoch",
+    "collaboration_mode",
+    "apps_instructions",
+    "permissions",
+    "total_tokens",
+];
+
+/// Removes every `<tag ...>...</tag>` block for the tags above, case-insensitively, in one
+/// pass over the text. A block without its closing tag truncates the text at its start, as
+/// the tag-by-tag stripper did. Tool results are `user` records and routinely run to hundreds
+/// of kilobytes, so this runs per record during indexing.
+fn strip_drop_tags(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(4096));
+    let mut rest = raw;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        let Some(tag) = DROP_TAGS.iter().find(|tag| starts_ascii_ci(after, tag)) else {
+            out.push('<');
+            rest = after;
+            continue;
+        };
+        let Some(open_end) = after.find('>') else {
+            return out;
+        };
+        let body = &after[open_end + 1..];
+        let close = format!("</{tag}>");
+        let Some(close_at) = find_ascii_ci(body, &close) else {
+            return out;
+        };
+        out.push(' ');
+        rest = &body[close_at + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
     let hay = haystack.as_bytes();
     let ndl = needle.as_bytes();
@@ -1928,6 +1985,111 @@ impl OpencodeLookupCache {
     }
 }
 
+/// Resolve provider-owned names on the machine that owns the transcripts.
+/// Keeping this in the catalog read path also handles renames and old indexes,
+/// without replaying messages or changing session counts.
+pub(crate) struct SessionTitleLookup {
+    codex: HashMap<String, crate::sources::codex::SessionTitleMetadata>,
+}
+
+impl SessionTitleLookup {
+    pub(crate) fn new<'a>(sessions: impl Iterator<Item = (SourceKind, &'a String)>) -> Self {
+        let ids = sessions
+            .filter(|(source, _)| *source == SourceKind::Codex)
+            .map(|(_, id)| id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        Self {
+            codex: crate::sources::codex::session_title_metadata(&ids),
+        }
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        source: SourceKind,
+        session_id: &str,
+        source_path: &str,
+        opening: Option<&str>,
+    ) -> Option<String> {
+        let codex = self
+            .codex
+            .get(session_id)
+            .filter(|_| source == SourceKind::Codex);
+        let explicit = match source {
+            SourceKind::Codex => codex.and_then(|metadata| metadata.title.clone()),
+            SourceKind::Claude => {
+                crate::sources::claude::session_title(Path::new(source_path), session_id)
+            }
+            _ => None,
+        };
+        explicit
+            .as_deref()
+            .and_then(nonempty_label)
+            // Forked agents inherit the parent's opening prompt. Their own task
+            // path is a better label when Codex has not assigned an explicit title.
+            .or_else(|| {
+                codex
+                    .and_then(|metadata| metadata.agent_path.as_deref())
+                    .and_then(human_agent_title)
+            })
+            .or_else(|| opening.and_then(nonempty_label))
+            .or_else(|| codex.and_then(|metadata| metadata.first_user_message.clone()))
+            .or_else(|| {
+                (source == SourceKind::Codex)
+                    .then(|| codex_assignment_title(source_path))
+                    .flatten()
+            })
+    }
+}
+
+fn nonempty_label(text: &str) -> Option<String> {
+    let title = sanitize_label(text);
+    (!title.is_empty()).then_some(title)
+}
+
+fn human_agent_title(path: &str) -> Option<String> {
+    let path = path.trim().strip_prefix("/root/")?;
+    let words = path
+        .split('/')
+        .map(|part| part.replace('_', " "))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let words = words.trim();
+    let mut chars = words.chars();
+    let first = chars.next()?;
+    nonempty_label(&format!("{}{}", first.to_uppercase(), chars.as_str()))
+}
+
+fn codex_assignment_title(source_path: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(source_path).ok()?;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        // The task body may be encrypted; only read its public routing metadata.
+        if !line.contains("agent_message") || !line.contains("NEW_TASK") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value["type"] != "response_item" || value["payload"]["type"] != "agent_message" {
+            continue;
+        }
+        let payload = &value["payload"];
+        if payload["content"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Message Type: NEW_TASK\n"))
+            })
+        }) && let Some(title) = payload["recipient"].as_str().and_then(human_agent_title)
+        {
+            return Some(title);
+        }
+    }
+    None
+}
+
 fn extract_session_label(
     source: SourceKind,
     source_path: &str,
@@ -1958,6 +2120,24 @@ fn extract_session_label(
         SourceKind::Jcode => {
             if let Some(text) = jcode_label_from_file(source_path) {
                 text
+            } else {
+                first_user_text?.to_string()
+            }
+        }
+        SourceKind::Bob => {
+            if let Some(title) =
+                crate::sources::bob::session_title(Path::new(source_path), session_id)
+            {
+                title
+            } else {
+                first_user_text?.to_string()
+            }
+        }
+        SourceKind::Zcode => {
+            if let Some(title) =
+                crate::sources::zcode::session_title(Path::new(source_path), session_id)
+            {
+                title
             } else {
                 first_user_text?.to_string()
             }
@@ -2000,12 +2180,10 @@ fn infer_session_kind(
                 }
             }
         }
-        SourceKind::Opencode => {
+        SourceKind::Opencode if opencode.has_parent(source_path, session_id) => {
             // Same value the parser stores, so parse-time and backfill
             // classification can never disagree.
-            if opencode.has_parent(source_path, session_id) {
-                return Some("fork".to_string());
-            }
+            return Some("fork".to_string());
         }
         // Match whole path components (like the Cursor parser's
         // `is_subagent_transcript`): a bare substring would false-positive
@@ -2046,16 +2224,24 @@ pub fn rebuild_from_records(
     for record in records {
         writer.record(&record)?;
     }
-    writer.replace_all_and_mark_complete()
+    writer.prepare().replace_all_and_mark_complete()
 }
 
 pub fn backfill_from_index(
     path: impl AsRef<Path>,
     index: &crate::index::SearchIndex,
 ) -> Result<()> {
+    backfill_from_index_with_repositories(path, index, Arc::new(RepositoryResolver::default()))
+}
+
+pub(crate) fn backfill_from_index_with_repositories(
+    path: impl AsRef<Path>,
+    index: &crate::index::SearchIndex,
+    repositories: Arc<RepositoryResolver>,
+) -> Result<()> {
     let expected_records = index.doc_count()?;
     let mut scanned_records = 0usize;
-    let mut writer = AnalyticsWriter::open(path)?;
+    let mut writer = AnalyticsWriter::with_repositories(path, repositories)?;
     index
         .for_each_record(|record| {
             scanned_records += 1;
@@ -2068,7 +2254,7 @@ pub fn backfill_from_index(
             "analytics backfill read {scanned_records} of {expected_records} indexed records; keeping the existing analytics cache"
         );
     }
-    writer.replace_all_and_mark_complete()
+    writer.prepare().replace_all_and_mark_complete()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2157,32 +2343,16 @@ fn session_selection_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn codex_worktree_repo_project(path: &str) -> Option<String> {
+        crate::repository::codex_worktree_repo_project(Path::new(path))
+    }
+    fn claude_worktree_repo_project(path: &str) -> Option<String> {
+        crate::repository::claude_worktree_repo_project(Path::new(path))
+    }
     use crate::test_support::env_lock;
     use crate::types::RecordLinks;
     use std::fs;
-
-    #[cfg(unix)]
-    #[test]
-    fn timed_out_child_is_killed_and_reaped() {
-        let _guard = env_lock();
-        let child = Command::new("sleep")
-            .arg("30")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn child");
-        let pid = child.id();
-
-        assert!(child_output_before(child, Instant::now() + Duration::from_millis(20)).is_none());
-        assert!(
-            !Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stderr(Stdio::null())
-                .status()
-                .expect("check child")
-                .success()
-        );
-    }
+    use std::process::Command;
 
     #[test]
     fn writable_connections_use_durable_wal_commits() {
@@ -2421,9 +2591,6 @@ mod tests {
 
         let mut replacement = AnalyticsWriter::open(&db).expect("open replacement analytics");
         replacement
-            .delete_source_path(&source_path)
-            .expect("stage source deletion");
-        replacement
             .record(&record("memex", "s1", &transcript, 20))
             .expect("record replacement session");
 
@@ -2435,13 +2602,41 @@ mod tests {
         assert_eq!(rows[0].last_at, 10);
         drop(before_flush);
 
-        replacement.flush().expect("flush replacement");
+        replacement
+            .prepare()
+            .commit(&[source_path], &[])
+            .expect("flush replacement");
         let after_flush = AnalyticsStore::open_read_only(&db).expect("open replaced catalog");
         let rows = after_flush
             .query_sessions(None, None, None, ProjectGrouping::Flat, None)
             .expect("query replaced catalog");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].last_at, 20);
+        assert_eq!(rows[0].message_count, 1);
+    }
+
+    #[test]
+    fn failed_rebuild_preserves_previous_complete_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("session.jsonl");
+        rebuild_from_records(&db, [record("memex", "old", &transcript, 10)]).unwrap();
+        let store = AnalyticsStore::open(&db).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_new_session BEFORE INSERT ON sessions
+             WHEN NEW.session_id = 'new'
+             BEGIN SELECT RAISE(ABORT, 'injected rebuild failure'); END;",
+            )
+            .unwrap();
+        assert!(rebuild_from_records(&db, [record("memex", "new", &transcript, 20)]).is_err());
+        assert!(store.complete().unwrap());
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "old");
         assert_eq!(rows[0].message_count, 1);
     }
 
@@ -2755,6 +2950,23 @@ mod tests {
     }
 
     #[test]
+    fn cleared_catalog_is_incomplete_until_rebuilt() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("analytics.sqlite");
+        let store = AnalyticsStore::open(&path).unwrap();
+        store.mark_complete().unwrap();
+        assert!(AnalyticsStore::is_complete(&path));
+        store.clear().unwrap();
+        assert!(!AnalyticsStore::is_complete(&path));
+        backfill_from_index(
+            &path,
+            &crate::index::SearchIndex::open_or_create(&temp.path().join("index")).unwrap(),
+        )
+        .unwrap();
+        assert!(AnalyticsStore::is_complete(&path));
+    }
+
+    #[test]
     fn analytics_schema_version_change_marks_incomplete() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("analytics.sqlite");
@@ -2770,9 +2982,13 @@ mod tests {
             .expect("seed meta");
         }
 
+        // Ingestion checks readiness read-only before opening its writer.
+        assert!(!AnalyticsStore::is_complete(&db));
         let store = AnalyticsStore::open(&db).expect("open store");
 
         assert!(!store.complete().expect("complete"));
+        store.mark_complete().unwrap();
+        assert!(AnalyticsStore::is_complete(&db));
     }
 
     #[test]
@@ -2960,6 +3176,167 @@ mod tests {
             Some("REAL FIRST PROMPT about the login bug")
         );
         assert_eq!(rows[0].conversation_kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn catalog_resolves_saved_names_and_renames_without_reindexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        let db = tmp.path().join("analytics.sqlite");
+        let mut request = record("proj", "saved-title", &transcript, 10);
+        request.source = SourceKind::Claude;
+        request.role = "user".into();
+        request.text = "Long original request".into();
+        let mut writer = AnalyticsWriter::open(&db).unwrap();
+        writer.record(&request).unwrap();
+        writer.flush().unwrap();
+        let store = AnalyticsStore::open_read_only(&db).unwrap();
+        for title in ["Saved title", "Renamed title"] {
+            fs::write(&transcript, serde_json::json!({"type":"custom-title", "sessionId":"saved-title", "customTitle":title}).to_string()).unwrap();
+            let detailed = store
+                .query_sessions_detailed(None, None, None, None, None)
+                .unwrap();
+            let regular = store
+                .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+                .unwrap();
+            assert_eq!(detailed[0].label.as_deref(), Some(title));
+            assert_eq!(regular[0].label.as_deref(), Some(title));
+            assert_eq!(detailed[0].message_count, 1);
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row("select label from sessions", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Long original request"
+        );
+    }
+
+    #[test]
+    fn reference_wrapper_titles_preserve_the_actual_request() {
+        for header in [
+            "## Referenced ChatGPT conversation:",
+            "## Referenced chats with Codex:",
+        ] {
+            let context = format!(
+                "{header}\nUntrusted reference instructions\n{{\"title\":\"Other task\"}}\n"
+            );
+            assert_eq!(sanitize_label(&context), "");
+            assert_eq!(
+                sanitize_label(&format!(
+                    "{context}## My request:\nCheck the Comradex update flow"
+                )),
+                "Check the Comradex update flow"
+            );
+            assert_eq!(sanitize_label(&format!("{context}## My request:\n")), "");
+        }
+        assert_eq!(
+            sanitize_label("Keep ## My request: in this example"),
+            "Keep ## My request: in this example"
+        );
+    }
+
+    #[test]
+    fn title_precedence_prefers_agent_tasks_over_inherited_requests() {
+        use crate::sources::codex::SessionTitleMetadata;
+        let mut titles = SessionTitleLookup {
+            codex: HashMap::from([(
+                "s".into(),
+                SessionTitleMetadata {
+                    title: Some("Check partner events parity".into()),
+                    first_user_message: Some("Original request".into()),
+                    agent_path: Some("/root/cache_invalidation".into()),
+                },
+            )]),
+        };
+        let resolve = |titles: &SessionTitleLookup, opening| {
+            titles.resolve(SourceKind::Codex, "s", "/missing", opening)
+        };
+        assert_eq!(
+            resolve(&titles, Some("Opening prompt")).as_deref(),
+            Some("Check partner events parity")
+        );
+        titles.codex.get_mut("s").unwrap().title = None;
+        assert_eq!(
+            resolve(&titles, Some("Opening prompt")).as_deref(),
+            Some("Cache invalidation")
+        );
+        assert_eq!(
+            resolve(&titles, None).as_deref(),
+            Some("Cache invalidation")
+        );
+        assert_eq!(
+            titles.codex["s"].agent_path.as_deref(),
+            Some("/root/cache_invalidation")
+        );
+        titles.codex.get_mut("s").unwrap().agent_path = None;
+        assert_eq!(
+            resolve(&titles, Some("Opening prompt")).as_deref(),
+            Some("Opening prompt")
+        );
+        assert_eq!(resolve(&titles, None).as_deref(), Some("Original request"));
+        titles.codex.get_mut("s").unwrap().first_user_message = None;
+        assert_eq!(resolve(&titles, None), None);
+        assert_eq!(
+            human_agent_title("/root/research/cache_invalidation").as_deref(),
+            Some("Research / cache invalidation")
+        );
+        assert_eq!(human_agent_title("/root"), None);
+        assert_eq!(
+            nonempty_label("Fix snake_case identifiers").as_deref(),
+            Some("Fix snake_case identifiers")
+        );
+    }
+
+    #[test]
+    fn encrypted_assignment_uses_public_task_name_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.jsonl");
+        fs::write(&path, serde_json::json!({"type":"response_item", "payload": {
+            "type":"agent_message", "recipient":"/root/cache_invalidation", "content":[
+                {"type":"input_text", "text":"Message Type: NEW_TASK\nTask name: /root/cache_invalidation\nSender: /root\nPayload:\n"},
+                {"type":"encrypted_content", "encrypted_content":"private-ciphertext"}
+            ]
+        }}).to_string()).unwrap();
+        let titles = SessionTitleLookup {
+            codex: HashMap::new(),
+        };
+        assert_eq!(
+            titles
+                .resolve(
+                    SourceKind::Codex,
+                    "unavailable",
+                    path.to_str().unwrap(),
+                    None
+                )
+                .as_deref(),
+            Some("Cache invalidation")
+        );
+    }
+
+    #[test]
+    fn first_request_follows_logical_order_even_when_index_iteration_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("session.jsonl");
+        let mut first = record("proj", "ordered", &transcript, 10);
+        first.role = "user".into();
+        first.text = "First request".into();
+        first.turn_id = 1;
+        let mut later = first.clone();
+        later.turn_id = 2;
+        later.text = "Later followup".into();
+        let mut writer = AnalyticsWriter::open(&db).unwrap();
+        writer.record(&later).unwrap();
+        writer.record(&first).unwrap();
+        writer.flush().unwrap();
+        let rows = writer
+            .store
+            .query_sessions_detailed(None, None, None, None, None)
+            .unwrap();
+        assert_eq!(rows[0].label.as_deref(), Some("First request"));
+        assert_eq!(rows[0].message_count, 2);
     }
 
     #[test]

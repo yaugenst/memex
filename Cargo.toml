@@ -1,6 +1,6 @@
 [package]
 name = "memex"
-version = "0.19.0"
+version = "0.23.1"
 edition = "2024"
 build = "build.rs"
 description = "CLI tool for indexing and searching local agent conversation history"
@@ -9,6 +9,7 @@ repository = "https://github.com/nicosuave/memex"
 
 [features]
 default = []
+profiling = []
 cuda = ["ort/cuda", "dep:libloading"]
 
 [dependencies]
@@ -17,9 +18,9 @@ clap = { version = "4.5", features = ["derive"] }
 dialoguer = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "5.0"
-fastembed = "5"
+fastembed = "5.17.4"
 model2vec-rs = "0.1.4"
-ort = "2.0.0-rc.10"
+ort = "2.0.0-rc.13"
 crossbeam-channel = "0.5"
 once_cell = "1.19"
 memchr = "2.7"
@@ -33,13 +34,14 @@ serde_json = "1.0"
 sha2 = "0.10"
 signal-hook = "0.3"
 simd-json = { version = "0.13", features = ["serde"] }
-tantivy = "0.22"
+tantivy = { version = "0.22", features = ["quickwit"] }
 usearch = "2"
 toml = "0.8"
 toml_edit = "0.22"
 walkdir = "2.5"
 globset = "0.4"
 notify = "8"
+gix = { version = "0.84", default-features = false, features = ["sha1", "sha256"] }
 indicatif = "0.17"
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm_0_29",
@@ -61,6 +63,40 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net",
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "query", "json"] }
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
+hashbrown = "0.17.1"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+# sha2 0.10 gates ARM64's runtime-detected SHA instructions behind this feature.
+sha2 = { version = "0.10", features = ["asm"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# ort >= rc.13 gates each execution provider behind its own feature.
+ort = { version = "2.0.0-rc.13", features = ["coreml"] }
+fsevent-sys = "4"
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+
+[package.metadata.binstall]
+# `memex` is taken on crates.io, so installs run via
+# `cargo binstall --git https://github.com/nicosuave/memex`.
+# Release assets use custom OS/arch names, mapped per target below.
+# Archives contain a bare `memex` binary at the tar root.
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+# Never fetch the unrelated `memex` crate from quickinstall; GitHub or compile only.
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/memex-{ version }-macos-arm64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/memex-{ version }-linux-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/memex-{ version }-linux-arm64.tar.gz"
+
+[[bench]]
+name = "index"
+harness = false

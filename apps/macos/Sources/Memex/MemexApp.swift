@@ -68,7 +68,10 @@ private struct BrowserReader: View {
     @Bindable var store: Store
 
     var body: some View {
-        ReaderView(store: store)
+        Group {
+            if store.scope == .home { HomeView(store: store) }
+            else { ReaderView(store: store) }
+        }
         .task(id: store.requestID) { await store.loadSessions() }
         .task(id: store.sessionCountRequestID) { await store.loadSessionCount() }
         .task(id: store.readerRequestID) { await store.loadRecords() }
@@ -87,36 +90,53 @@ private struct BrowserSidebar: View {
 
     private var sidebar: some View {
         VStack(spacing: 0) {
-            sidebarList.clipped()
-            Divider()
-            HStack(spacing: 6) {
-                Picker("Machines", selection: $store.machineSelection) {
-                    Text("All Machines").tag(MachineSelection.all)
-                    ForEach(store.machines) { machine in
-                        Text(machine.label).tag(MachineSelection.machine(machine.id))
-                    }
-                }
-                .labelsHidden().pickerStyle(.menu)
-                .accessibilityLabel("Machines")
-                if store.loadingMachines { ProgressView().controlSize(.mini) }
-                if let error = store.machineError {
-                    Button { Task { await store.loadMachines() } } label: {
-                        Image(systemName: "exclamationmark.triangle")
-                    }
-                    .buttonStyle(.plain).help(error)
-                    .accessibilityLabel("Retry loading machines")
+            Group {
+                if #available(macOS 26.0, *) {
+                    sidebarList
+                        .scrollEdgeEffectStyle(.soft, for: .top)
+                } else {
+                    sidebarList
                 }
             }
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.horizontal, 16).padding(.vertical, 12)
-                .fixedSize(horizontal: false, vertical: true)
-                .background(Color(nsColor: .windowBackgroundColor))
+            Divider()
+            machinePicker
         }
+        // The material must continue beneath the native titlebar as well as
+        // the list and footer, otherwise its safe-area edge makes a color seam.
+        .background(SidebarBackground().ignoresSafeArea())
+    }
+
+    private var machinePicker: some View {
+        HStack(spacing: 6) {
+            Picker("Machines", selection: $store.machineSelection) {
+                Text("All Machines").tag(MachineSelection.all)
+                ForEach(store.machines) { machine in
+                    Text(machine.label).tag(MachineSelection.machine(machine.id))
+                }
+            }
+            .labelsHidden().pickerStyle(.menu)
+            .buttonStyle(.borderless)
+            .frame(maxWidth: .infinity)
+            .accessibilityLabel("Machines")
+            if store.loadingMachines { ProgressView().controlSize(.mini) }
+            if let error = store.machineError {
+                Button { Task { await store.loadMachines() } } label: {
+                    Image(systemName: "exclamationmark.triangle")
+                }
+                .buttonStyle(.plain).help(error)
+                .accessibilityLabel("Retry loading machines")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var sidebarList: some View {
         List(selection: $store.scope) {
             Section {
+                Label("Home", systemImage: "house")
+                    .tag(Store.Scope.home)
                 Label("All conversations", systemImage: "bubble.left.and.bubble.right")
                     .tag(Store.Scope.all)
             }
@@ -164,8 +184,20 @@ private struct BrowserSidebar: View {
 
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
     }
 
+}
+
+private struct SidebarBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .sidebar
+        view.blendingMode = .behindWindow
+        return view
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
 }
 
 private struct BrowserConversationList: View {

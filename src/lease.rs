@@ -66,6 +66,7 @@ impl IngestLease {
     }
 
     fn acquire_path(path: PathBuf, operation: String, timeout: Duration) -> Result<Self> {
+        crate::profiling::span!("ingest.lease_wait");
         let started = Instant::now();
         loop {
             match Self::try_acquire_path(path.clone(), operation.clone())? {
@@ -123,6 +124,37 @@ fn is_path_held_by(path: &Path, pid: u32) -> bool {
         Err(TryLockError::WouldBlock) => read_holder(path).is_some_and(|holder| holder.pid == pid),
         Err(TryLockError::Error(_)) => false,
     }
+}
+
+/// Serializes the merge itself, which the ingest lease cannot: a compaction releases that
+/// lease while it merges so searches keep working, which would otherwise let two detached
+/// children merge the same segments at once.
+#[derive(Debug)]
+pub struct CompactionLock {
+    _file: File,
+}
+
+impl CompactionLock {
+    pub fn try_acquire(paths: &Paths) -> Result<Option<Self>> {
+        let path = compaction_lock_path(paths);
+        let file = open_lease_file(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error)
+                .with_context(|| format!("failed to acquire compaction lock {}", path.display())),
+        }
+    }
+}
+
+fn compaction_lock_path(paths: &Paths) -> PathBuf {
+    let path = lease_path(paths, "ingest");
+    path.with_file_name(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(".memex.ingest.lock")
+            .replace("ingest.lock", "compaction.lock"),
+    )
 }
 
 fn lease_path(paths: &Paths, kind: &str) -> PathBuf {
@@ -197,6 +229,35 @@ fn lease_timeout_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_compaction_is_refused_while_the_first_holds_its_own_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
+        assert_ne!(compaction_lock_path(&paths), lease_path(&paths, "ingest"));
+
+        let first = CompactionLock::try_acquire(&paths)
+            .expect("first compaction lock")
+            .expect("first compaction should be available");
+        assert!(
+            CompactionLock::try_acquire(&paths)
+                .expect("second compaction lock")
+                .is_none()
+        );
+
+        let ingest = match IngestLease::try_acquire(&paths, "refresh").expect("ingest lease") {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Busy(_) => panic!("compaction lock must not hold the ingest lease"),
+        };
+        drop(ingest);
+
+        drop(first);
+        assert!(
+            CompactionLock::try_acquire(&paths)
+                .expect("third compaction lock")
+                .is_some()
+        );
+    }
 
     #[test]
     fn contended_lease_reports_holder() {

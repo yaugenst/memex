@@ -13,11 +13,35 @@ struct Session: Decodable, Identifiable, Hashable, Sendable {
     var repoProject: String?
     var machine: String?
     var searchRecordID: String?
+    var messageCount: Int?
+    var conversationKind: String?
+
+    // Match the backend's subagent filter, including provider-specific kinds.
+    var isSubagent: Bool {
+        conversationKind != nil && conversationKind != "main" && conversationKind != "guardian_review"
+    }
 
     // A session ID alone is not unique across machines, providers or transcript files.
     var machineID: String { machine ?? "local" }
     var id: String { [machineID, source, sessionID, sourcePath].joined(separator: "\u{1f}") }
     var title: String { label?.nilIfBlank ?? "Untitled conversation" }
+    static func openingTitle(_ records: [TranscriptRecord]) -> String? {
+        if let request = TranscriptPresentation.project(records).first(where: {
+            $0.record.role == "user" && !$0.record.isInstruction && $0.record.text.nilIfBlank != nil
+        }) {
+            let text = request.record.text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            return String(text.prefix(160)) + (text.count > 160 ? "…" : "")
+        }
+        for entry in records where entry.record.role == "developer" && entry.record.text.hasPrefix("<context_window>") {
+            if let line = entry.record.text.components(separatedBy: "\n").first(where: { $0.hasPrefix("Agent name: /root/") }) {
+                let name = line.dropFirst("Agent name: /root/".count).replacingOccurrences(of: "_", with: " ")
+                let title = String(name.prefix(160))
+                return title.prefix(1).uppercased() + title.dropFirst()
+            }
+        }
+        return nil
+    }
+
     var projectName: String { repoProject?.nilIfBlank ?? project.nilIfBlank ?? "No project" }
     var date: Date? { lastAt.flatMap { try? Date.ISO8601FormatStyle().parse($0) } }
 
@@ -28,6 +52,8 @@ struct Session: Decodable, Identifiable, Hashable, Sendable {
         value.searchRecordID = searchRecordID
         if value.label == nil { value.label = label }
         if value.lastAt == nil { value.lastAt = lastAt }
+        if value.messageCount == nil { value.messageCount = messageCount }
+        if value.conversationKind == nil { value.conversationKind = conversationKind }
         return value
     }
 
@@ -37,6 +63,8 @@ struct Session: Decodable, Identifiable, Hashable, Sendable {
         case lastAt = "last_at", resumeCommand = "resume_cmd"
         case repoProject = "repo_project"
         case searchRecordID = "search_record_id"
+        case messageCount = "message_count"
+        case conversationKind = "conversation_kind"
     }
 }
 
@@ -49,20 +77,22 @@ struct SearchHit: Decodable, Sendable {
     let ts: String?
     var machine: String?
     var recordID: String?
+    var conversationKind: String?
 
     enum CodingKeys: String, CodingKey {
         case source, project, snippet, ts, machine
         case sessionID = "session_id", sourcePath = "source_path"
         case recordID = "record_id"
+        case conversationKind = "conversation_kind"
     }
 
     func session(known: [String: Session]) -> Session {
         var value = Session(source: source, sessionID: sessionID, sourcePath: sourcePath,
                             project: project, label: nil, lastAt: nil, machine: machine)
         if let existing = known[value.id] { value = existing }
+        if value.conversationKind == nil { value.conversationKind = conversationKind }
         value.snippet = snippet
         value.searchRecordID = recordID
-        if value.label == nil { value.label = snippet?.nilIfBlank }
         if value.lastAt == nil, let ts {
             value.lastAt = ts
         }
@@ -73,32 +103,79 @@ struct SearchHit: Decodable, Sendable {
 struct TranscriptRecord: Decodable, Identifiable, Equatable, Sendable {
     let recordID: String
     let record: Message
+    var sourceRecordID: String? = nil
+    var rawJSON: String? = nil
+    var sourceID: String { sourceRecordID ?? recordID }
     var id: String { recordID }
     enum CodingKeys: String, CodingKey { case recordID = "record_id", record }
+
+    init(recordID: String, record: Message, sourceRecordID: String? = nil, rawJSON: String? = nil) {
+        self.recordID = recordID
+        self.record = record
+        self.sourceRecordID = sourceRecordID
+        self.rawJSON = rawJSON
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        recordID = try container.decode(String.self, forKey: .recordID)
+        record = try container.decode(Message.self, forKey: .record)
+        rawJSON = try RawTranscriptJSON(from: decoder).prettyPrinted()
+    }
+
+    var rawTranscriptBody: String {
+        if let rawJSON { return rawJSON }
+        var fields: [String: RawTranscriptJSON] = ["role": .string(record.role), "text": .string(record.text)]
+        for (key, value) in [("tool_name", record.toolName), ("tool_input", record.toolInput),
+                             ("tool_output", record.toolOutput), ("event_id", record.eventID),
+                             ("parent_tool_use_id", record.parentToolUseID), ("source_turn_id", record.sourceTurnID),
+                             ("assistant_phase", record.assistantPhase), ("lifecycle_event", record.lifecycleEvent),
+                             ("source_record_type", record.sourceRecordType)] {
+            if let value { fields[key] = .string(value) }
+        }
+        if let content = record.sourceContent { fields["source_content"] = .string(content) }
+        if let isError = record.toolResultIsError { fields["tool_result_is_error"] = .bool(isError) }
+        return (try? RawTranscriptJSON.object(["record_id": .string(sourceID), "record": .object(fields)]).prettyPrinted()) ?? record.text
+    }
 }
 
 struct Message: Decodable, Equatable, Sendable {
     let role: String
-    let text: String
+    var text: String
     let toolName: String?
     let toolInput: String?
     let toolOutput: String?
     var eventID: String? = nil
     var parentToolUseID: String? = nil
+    var sourceTurnID: String? = nil
+    var assistantPhase: String? = nil
+    var lifecycleEvent: String? = nil
+    var sourceRecordType: String? = nil
+    var sourceContent: String? = nil
+    var toolResultIsError: Bool? = nil
+    // Display-only classification; source records and serialized content stay intact.
+    var contextLabel: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case role, text
         case toolName = "tool_name", toolInput = "tool_input", toolOutput = "tool_output"
         case eventID = "event_id", parentToolUseID = "parent_tool_use_id"
+        case sourceTurnID = "source_turn_id", assistantPhase = "assistant_phase"
+        case lifecycleEvent = "lifecycle_event", sourceRecordType = "source_record_type"
+        case sourceContent = "source_content"
+        case toolResultIsError = "tool_result_is_error"
     }
 
     var isActivity: Bool { ["tool_use", "tool_result", "tool", "reasoning"].contains(role) }
+    var isRoutineTurnBoundary: Bool {
+        role == "lifecycle" && (lifecycleEvent == "task_started" || lifecycleEvent == "task_complete")
+    }
     var isEnvironmentContext: Bool {
         guard role == "user" else { return false }
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.hasPrefix("<environment_context>") && value.hasSuffix("</environment_context>")
     }
-    var isInstruction: Bool { ["system", "developer"].contains(role) || isEnvironmentContext }
+    var isInstruction: Bool { contextLabel != nil || ["system", "developer"].contains(role) || isEnvironmentContext }
     var activityTitle: String {
         if role == "reasoning" { return "Reasoning" }
         guard let toolName = toolName?.nilIfBlank else {
@@ -114,6 +191,7 @@ struct TranscriptActivity: Identifiable, Sendable {
     var id: String { records.first(where: { $0.record.role == "tool_use" })?.id ?? records[0].id }
     var title: String {
         let message = records.first(where: { $0.record.role == "tool_use" })?.record ?? records[0].record
+        if let label = message.contextLabel { return label }
         if message.isEnvironmentContext { return "Environment context" }
         if message.isInstruction { return message.role.capitalized + " instructions" }
         return message.activityTitle
@@ -186,12 +264,34 @@ struct TranscriptActivity: Identifiable, Sendable {
 
 struct TranscriptItem: Identifiable, Sendable {
     let records: [TranscriptRecord]
-    var activities: [TranscriptActivity] { TranscriptActivity.pair(records) }
+    // Preserve pairing when routine spans are separated around explicit failures.
+    var groupedActivities: [TranscriptActivity]? = nil
+    var isCompletedWork = false
+    var activities: [TranscriptActivity] { groupedActivities ?? TranscriptActivity.pair(records) }
     var id: String { records[0].id }
-    var isActivity: Bool { records[0].record.isActivity }
+    var isActivity: Bool { isCompletedWork || records[0].record.isActivity }
     var isInstructions: Bool { records[0].record.isInstruction }
+    var activitySummary: String {
+        if isCompletedWork { return "Completed work" }
+        if isInstructions { return title }
+        let entries = activities
+        guard entries.count > 1 else { return entries.first?.presentation.title ?? title }
+        if entries.allSatisfy({ $0.presentation.category == nil && $0.records[0].record.role != "reasoning" }) {
+            return "\(entries.count) tool calls"
+        }
+        var categories: [(String, Int)] = []
+        for entry in entries {
+            let category = entry.presentation.category?.lowercased() ?? (entry.records[0].record.role == "reasoning" ? "reasoning" : "tool")
+            if let index = categories.firstIndex(where: { $0.0 == category }) { categories[index].1 += 1 }
+            else { categories.append((category, 1)) }
+        }
+        let details = categories.prefix(3).map { name, count in
+            name == "reasoning" ? "reasoning" : "\(count) \(name)\(count == 1 ? "" : name == "search" ? "es" : "s")"
+        }.joined(separator: ", ")
+        return "\(entries.count) activities · \(details)" + (categories.count > 3 ? ", …" : "")
+    }
     var title: String {
-        if isInstructions { return "Session instructions" }
+        if isInstructions { return "Session context" }
         var names: [String] = []
         // Use the same readable labels for group summaries and individual tools.
         for item in records where item.record.role != "tool_result" {
@@ -204,21 +304,48 @@ struct TranscriptItem: Identifiable, Sendable {
     }
 
     static func group(_ records: [TranscriptRecord]) -> [TranscriptItem] {
+        TranscriptPresentation.group(records)
+    }
+
+    static func groupConsecutive(_ records: [TranscriptRecord]) -> [TranscriptItem] {
         var result: [TranscriptItem] = []
         var pending: [TranscriptRecord] = []
+        func flush() {
+            guard !pending.isEmpty else { return }
+            let entries = TranscriptActivity.pair(pending)
+            guard pending[0].record.isActivity, entries.contains(where: { $0.presentation.needsAttention }) else {
+                result.append(TranscriptItem(records: pending))
+                pending = []
+                return
+            }
+            var routine: [TranscriptActivity] = []
+            func appendRoutine() {
+                if !routine.isEmpty {
+                    result.append(TranscriptItem(records: routine.flatMap(\.records), groupedActivities: routine))
+                    routine = []
+                }
+            }
+            for entry in entries {
+                if entry.presentation.needsAttention {
+                    appendRoutine()
+                    result.append(TranscriptItem(records: entry.records, groupedActivities: [entry]))
+                } else { routine.append(entry) }
+            }
+            appendRoutine()
+            pending = []
+        }
         for record in records {
             let canGroup = record.record.isActivity || record.record.isInstruction
             if let previous = pending.first,
                !canGroup || previous.record.isActivity != record.record.isActivity {
-                result.append(TranscriptItem(records: pending))
-                pending = []
+                flush()
             }
             if canGroup { pending.append(record) }
             else {
                 result.append(TranscriptItem(records: [record]))
             }
         }
-        if !pending.isEmpty { result.append(TranscriptItem(records: pending)) }
+        flush()
         return result
     }
 }

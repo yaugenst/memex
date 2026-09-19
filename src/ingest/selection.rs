@@ -1,9 +1,9 @@
 //! Resolve event hints without walking transcript trees. Root aliases are
 //! translated back to discovery spelling so state and index keys stay stable.
 
+use super::CheckpointSession;
 use super::{IngestOptions, PathExcluder, build_path_excluder};
 use crate::sources::{self, SourceFile};
-use crate::state::IngestState;
 use crate::types::SourceKind;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -32,6 +32,8 @@ enum Shape {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
+    Zcode,
 }
 
 struct Root {
@@ -125,13 +127,27 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
             Shape::Antigravity,
         ));
     }
+    if options.include_bob {
+        roots.extend(
+            sources::bob::roots()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Bob)),
+        );
+    }
+    if options.include_zcode {
+        roots.extend(
+            sources::zcode::db_dirs()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Zcode)),
+        );
+    }
     roots
 }
 
 pub(super) fn resolve_dirty(
     options: &IngestOptions,
     dirty: &HashSet<PathBuf>,
-    state: &IngestState,
+    state: &CheckpointSession,
 ) -> Result<DirtySelection> {
     let excluder = build_path_excluder(options)?;
     resolve(&roots(options), dirty, state, &excluder)
@@ -213,9 +229,29 @@ fn classify(root: &Root, path: &Path) -> Match {
             (name.starts_with("session_") && name.ends_with(".json")).then_some(SourceKind::Jcode)
         }
         Shape::Muse => (name == "session.jsonl").then_some(SourceKind::Muse),
+        Shape::Bob => {
+            // Every task shares one database and discovery diffs task aggregates
+            // itself, so a commit targets the database (`resolve` already routed WAL
+            // and journal hints to it). The shared-memory index is read noise.
+            return if parts.len() == 1 && sources::bob::is_configured_database(path) {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
+        }
+        Shape::Zcode => {
+            // One store per db directory; `resolve` routes WAL and shared-memory
+            // sidecar hints to the database before classification.
+            return if parts.len() == 1 && name == "db.sqlite" {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
+        }
         Shape::Antigravity => {
             let in_profile = parts.first().is_some_and(|part| {
-                *part == "antigravity-ide"
+                *part == "antigravity-cli"
+                    || *part == "antigravity-ide"
                     || *part == "antigravity"
                     || *part == "antigravity-backup"
             });
@@ -225,7 +261,9 @@ fn classify(root: &Root, path: &Path) -> Match {
                 && !name.ends_with("-wal.db")
                 && !name.ends_with("-shm.db")
                 && parts.get(1).is_some_and(|part| *part == "conversations"))
-                || (name == "overview.txt"
+                || ((name == "overview.txt"
+                    || name == "transcript.jsonl"
+                    || name == "transcript_full.jsonl")
                     && path.to_string_lossy().contains(".system_generated/logs/"))
             {
                 Some(SourceKind::Antigravity)
@@ -240,7 +278,7 @@ fn classify(root: &Root, path: &Path) -> Match {
 fn resolve(
     roots: &[Root],
     dirty: &HashSet<PathBuf>,
-    state: &IngestState,
+    state: &CheckpointSession,
     excluder: &PathExcluder,
 ) -> Result<DirtySelection> {
     let mut files = Vec::new();
@@ -255,15 +293,37 @@ fn resolve(
             if excluder.is_excluded(&path) || excluder.is_excluded(hint) {
                 continue;
             }
-            let path = if matches!(root.shape, Shape::Antigravity) {
-                path.file_name()
+            // SQLite commits may touch only a sidecar; route the hint to the database
+            // so classification and the stat below see the file that exists.
+            let path = match root.shape {
+                Shape::Antigravity => path
+                    .file_name()
                     .and_then(|name| name.to_str())
                     .and_then(|name| name.strip_suffix("-wal"))
                     .filter(|name| name.ends_with(".db"))
                     .map(|name| path.with_file_name(name))
-                    .unwrap_or(path)
-            } else {
-                path
+                    .unwrap_or(path),
+                Shape::Bob => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.strip_suffix("-wal")
+                            .or_else(|| name.strip_suffix("-journal"))
+                    })
+                    .map(|name| path.with_file_name(name))
+                    .filter(|database| sources::bob::is_configured_database(database))
+                    .unwrap_or(path),
+                Shape::Zcode => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.strip_suffix("-wal")
+                            .or_else(|| name.strip_suffix("-shm"))
+                    })
+                    .filter(|name| *name == "db.sqlite")
+                    .map(|name| path.with_file_name(name))
+                    .unwrap_or(path),
+                _ => path,
             };
             if excluder.is_excluded(&path) {
                 continue;
@@ -288,12 +348,12 @@ fn resolve(
                 // A deleted lock/cache file is noise. A vanished directory
                 // containing indexed keys still requires tombstone recovery.
                 let key = path.to_string_lossy();
-                known_unmatched |= state.files.contains_key(key.as_ref())
+                known_unmatched |= state.contains_file(key.as_ref())?
                     || state.opencode_databases.contains_key(key.as_ref());
                 if metadata.is_err() {
                     known_unmatched |= state
-                        .files
-                        .keys()
+                        .file_keys()?
+                        .iter()
                         .chain(state.opencode_databases.keys())
                         .any(|key| Path::new(key).starts_with(&path));
                 }
@@ -318,13 +378,14 @@ fn resolve(
                     if !path.is_file() {
                         return Ok(DirtySelection::Resync);
                     }
-                    (
-                        SourceFile {
-                            source: SourceKind::Opencode,
-                            path,
-                        },
-                        true,
-                    )
+                    let source = if sources::bob::is_configured_database(&path) {
+                        SourceKind::Bob
+                    } else if matches!(root.shape, Shape::Zcode) {
+                        SourceKind::Zcode
+                    } else {
+                        SourceKind::Opencode
+                    };
+                    (SourceFile { source, path }, true)
                 }
             };
             // WalkDir does not follow nested symlinks. A root symlink is valid,
@@ -363,23 +424,23 @@ fn resolve(
 /// batch. No transcript discovery or per-file stats are needed here.
 pub(super) fn codex_session_ids(
     options: &IngestOptions,
-    state: &IngestState,
+    state: &CheckpointSession,
     files: &[SourceFile],
-) -> HashSet<String> {
+) -> Result<HashSet<String>> {
     if !options.include_codex {
-        return HashSet::new();
+        return Ok(HashSet::new());
     }
     let Ok(excluder) = build_path_excluder(options) else {
         // The caller validates these same patterns before resolving a batch.
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
     let rollout_roots = sources::codex::rollout_roots()
         .into_iter()
         .map(|root| Root::new(root, Shape::Jsonl(SourceKind::Codex)))
         .collect::<Vec<_>>();
-    state
-        .files
-        .keys()
+    Ok(state
+        .file_keys()?
+        .iter()
         .map(Path::new)
         .chain(
             files
@@ -399,14 +460,24 @@ pub(super) fn codex_session_ids(
             })
         })
         .filter_map(sources::codex::session_id_from_path)
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{IndexedToolContentLimits, UserConfig};
-    use crate::state::FileState;
+    use crate::state::{FileState, IngestState};
+
+    fn checkpoint(temp: &tempfile::TempDir, state: &IngestState) -> CheckpointSession {
+        let paths = crate::config::Paths::new(Some(temp.path().join("checkpoint"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease =
+            crate::lease::IngestLease::acquire(&paths, "test", std::time::Duration::ZERO).unwrap();
+        let path = paths.state.join("ingest.json");
+        state.save_with_lease(&path, &lease).unwrap();
+        CheckpointSession::open(&path, &lease, false, None).unwrap()
+    }
     use crate::test_support::{EnvVarGuard, env_lock};
 
     fn options() -> IngestOptions {
@@ -426,12 +497,15 @@ mod tests {
             include_jcode: false,
             include_muse: false,
             include_antigravity: false,
+            include_bob: false,
+            include_zcode: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
             model: Default::default(),
             embed_runtime: UserConfig::default().resolve_embed_runtime().unwrap(),
             tool_content_limits: IndexedToolContentLimits::default(),
+            defer_merges: false,
         }
     }
 
@@ -441,13 +515,56 @@ mod tests {
     }
 
     fn select(roots: &[Root], path: &Path) -> DirtySelection {
+        let temp = tempfile::tempdir().unwrap();
         resolve(
             roots,
             &HashSet::from([path.to_path_buf()]),
-            &IngestState::default(),
+            &checkpoint(&temp, &IngestState::default()),
             &PathExcluder::build(&[]).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn bob_database_commits_target_the_database() {
+        let _guard = crate::test_support::env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("bob.db");
+        write(&database);
+        let _env = crate::test_support::EnvVarGuard::set_os(&[(
+            "MEMEX_BOB_DB",
+            Some(database.as_os_str()),
+        )]);
+        // A database that is not configured is ignored even with the default name.
+        let stray = temp.path().join("other").join("bob.db");
+        write(&stray);
+        let roots = [Root::new(temp.path().to_path_buf(), Shape::Bob)];
+        let DirtySelection::Paths { files, databases } = select(&roots, &stray) else {
+            panic!("unexpected resync for a stray database")
+        };
+        assert!(files.is_empty() && databases.is_empty());
+        for hint in ["bob.db", "bob.db-wal", "bob.db-journal"] {
+            let DirtySelection::Paths { files, databases } =
+                select(&roots, &temp.path().join(hint))
+            else {
+                panic!("unexpected resync for {hint}")
+            };
+            assert!(files.is_empty(), "{hint}");
+            assert_eq!(
+                databases,
+                vec![SourceFile {
+                    source: SourceKind::Bob,
+                    path: database.clone(),
+                }],
+                "{hint}"
+            );
+        }
+        let DirtySelection::Paths { files, databases } =
+            select(&roots, &temp.path().join("bob.db-shm"))
+        else {
+            panic!("unexpected resync for shm")
+        };
+        assert!(files.is_empty() && databases.is_empty());
     }
 
     #[test]
@@ -501,7 +618,22 @@ mod tests {
             ),
             (
                 Shape::Antigravity,
+                "antigravity-cli/conversations/abc.db",
+                SourceKind::Antigravity,
+            ),
+            (
+                Shape::Antigravity,
                 "antigravity-ide/brain/comp/.system_generated/logs/overview.txt",
+                SourceKind::Antigravity,
+            ),
+            (
+                Shape::Antigravity,
+                "antigravity-cli/brain/comp/.system_generated/logs/transcript.jsonl",
+                SourceKind::Antigravity,
+            ),
+            (
+                Shape::Antigravity,
+                "antigravity-cli/brain/comp/.system_generated/logs/transcript_full.jsonl",
                 SourceKind::Antigravity,
             ),
         ];
@@ -638,7 +770,7 @@ mod tests {
         let exclusions =
             PathExcluder::build(&[alias.join("**").to_string_lossy().into_owned()]).unwrap();
         assert!(matches!(resolve(&roots, &HashSet::from([canonical_hint]),
-            &IngestState::default(), &exclusions).unwrap(), DirtySelection::Paths { files, databases }
+            &checkpoint(&temp, &IngestState::default()), &exclusions).unwrap(), DirtySelection::Paths { files, databases }
             if files.is_empty() && databases.is_empty()));
     }
 
@@ -671,16 +803,19 @@ mod tests {
         state.files.insert(
             known.to_string_lossy().into_owned(),
             FileState {
-                source: None,
                 size: 3,
                 mtime: 0,
                 offset: 3,
                 turn_id: 0,
+                legacy_turn_id: None,
                 parser_version: 0,
                 pending_tool_calls: Default::default(),
+                codex_metadata_offsets: None,
                 identity: Default::default(),
+                claude_background: None,
             },
         );
+        let state = checkpoint(&temp, &state);
         let DirtySelection::Paths { files, databases } = resolve_dirty(
             &options,
             &HashSet::from([history.clone(), new.clone(), pi.clone()]),
@@ -696,12 +831,12 @@ mod tests {
             path: pi
         }));
         assert_eq!(
-            codex_session_ids(&options, &state, &files),
+            codex_session_ids(&options, &state, &files).unwrap(),
             HashSet::from([known_id.to_string(), new_id.to_string()])
         );
         options.exclude_patterns = vec![known.to_string_lossy().into_owned()];
         assert_eq!(
-            codex_session_ids(&options, &state, &files),
+            codex_session_ids(&options, &state, &files).unwrap(),
             HashSet::from([new_id.to_string()])
         );
     }
@@ -746,13 +881,16 @@ mod tests {
         options.include_codex = true;
         options.include_pi = true;
         options.include_opencode = true;
-        let DirtySelection::Paths { files, databases } =
-            resolve_dirty(&options, &dirty, &IngestState::default()).unwrap()
-        else {
+        let DirtySelection::Paths { files, databases } = resolve_dirty(
+            &options,
+            &dirty,
+            &checkpoint(&temp, &IngestState::default()),
+        )
+        .unwrap() else {
             panic!("regular source files should resolve directly")
         };
-        let mut discovered = sources::claude::discover(&claude, false).unwrap();
-        discovered.extend(sources::codex::discover_rollouts());
+        let mut discovered = sources::claude::discover(&claude, false, None).unwrap();
+        discovered.extend(sources::codex::discover_rollouts(None));
         discovered.extend(
             sources::codex::history_paths()
                 .into_iter()
@@ -761,7 +899,7 @@ mod tests {
                     path,
                 }),
         );
-        discovered.extend(sources::pi::discover());
+        discovered.extend(sources::pi::discover(None));
         discovered.sort_by(|left, right| left.path.cmp(&right.path));
         assert_eq!(files, discovered);
         assert_eq!(databases, sources::opencode::discover_databases().unwrap());
@@ -781,12 +919,15 @@ mod tests {
         }
         let mut options = options();
         options.include_codex = true;
-        let DirtySelection::Paths { files, databases } =
-            resolve_dirty(&options, &dirty, &IngestState::default()).unwrap()
-        else {
+        let DirtySelection::Paths { files, databases } = resolve_dirty(
+            &options,
+            &dirty,
+            &checkpoint(&temp, &IngestState::default()),
+        )
+        .unwrap() else {
             panic!("fallback Codex root should resolve directly")
         };
-        assert_eq!(files, sources::codex::discover_rollouts());
+        assert_eq!(files, sources::codex::discover_rollouts(None));
         assert!(databases.is_empty());
     }
 
@@ -804,6 +945,7 @@ mod tests {
             .opencode_databases
             .insert(noise.to_string_lossy().into_owned(), Default::default());
         let root = Root::new(temp.path().to_path_buf(), Shape::CodexHome);
+        let state = checkpoint(&temp, &state);
         assert!(matches!(
             resolve(
                 &[root],
@@ -814,5 +956,39 @@ mod tests {
             .unwrap(),
             DirtySelection::Resync
         ));
+    }
+
+    #[test]
+    fn vanished_directory_queries_preserve_path_components_and_exact_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let removed = temp.path().join("removed");
+        let sibling = temp.path().join("removed-neighbor/session.jsonl");
+        let nested = removed.join("./nested/session.jsonl");
+        let file: FileState = serde_json::from_value(serde_json::json!({
+            "size": 1, "mtime": 0, "offset": 1, "turn_id": 1
+        }))
+        .unwrap();
+        let mut original = IngestState::default();
+        original
+            .files
+            .insert(sibling.to_string_lossy().into_owned(), file.clone());
+        let roots = [Root::new(temp.path().to_path_buf(), Shape::CodexHome)];
+        let excluder = PathExcluder::build(&[]).unwrap();
+        let state = checkpoint(&temp, &original);
+        assert!(
+            matches!(resolve(&roots, &HashSet::from([removed.clone()]), &state, &excluder).unwrap(),
+            DirtySelection::Paths { files, databases } if files.is_empty() && databases.is_empty())
+        );
+        assert!(state.loaded.is_empty());
+        drop(state);
+        let nested_key = nested.to_string_lossy().into_owned();
+        original.files.insert(nested_key.clone(), file);
+        let state = checkpoint(&temp, &original);
+        assert!(matches!(
+            resolve(&roots, &HashSet::from([removed]), &state, &excluder).unwrap(),
+            DirtySelection::Resync
+        ));
+        assert!(state.loaded.is_empty());
+        assert!(state.file_keys().unwrap().contains(&nested_key));
     }
 }

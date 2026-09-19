@@ -2,6 +2,23 @@ import Foundation
 import Testing
 @testable import Memex
 
+@Test func subagentClassificationSurvivesBrowsingSearchAndMetadata() throws {
+    for kind in [nil, "main", "subagent", "sidechain", "guardian_review"] as [String?] {
+        var object: [String: String] = ["source": "codex", "session_id": "s", "source_path": "/s", "project": "p"]
+        object["conversation_kind"] = kind
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let session = try JSONDecoder().decode(Session.self, from: data)
+        let expected = kind == "subagent" || kind == "sidechain"
+        #expect(session.isSubagent == expected)
+        let hit = try JSONDecoder().decode(SearchHit.self, from: data)
+        #expect(hit.session(known: [:]).isSubagent == expected)
+        var oldMetadata = session
+        oldMetadata.conversationKind = nil
+        #expect(session.applyingMetadata(oldMetadata).isSubagent == expected)
+        #expect(hit.session(known: [oldMetadata.id: oldMetadata]).isSubagent == expected)
+    }
+}
+
 @Test func decodesCLIContracts() throws {
     let sessionJSON = #"[{"source":"codex","session_id":"session-1","source_path":"/tmp/one.jsonl","project":"memex","last_at":"2026-09-07T17:03:01Z","label":"Native app","resume_cmd":"codex resume session-1"}]"#
     let sessions = try JSONDecoder().decode([Session].self, from: Data(sessionJSON.utf8))
@@ -77,7 +94,7 @@ private func record(_ id: String, _ role: String, _ tool: String? = nil) -> Tran
                  record("7", "developer"), record("8", "assistant")]
     let items = TranscriptItem.group(input)
     #expect(items.count == 5)
-    #expect(items[0].title == "Session instructions")
+    #expect(items[0].title == "Session context")
     #expect(items[0].records.count == 3)
     #expect(items[1].records[0].record.role == "user")
     #expect(items[2].isActivity)
@@ -197,4 +214,28 @@ private func linkedRecord(_ id: String, _ role: String, _ invocation: String?,
     let instruction = TranscriptItem(records: [record("instructions", "developer")]).activities[0]
     #expect(instruction.body == "instructions")
     #expect(instruction.title == "Developer instructions")
+}
+
+@Test func searchExcerptNeverBecomesConversationTitle() {
+    let hit = SearchHit(source: "claude", sessionID: "s", sourcePath: "/a", project: "p",
+                        snippet: "old_string: String(large tool payload)", ts: nil)
+    let unknown = hit.session(known: [:])
+    #expect(unknown.label == nil)
+    #expect(unknown.title == "Untitled conversation")
+    #expect(unknown.snippet == hit.snippet)
+    var known = unknown
+    known.label = "Investigate equality deletes"
+    #expect(hit.session(known: [known.id: known]).title == "Investigate equality deletes")
+}
+
+@Test func openingTitleSkipsInjectedContextAndUsesRequestOrSubagentName() {
+    func entry(_ role: String, _ text: String) -> TranscriptRecord {
+        TranscriptRecord(recordID: text, record: Message(role: role, text: text, toolName: nil, toolInput: nil, toolOutput: nil))
+    }
+    let context = entry("user", "<recommended_plugins>plugins</recommended_plugins>\n<environment_context>environment</environment_context>")
+    let agent = entry("developer", "<context_window>\nAgent name: /root/activity_backfill\n</context_window>")
+    #expect(Session.openingTitle([agent, context]) == "Activity backfill")
+    #expect(Session.openingTitle([context, entry("user", "Please fix\n the backfill")]) == "Please fix the backfill")
+    #expect(Session.openingTitle([agent, context, entry("user", "Actual assignment")]) == "Actual assignment")
+    #expect(Session.openingTitle([context]) == nil)
 }

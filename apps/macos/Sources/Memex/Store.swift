@@ -14,6 +14,8 @@ final class Store {
     private var projectGeneration = UUID()
     private var projectLoadScope = ""
     private var sessionMachineScope = ""
+    private var sessionBatchesCriteria: String?
+    private var sessionBatches: [String: [Session]] = [:]
     private var sortTask: Task<Void, Never>?
     private var projectSortWasSelected = false
     let projectCatalog: ProjectCatalog
@@ -25,7 +27,13 @@ final class Store {
     var selectedID: String?
     var records: [TranscriptRecord] = []
     var query = ""
-    var scope: Scope = .all
+    var homeProject: String?
+    var scope: Scope = .home {
+        didSet {
+            if scope == .home { selectedID = nil }
+            else if oldValue == .home && selectedID == nil { selectedID = sessions.first?.id }
+        }
+    }
     var filters = ConversationFilters.defaults {
         didSet {
             guard filters != oldValue else { return }
@@ -43,6 +51,25 @@ final class Store {
     private var filterReferenceDate = Date()
     private var activeSessionCriteria = ""
     var loadingSessions = false
+    var loadingHomeActivity = false
+    var homeActivityMetric = HomeActivityMetric.sessions
+    var homeActivityCache: HomeActivityCache? {
+        didSet {
+            guard let cache = homeActivityCache else { return }
+            homeActivityCaches[cache.criteria] = cache
+            homeActivityCacheOrder.removeAll { $0 == cache.criteria }
+            homeActivityCacheOrder.append(cache.criteria)
+            while homeActivityCacheOrder.count > 8 {
+                homeActivityCaches.removeValue(forKey: homeActivityCacheOrder.removeFirst())
+            }
+        }
+    }
+    private var homeActivityCaches: [String: HomeActivityCache] = [:]
+    private var homeActivityCacheOrder: [String] = []
+    var homeActivityGeneration = UUID()
+    private var refreshingHome = false
+    private var lastHomeRefresh = Date()
+    private var lastSessionsLoadedAt = Date()
     var loadingRecords = false
     var listError: String?
     var readerError: String?
@@ -69,6 +96,7 @@ final class Store {
     private var countResultKey: String?
     private var countValue: Int?
     private var countRefresh = 0
+    private var activityRefresh = 0
     private var listGeneration = UUID()
     private var readerGeneration = UUID()
     let client: MemexClient
@@ -82,9 +110,9 @@ final class Store {
     }
 
     enum Scope: Hashable {
-        case all, project(String)
+        case home, all, project(String)
         var title: String {
-            switch self { case .all: "All conversations"; case .project(let value): value }
+            switch self { case .home: "Home"; case .all: "All conversations"; case .project(let value): value }
         }
         var project: String? { if case .project(let value) = self { value } else { nil } }
     }
@@ -97,9 +125,15 @@ final class Store {
         }
     }
     var machineRequestID: String { "\(machineSelection)|\(selectedMachineIDs.joined(separator: "|"))" }
-    private var sessionCriteriaID: String { "\(machineRequestID)|\(scope)|\(filters)|\(query)" }
+    var selectedProject: String? { scope == .home ? homeProject : scope.project }
+    private var sessionCriteriaID: String { "\(machineRequestID)|\(selectedProject ?? "")|\(filters)|\(query)" }
     var requestID: String { "\(sessionCriteriaID)|\(sessionLimit)" }
     var sessionCountRequestID: String { "\(sessionCriteriaID)|\(countRefresh)" }
+    var homeActivityCriteriaID: String { sessionCriteriaID }
+    var homeActivityRequestID: String { "\(sessionCriteriaID)|\(activityRefresh)" }
+    func cachedHomeActivity(for criteria: String) -> HomeActivityCache? {
+        homeActivityCaches[criteria]
+    }
     var sessionTotal: Int? {
         guard countResultKey == sessionCountRequestID, let countValue,
               countValue >= sessions.count else { return nil }
@@ -122,6 +156,11 @@ final class Store {
         [selectedID ?? "", query.nilIfBlank ?? "", readerAnchorID ?? ""].map { "\($0.utf8.count):\($0)" }.joined()
     }
     var readerRequestID: String { readerPositionKey }
+
+    func openConversation(_ session: Session) {
+        if scope == .home { scope = homeProject.map(Scope.project) ?? .all }
+        selectedID = session.id
+    }
 
     func loadMachines() async {
         guard !loadingMachines else { return }
@@ -188,15 +227,27 @@ final class Store {
         projectsError = snapshot.cacheWarning
     }
 
-    func refresh() async {
+    func refresh(refreshActivity: Bool = true) async {
         filterReferenceDate = Date()
         countRefresh += 1
+        if refreshActivity { activityRefresh += 1 }
         async let sessions: Void = loadSessions()
         async let projects: Void = loadProjects()
         async let machines: Void = loadMachines()
         async let count: Void = loadSessionCount()
         _ = await (sessions, projects, machines, count)
         await loadSelectedSessionMetadata()
+    }
+
+    func refreshHomeIfStale(isVisible: Bool, now: Date = Date()) async {
+        guard isVisible, scope == .home, !refreshingHome,
+              !loadingSessions, !loadingProjects, !loadingMachines,
+              now.timeIntervalSince(lastHomeRefresh) >= 60,
+              now.timeIntervalSince(lastSessionsLoadedAt) >= 60 else { return }
+        refreshingHome = true
+        lastHomeRefresh = now
+        defer { refreshingHome = false }
+        await refresh(refreshActivity: !loadingHomeActivity)
     }
 
     func loadMoreSessionsIfNeeded(visibleID: String) {
@@ -230,7 +281,7 @@ final class Store {
         }
         let ids = selectedMachineIDs
         let query = query.nilIfBlank
-        let project = scope.project
+        let project = selectedProject
         let source = filters.provider.argument
         let since = filters.timeframe.since(relativeTo: filterReferenceDate)
         let origin = filters.origin
@@ -262,6 +313,11 @@ final class Store {
     func loadSessions() async {
         prepareSessionCriteria()
         let criteria = sessionCriteriaID
+        if sessionBatchesCriteria != criteria {
+            sessionBatchesCriteria = criteria
+            sessionBatches = [:]
+        }
+        let previousBatches = sessionBatches
         let generation = UUID()
         listGeneration = generation
         loadingSessions = true
@@ -270,10 +326,15 @@ final class Store {
             sessionMachineScope = machineRequestID
             sessions = []; catalog = []; selectedID = nil
         }
-        defer { if listGeneration == generation { loadingSessions = false } }
+        defer {
+            if listGeneration == generation {
+                loadingSessions = false
+                if !Task.isCancelled { lastSessionsLoadedAt = Date() }
+            }
+        }
         let ids = selectedMachineIDs
         let query = query.nilIfBlank
-        let project = scope.project
+        let project = selectedProject
         let source = filters.provider.argument
         let origin = filters.origin
         let since = filters.timeframe.since(relativeTo: filterReferenceDate)
@@ -290,21 +351,31 @@ final class Store {
                         project: project, source: source, since: since, origin: origin, limit: limit, known: known)
                 }
             }
-            var batches: [String: [Session]] = [:]
+            // Keep each peer's previous page until its replacement arrives.
+            // Otherwise a fast peer temporarily removes the rows being scrolled
+            // on a slower peer, losing the native list's visible-row anchor.
+            var batches = previousBatches
             var errors: [String: String] = [:]
             for await batch in group {
                 guard listGeneration == generation, sessionCriteriaID == criteria, !Task.isCancelled else { group.cancelAll(); return }
                 if let error = batch.error { errors[batch.machine] = "\(batch.machine): \(error)" }
                 else { batches[batch.machine] = batch.rows }
+                sessionBatches = batches
                 let rows = await mergeMachineSessions(batches: ids.compactMap { batches[$0] }, limit: limit, ranked: query != nil)
                 guard listGeneration == generation, sessionCriteriaID == criteria, !Task.isCancelled else { group.cancelAll(); return }
                 if query != nil {
                     let metadata = Dictionary(catalog.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                     sessions = rows.map { row in metadata[row.id].map { row.applyingMetadata($0) } ?? row }
                 } else { sessions = rows }
-                if scope == .all && query == nil && !filters.isActive { catalog = rows }
+                if query == nil {
+                    // Search results need metadata from every previously browsed
+                    // filter, including subagents explicitly shown by the user.
+                    let refreshedIDs = Set(rows.map(\.id))
+                    catalog.removeAll { refreshedIDs.contains($0.id) }
+                    catalog.append(contentsOf: rows)
+                }
                 hasMoreSessions = rows.count >= limit
-                if !rows.contains(where: { $0.id == selectedID }) { selectedID = rows.first?.id }
+                if scope != .home && !rows.contains(where: { $0.id == selectedID }) { selectedID = rows.first?.id }
                 listError = errors.keys.sorted().compactMap { errors[$0] }.joined(separator: "\n").nilIfBlank
             }
         }
@@ -315,13 +386,18 @@ final class Store {
         sessionMetadataGeneration = generation
         loadingSessionMetadata = false
         sessionMetadataError = nil
-        guard let session = selected, session.machineID == "local",
-              session.searchRecordID != nil, session.resumeCommand == nil else { return }
+        guard let session = selected,
+              session.label?.nilIfBlank == nil || (session.searchRecordID != nil && session.machineID == "local" && session.resumeCommand == nil) else { return }
         let request = readerRequestID
         loadingSessionMetadata = true
         defer { if sessionMetadataGeneration == generation { loadingSessionMetadata = false } }
         do {
-            let detail = try await client.sessionDetails(for: session)
+            var detail = try await client.sessionDetails(for: session)
+            if detail.label?.nilIfBlank == nil { detail.label = session.label?.nilIfBlank }
+            if detail.label?.nilIfBlank == nil {
+                let opening = try await client.records(for: session, offset: 0, limit: 16)
+                detail.label = Session.openingTitle(opening)
+            }
             try Task.checkCancellation()
             guard sessionMetadataGeneration == generation, readerRequestID == request,
                   let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }
@@ -376,15 +452,12 @@ final class Store {
         defer { if readerGeneration == generation { loadingRecords = false } }
         let anchor = readerAnchorID
         do {
-            let start = try await client.initialRecordOffset(for: selected, anchor: anchor)
+            let page = try await client.initialRecords(for: selected, anchor: anchor)
             try Task.checkCancellation()
             guard readerGeneration == generation, readerRequestID == request else { return }
-            let page = try await client.records(for: selected, offset: start.offset)
-            try Task.checkCancellation()
-            guard readerGeneration == generation, readerRequestID == request else { return }
-            records = page
-            recordsOffset = start.offset
-            recordsTotal = start.total
+            records = page.records
+            recordsOffset = page.offset
+            recordsTotal = page.total
             loadedReaderKey = key
             updateRecordBounds()
             cacheReaderWindow()
@@ -405,23 +478,17 @@ final class Store {
         failedPageWasEarlier = nil
         defer { if readerGeneration == generation { loadingRecords = false } }
         do {
-            let start: (offset: Int, total: Int)
+            let page: TranscriptPage
             if let offset {
-                let total: Int
-                if loadedReaderKey == key { total = recordsTotal }
-                else { total = try await client.recordMetadata(for: selected, offset: 0, limit: 1).total }
-                start = (max(0, offset - MemexClient.pageSize / 2), total)
+                page = try await client.recordPage(for: selected, offset: max(0, offset - MemexClient.pageSize / 2))
             } else {
-                start = try await client.initialRecordOffset(for: selected, anchor: recordID)
+                page = try await client.initialRecords(for: selected, anchor: recordID)
             }
             try Task.checkCancellation()
             guard readerGeneration == generation, readerRequestID == request else { return }
-            let page = try await client.records(for: selected, offset: start.offset)
-            try Task.checkCancellation()
-            guard readerGeneration == generation, readerRequestID == request else { return }
-            records = page
-            recordsOffset = start.offset
-            recordsTotal = start.total
+            records = page.records
+            recordsOffset = page.offset
+            recordsTotal = page.total
             loadedReaderKey = key
             updateRecordBounds()
             cacheReaderWindow()

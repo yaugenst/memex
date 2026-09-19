@@ -48,6 +48,7 @@ pub(crate) struct StagedVectorGeneration {
 
 impl StagedVectorGeneration {
     pub(crate) fn publish(mut self) -> Result<()> {
+        crate::profiling::span!("vectors.publish");
         // Once publication starts, keep the generation even on error: current.json may have
         // changed before the error was reported. A later successful save collects it safely.
         self.cleanup_on_drop = false;
@@ -106,10 +107,8 @@ impl VectorIndex {
             return Ok(0);
         };
         let mut index = Self::open_active_snapshot(dir, storage)?;
-        let mut removed = 0;
-        for doc_id in doc_ids {
-            removed += usize::from(index.remove(*doc_id)?);
-        }
+        let removed = index.doc_id_set.intersection(doc_ids).count();
+        index.remove_doc_ids(doc_ids)?;
         if removed > 0 {
             index.save()?;
         }
@@ -170,6 +169,7 @@ impl VectorIndex {
     }
 
     fn open_from_storage(root: &Path, storage: &ActiveStorage) -> Result<Self> {
+        crate::profiling::span!("vectors.load");
         let index_path = storage.path.join("usearch.index");
         let ids_path = storage.path.join("doc_ids.bin");
         let index = Index::new(&IndexOptions::default())?;
@@ -239,24 +239,8 @@ impl VectorIndex {
         Ok(())
     }
 
-    pub fn remove(&mut self, doc_id: u64) -> Result<bool> {
-        if !self.doc_id_set.remove(&doc_id) {
-            return Ok(false);
-        }
-        self.index.remove(doc_id)?;
-        Ok(true)
-    }
-
     pub fn retain_ids(&mut self, live_ids: &HashSet<u64>) -> Result<()> {
-        let stale = self
-            .doc_id_set
-            .difference(live_ids)
-            .copied()
-            .collect::<Vec<_>>();
-        for doc_id in stale {
-            self.remove(doc_id)?;
-        }
-        Ok(())
+        self.retain_doc_ids(live_ids)
     }
 
     pub fn search(&self, embedding: &[f32], limit: usize) -> Result<Vec<(u64, f32)>> {
@@ -320,6 +304,7 @@ impl VectorIndex {
     }
 
     pub(crate) fn stage(&self) -> Result<StagedVectorGeneration> {
+        crate::profiling::span!("vectors.stage");
         fs::create_dir_all(&self.root)?;
         let generations = self.root.join(GENERATIONS_DIR);
         fs::create_dir_all(&generations)?;

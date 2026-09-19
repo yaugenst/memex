@@ -32,7 +32,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
     push(SourceKind::Claude, super::claude::usage_files());
     push(
         SourceKind::Codex,
-        super::codex::discover_rollouts()
+        super::codex::discover_rollouts(None)
             .into_iter()
             .map(|file| file.path)
             .collect(),
@@ -54,7 +54,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
     );
     push(
         SourceKind::Pi,
-        super::pi::discover()
+        super::pi::discover(None)
             .into_iter()
             .map(|file| file.path)
             .collect(),
@@ -96,7 +96,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
     );
     push(
         SourceKind::Muse,
-        super::muse::discover()
+        super::muse::discover(None)
             .into_iter()
             .map(|file| file.path)
             .collect(),
@@ -108,10 +108,12 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .map(|file| file.path)
             .collect(),
     );
+    push(SourceKind::Bob, super::bob::usage_files());
+    push(SourceKind::Zcode, super::zcode::usage_files());
 
     push(
         SourceKind::Omp,
-        super::omp::discover()
+        super::omp::discover(None)
             .into_iter()
             .map(|file| file.path)
             .collect(),
@@ -137,18 +139,20 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
         ..SourceAudit::default()
     };
     for file in files {
-        if source == SourceKind::Hermes {
-            // Hermes usage truth is SQLite aggregate data. Audit must not
-            // reinterpret the database as JSON, and in particular must not
-            // read transcript/message columns: count the file, skip content.
+        if matches!(
+            source,
+            SourceKind::Hermes | SourceKind::Bob | SourceKind::Zcode
+        ) {
+            // Hermes usage truth, Bob tasks, and Zcode sessions are SQLite data.
+            // Audit must not reinterpret the database as JSON, and in particular
+            // must not read transcript/message columns: count the file, skip
+            // content.
             continue;
         }
-        if source == SourceKind::Antigravity
-            && file.file_name().and_then(|name| name.to_str()) != Some("overview.txt")
-        {
-            // Antigravity conversation stores are SQLite. Audit must not
-            // reinterpret the database as JSON: count the file, skip content.
-            // overview.txt transcripts are JSONL and audit normally below.
+        if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(file) {
+            // Conversation stores are SQLite; audit must not reinterpret the
+            // database as JSON. The overview.txt / transcript.jsonl projections
+            // are JSONL and audit normally below.
             continue;
         }
         let Ok(file) = std::fs::File::open(file) else {
@@ -355,6 +359,10 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
                 increment(&mut audit.semantic_types, "tool_calls");
             }
         }
+        // Bob never reaches here: it contributes no files to the audit.
+        SourceKind::Bob => {}
+        // Zcode sessions are SQLite rows, not per-line JSON documents.
+        SourceKind::Zcode => {}
     }
 }
 

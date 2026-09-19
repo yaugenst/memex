@@ -418,6 +418,8 @@ enum SourceChoice {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
+    Zcode,
 }
 
 impl SourceChoice {
@@ -436,7 +438,9 @@ impl SourceChoice {
             SourceChoice::Hermes => SourceChoice::Jcode,
             SourceChoice::Jcode => SourceChoice::Muse,
             SourceChoice::Muse => SourceChoice::Antigravity,
-            SourceChoice::Antigravity => SourceChoice::All,
+            SourceChoice::Antigravity => SourceChoice::Bob,
+            SourceChoice::Bob => SourceChoice::Zcode,
+            SourceChoice::Zcode => SourceChoice::All,
         }
     }
 
@@ -456,6 +460,8 @@ impl SourceChoice {
             SourceChoice::Jcode => Some(SourceFilter::Jcode),
             SourceChoice::Muse => Some(SourceFilter::Muse),
             SourceChoice::Antigravity => Some(SourceFilter::Antigravity),
+            SourceChoice::Bob => Some(SourceFilter::Bob),
+            SourceChoice::Zcode => Some(SourceFilter::Zcode),
         }
     }
 
@@ -475,6 +481,8 @@ impl SourceChoice {
             SourceChoice::Jcode => "jcode",
             SourceChoice::Muse => "muse",
             SourceChoice::Antigravity => "antigravity",
+            SourceChoice::Bob => "bob",
+            SourceChoice::Zcode => "zcode",
         }
     }
 
@@ -493,6 +501,8 @@ impl SourceChoice {
             SourceKind::Jcode => SourceChoice::Jcode,
             SourceKind::Muse => SourceChoice::Muse,
             SourceKind::Antigravity => SourceChoice::Antigravity,
+            SourceKind::Bob => SourceChoice::Bob,
+            SourceKind::Zcode => SourceChoice::Zcode,
         }
     }
 }
@@ -871,25 +881,15 @@ impl StdIoRedirect {
 }
 
 fn open_tui_index(paths: &Paths, auto_index: bool) -> Result<SearchIndex> {
-    let index = if SearchIndex::exists(&paths.index) {
-        match SearchIndex::open_or_create(&paths.index) {
-            Ok(index) => return Ok(index),
-            Err(error) if !auto_index => return Err(error),
-            Err(_) => {
-                let _lease =
-                    IngestLease::acquire(paths, "TUI index initialization", INGEST_LEASE_TIMEOUT)?;
-                SearchIndex::open_or_create_for_ingest(&paths.index)?
-            }
-        }
+    if SearchIndex::exists(&paths.index) {
+        return SearchIndex::open_or_create(&paths.index);
+    }
+    let _lease = IngestLease::acquire(paths, "TUI index initialization", INGEST_LEASE_TIMEOUT)?;
+    if auto_index {
+        SearchIndex::open_or_create_for_ingest(&paths.index)
     } else {
-        let _lease = IngestLease::acquire(paths, "TUI index initialization", INGEST_LEASE_TIMEOUT)?;
-        if auto_index {
-            SearchIndex::open_or_create_for_ingest(&paths.index)?
-        } else {
-            SearchIndex::open_or_create(&paths.index)?
-        }
-    };
-    Ok(index)
+        SearchIndex::open_or_create(&paths.index)
+    }
 }
 
 pub fn run(
@@ -1146,11 +1146,6 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(IndexUpdate::Started);
             let result = (|| -> Result<Option<crate::ingest::IngestReport>> {
-                let lease = match IngestLease::try_acquire(&paths, "TUI auto-index")? {
-                    LeaseAttempt::Acquired(lease) => lease,
-                    LeaseAttempt::Busy(_) => return Ok(None),
-                };
-                let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;
@@ -1170,17 +1165,42 @@ impl App {
                     include_jcode: true,
                     include_muse: true,
                     include_antigravity: true,
+                    include_bob: true,
+                    include_zcode: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     prune_missing: true,
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,
+                    defer_merges: true,
                 };
-                ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl(), &lease)
+                let journal = crate::ingest::discovery::start_journal_replay(&paths, &opts);
+                journal.wait_until_streaming(crate::ingest::journal::REPLAY_BUDGET);
+                let lease = match IngestLease::try_acquire(&paths, "TUI auto-index")? {
+                    LeaseAttempt::Acquired(lease) => lease,
+                    LeaseAttempt::Busy(_) => return Ok(None),
+                };
+                let index = match SearchIndex::open_or_create(&paths.index) {
+                    Ok(index) if !index.is_writable() => index,
+                    _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+                };
+                ingest_if_stale(
+                    &paths,
+                    &index,
+                    &opts,
+                    config.scan_cache_ttl(),
+                    &lease,
+                    Some(journal),
+                )
             })();
             match result {
                 Ok(Some(report)) => {
+                    // Maintenance is best effort: a failed schedule must not
+                    // fail the refresh the user asked for.
+                    if report.records_added > 0 || crate::machine::compaction_pending(&paths) {
+                        let _ = crate::machine::schedule_compaction_if_fragmented(&paths);
+                    }
                     let _ = tx.send(IndexUpdate::Done {
                         added: report.records_added,
                         embedded: report.records_embedded,
@@ -2659,6 +2679,8 @@ impl App {
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
+            SourceKind::Bob => "bob",
+            SourceKind::Zcode => "zcode",
         };
         let source_path = session.source_path.clone();
 
@@ -4116,6 +4138,8 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Jcode => label == "jcode",
         SourceChoice::Muse => label == "muse",
         SourceChoice::Antigravity => label == "antigravity",
+        SourceChoice::Bob => label == "bob",
+        SourceChoice::Zcode => label == "zcode",
         SourceChoice::All => false,
     }
 }
@@ -4135,6 +4159,8 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Jcode => Color::Rgb(220, 140, 180),
         SourceKind::Muse => Color::Rgb(180, 130, 240),
         SourceKind::Antigravity => Color::Rgb(120, 200, 140),
+        SourceKind::Bob => Color::Rgb(100, 150, 255),
+        SourceKind::Zcode => Color::Rgb(96, 222, 228),
     }
 }
 
@@ -5342,7 +5368,7 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
         last_ts: row.last_at,
         hit_count: row.message_count.max(1) as usize,
         top_score: 0.0,
-        title: String::new(),
+        title: row.label.clone().unwrap_or_default(),
         snippet: String::new(),
         source_dir: row
             .cwd
@@ -5355,24 +5381,23 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
 }
 
 fn enrich_session_titles(index: &SearchIndex, sessions: &mut [SessionSummary]) {
-    let codex_ids = sessions
-        .iter()
-        .filter(|session| session.source == SourceKind::Codex)
-        .map(|session| session.session_id.clone())
-        .collect::<Vec<_>>();
-    let codex_titles = crate::sources::codex::session_titles(&codex_ids);
-
+    let titles = crate::analytics::SessionTitleLookup::new(
+        sessions
+            .iter()
+            .map(|session| (session.source, &session.session_id)),
+    );
     for session in sessions {
-        let source_title = match session.source {
-            SourceKind::Codex => codex_titles.get(&session.session_id).cloned(),
-            SourceKind::Claude => crate::sources::claude::session_title(
-                std::path::Path::new(&session.source_path),
+        let opening = session
+            .label
+            .clone()
+            .or_else(|| first_user_prompt(index, session));
+        session.title = titles
+            .resolve(
+                session.source,
                 &session.session_id,
-            ),
-            _ => None,
-        };
-        session.title = source_title
-            .or_else(|| first_user_prompt(index, session))
+                &session.source_path,
+                opening.as_deref(),
+            )
             .map(|title| summarize(&title, 120))
             .unwrap_or_default();
     }
@@ -5391,7 +5416,10 @@ fn first_user_prompt(index: &SearchIndex, session: &SessionSummary) -> Option<St
             .then_with(|| left.ts.cmp(&right.ts))
             .then_with(|| left.doc_id.cmp(&right.doc_id))
     });
-    records.into_iter().next().map(|record| record.text)
+    records
+        .into_iter()
+        .map(|record| crate::analytics::sanitize_label(&record.text))
+        .find(|text| !text.is_empty())
 }
 
 fn enrich_session_projects(
@@ -5680,6 +5708,7 @@ fn run_search_request(
                     recency_half_life_days: 30.0,
                     min_score: None,
                     project_grouping: Some(request.grouping),
+                    text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
                 },
                 false,
             )?
@@ -5739,9 +5768,9 @@ fn run_search_request(
             if sessions.is_empty() {
                 anyhow::bail!("no analytics sessions");
             }
+            enrich_session_titles(index, &mut sessions);
             Ok(sessions)
         })?;
-        enrich_session_titles(index, &mut sessions);
         sessions.retain(|session| {
             session_matches_kind(request.kind, session.conversation_kind.as_deref())
         });
@@ -6618,6 +6647,11 @@ fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
     {
         return Some(cwd);
     }
+    if session.source == SourceKind::Bob {
+        // Virtual `<db>/<task_id>` paths are not transcripts; ask the database.
+        return crate::sources::bob::session_cwd(std::path::Path::new(&session.source_path))
+            .map(|cwd| cwd.to_string_lossy().into_owned());
+    }
     let file = std::fs::File::open(&session.source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;
@@ -7151,23 +7185,31 @@ mod tests {
     }
 
     #[test]
-    fn auto_index_tui_startup_rebuilds_stale_schema() {
+    fn tui_startup_preserves_stale_schema_with_or_without_auto_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
         create_stale_schema_index(&paths.index);
+        let metadata = std::fs::read(paths.index.join("meta.json")).unwrap();
 
-        let index = open_tui_index(&paths, true).expect("rebuild stale index");
-
-        assert_eq!(index.doc_count().expect("doc count"), 0);
-        assert!(paths.index.join("sentinel").exists());
-        index.publish_generation().expect("publish rebuilt index");
-        assert_eq!(
-            SearchIndex::open_or_create(&paths.index)
-                .expect("open rebuilt generation")
-                .doc_count()
-                .expect("rebuilt count"),
-            0
-        );
+        for auto_index in [true, false] {
+            let error = open_tui_index(&paths, auto_index)
+                .err()
+                .expect("stale schema error");
+            assert!(
+                error
+                    .to_string()
+                    .contains("migrate with exact-text vector reuse")
+            );
+            assert_eq!(
+                std::fs::read(paths.index.join("meta.json")).unwrap(),
+                metadata
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.index.join("sentinel")).unwrap(),
+                "stale"
+            );
+            assert!(!paths.index.join("generations").exists());
+        }
     }
 
     fn record(role: &str, text: &str) -> Record {

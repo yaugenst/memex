@@ -3,7 +3,7 @@ import Foundation
 struct ConversationFilters: Codable, Equatable, Sendable {
     var timeframe = ConversationTimeframe.all
     var provider = ConversationProvider.all
-    var origin = ConversationOrigin.all
+    var origin = ConversationOrigin.interactive
 
     static let defaults = ConversationFilters()
     var conversationType: ConversationOrigin {
@@ -21,7 +21,7 @@ struct ConversationFilters: Codable, Equatable, Sendable {
     var summary: String {
         [timeframe == .all ? nil : timeframe.title,
          provider == .all ? nil : provider.title,
-         origin == .all ? nil : origin.title].compactMap { $0 }.joined(separator: " · ")
+         origin == Self.defaults.origin ? nil : origin.title].compactMap { $0 }.joined(separator: " · ")
     }
 }
 
@@ -70,7 +70,7 @@ enum ConversationOrigin: String, CaseIterable, Codable, Sendable {
 /// The provider filters supported by the bundled CLI, independent of which
 /// providers happen to appear in the first loaded page of conversations.
 enum ConversationProvider: String, CaseIterable, Codable, Sendable {
-    case all, claude, codex, cursor, opencode, pi, omp, openclaw, copilot, grok, hermes, jcode, muse
+    case all, claude, codex, cursor, opencode, pi, omp, openclaw, copilot, grok, hermes, jcode, muse, bob
     var argument: String? { self == .all ? nil : rawValue }
     var title: String {
         switch self {
@@ -87,6 +87,7 @@ enum ConversationProvider: String, CaseIterable, Codable, Sendable {
         case .hermes: "Hermes"
         case .jcode: "Jcode"
         case .muse: "Muse"
+        case .bob: "IBM Bob"
         }
     }
 }

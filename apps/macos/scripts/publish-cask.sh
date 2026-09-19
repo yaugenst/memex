@@ -6,7 +6,7 @@ version=${1:?Usage: publish-cask.sh VERSION}
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Expected a stable semantic version" >&2; exit 1; }
 repo=nicosuave/memex
 tap=nicosuave/homebrew-tap
-artifact="memex-app-${version}-macos-universal.zip"
+artifact="memex-app-${version}-macos-arm64.zip"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 gh release download "v$version" --repo "$repo" --dir "$scratch" \

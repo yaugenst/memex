@@ -2,7 +2,13 @@ use anyhow::Result;
 use memex::embed::{EmbedderHandle, ModelChoice};
 
 fn main() -> Result<()> {
-    let input = vec!["hello world", "small embedding smoke test"];
+    let long = "Long input crossing the tokenizer limit. ".repeat(600);
+    let input = vec![
+        "hello world",
+        "fn main() { println!(\"small embedding smoke test\"); }",
+        "Überprüfung der Vektoren — 光学仿真",
+        long.as_str(),
+    ];
     let choice = std::env::var("MEMEX_MODEL")
         .ok()
         .map(|s| ModelChoice::parse(&s))
@@ -12,6 +18,10 @@ fn main() -> Result<()> {
     let embeddings = embedder.embed_texts(&input)?;
     if embeddings.is_empty() {
         anyhow::bail!("no embeddings returned");
+    }
+    if std::env::args().any(|arg| arg == "--json") {
+        serde_json::to_writer(std::io::stdout(), &embeddings)?;
+        return Ok(());
     }
     println!(
         "embeddings: {} vectors, dims {}",

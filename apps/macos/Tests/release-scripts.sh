@@ -36,7 +36,7 @@ if [[ "$1 $2" == 'release view' ]]; then
     if [[ "${UPLOAD_TEST:-no}" == yes ]]; then
       for file in "$TEST_SCRATCH/remote/"*; do [[ ! -f "$file" ]] || basename "$file"; done
     else
-      [[ "${ASSET_EXISTS:-no}" != yes ]] || echo memex-app-1.2.3-macos-universal.zip
+      [[ "${ASSET_EXISTS:-no}" != yes ]] || echo memex-app-1.2.3-macos-arm64.zip
     fi
   else
     echo '{"isDraft":false,"isPrerelease":false}'
@@ -50,8 +50,8 @@ elif [[ "$1 $2" == 'release download' ]]; then
   if [[ "${UPLOAD_TEST:-no}" == yes ]]; then
     cp "$TEST_SCRATCH/remote/$pattern" "$dest/"
   else
-    cp "$TEST_SCRATCH/asset.zip" "$dest/memex-app-1.2.3-macos-universal.zip"
-    cp "$TEST_SCRATCH/asset.sha256" "$dest/memex-app-1.2.3-macos-universal.zip.sha256"
+    cp "$TEST_SCRATCH/asset.zip" "$dest/memex-app-1.2.3-macos-arm64.zip"
+    cp "$TEST_SCRATCH/asset.sha256" "$dest/memex-app-1.2.3-macos-arm64.zip.sha256"
   fi
 elif [[ "$1 $2" == 'release upload' ]]; then
   file=${!#}
@@ -109,7 +109,7 @@ renderer="$ROOT/apps/macos/scripts/render-cask.sh"
 publisher="$ROOT/apps/macos/scripts/publish-cask.sh"
 printf 'archive fixture\n' > "$scratch/asset.zip"
 checksum=$(shasum -a 256 "$scratch/asset.zip" | awk '{print $1}')
-printf '%s  memex-app-1.2.3-macos-universal.zip\n' "$checksum" > "$scratch/asset.sha256"
+printf '%s  memex-app-1.2.3-macos-arm64.zip\n' "$checksum" > "$scratch/asset.sha256"
 expect_failure 'SHA256 checksum' "$renderer" 1.2.3 garbage
 expect_failure 'stable semantic version' "$renderer" '1.2.3";bad' "$checksum"
 "$publisher" 1.2.3
@@ -149,7 +149,7 @@ TEST_COMMIT=$(git -C "$scratch/repo" rev-parse HEAD)
 echo 'apps/macos/build/' >> "$scratch/repo/.git/info/exclude"
 artifacts="$scratch/repo/apps/macos/build/releases/v1.2.3"
 mkdir -p "$artifacts"
-asset=memex-app-1.2.3-macos-universal.zip
+asset=memex-app-1.2.3-macos-arm64.zip
 cp "$scratch/asset.zip" "$artifacts/$asset"
 (cd "$artifacts" && shasum -a 256 "$asset" > "$asset.sha256")
 echo "$TEST_COMMIT" > "$artifacts/commit.txt"

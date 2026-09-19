@@ -18,10 +18,12 @@ pub enum SourceKind {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
+    Zcode,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 13] = [
+    pub const ALL: [SourceKind; 15] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -35,6 +37,8 @@ impl SourceKind {
         SourceKind::Jcode,
         SourceKind::Muse,
         SourceKind::Antigravity,
+        SourceKind::Bob,
+        SourceKind::Zcode,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -53,6 +57,8 @@ impl SourceKind {
             SourceKind::Jcode => 10,
             SourceKind::Muse => 11,
             SourceKind::Antigravity => 12,
+            SourceKind::Bob => 13,
+            SourceKind::Zcode => 14,
         }
     }
 
@@ -71,6 +77,8 @@ impl SourceKind {
             10 => Some(SourceKind::Jcode),
             11 => Some(SourceKind::Muse),
             12 => Some(SourceKind::Antigravity),
+            13 => Some(SourceKind::Bob),
+            14 => Some(SourceKind::Zcode),
             _ => None,
         }
     }
@@ -90,6 +98,8 @@ impl SourceKind {
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
+            SourceKind::Bob => "bob",
+            SourceKind::Zcode => "zcode",
         }
     }
 
@@ -108,6 +118,8 @@ impl SourceKind {
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
+            SourceKind::Bob => "bob",
+            SourceKind::Zcode => "zcode",
         }
     }
 
@@ -130,12 +142,14 @@ impl SourceKind {
             "jcode" => Some(SourceKind::Jcode),
             "muse" => Some(SourceKind::Muse),
             "antigravity" => Some(SourceKind::Antigravity),
+            "bob" => Some(SourceKind::Bob),
+            "zcode" => Some(SourceKind::Zcode),
             _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum, Serialize, Deserialize)]
 #[value(rename_all = "kebab-case")]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceFilter {
@@ -153,6 +167,8 @@ pub enum SourceFilter {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
+    Zcode,
 }
 
 impl SourceFilter {
@@ -171,6 +187,8 @@ impl SourceFilter {
             SourceFilter::Jcode => source == SourceKind::Jcode,
             SourceFilter::Muse => source == SourceKind::Muse,
             SourceFilter::Antigravity => source == SourceKind::Antigravity,
+            SourceFilter::Bob => source == SourceKind::Bob,
+            SourceFilter::Zcode => source == SourceKind::Zcode,
         }
     }
 
@@ -189,6 +207,8 @@ impl SourceFilter {
             SourceFilter::Jcode => &["jcode"],
             SourceFilter::Muse => &["muse"],
             SourceFilter::Antigravity => &["antigravity"],
+            SourceFilter::Bob => &["bob"],
+            SourceFilter::Zcode => &["zcode"],
         }
     }
 
@@ -207,12 +227,36 @@ impl SourceFilter {
             SourceFilter::Jcode => "jcode",
             SourceFilter::Muse => "muse",
             SourceFilter::Antigravity => "antigravity",
+            SourceFilter::Bob => "bob",
+            SourceFilter::Zcode => "zcode",
         }
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordLinks {
+    /// Original parser ordinal for fallback IDs, independent of added display records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_turn_id: Option<u32>,
+    /// Disjoint identity for newly retained records that had no legacy ordinal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_record_offset: Option<u64>,
+    /// Provider turn identity; `Record::turn_id` remains the ordered record sequence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_phase: Option<String>,
+    /// Explicit provider event, never inferred from an answer or missing output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_record_type: Option<String>,
+    /// Typed display content when a message includes attachments, serialized as JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_content: Option<String>,
+    /// Provider tool-result envelope status; distinct from the result body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
