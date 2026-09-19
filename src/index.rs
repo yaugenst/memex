@@ -31,6 +31,8 @@ use tantivy::{
     TantivyDocument, Term,
 };
 
+pub(crate) mod context;
+
 #[derive(Clone)]
 pub struct IndexFields {
     /// Present in indexes created after canonical record lookup was introduced. Older indexes
@@ -970,6 +972,7 @@ impl SearchIndex {
         self.records_matching_query(query)
     }
 
+    #[cfg(test)]
     pub(crate) fn records_by_session_path(
         &self,
         source: crate::types::SourceKind,
