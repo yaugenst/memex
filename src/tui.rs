@@ -27,7 +27,6 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::BufRead;
 #[cfg(not(unix))]
 use std::io::Stdout;
 use std::io::Write;
@@ -420,6 +419,7 @@ enum SourceChoice {
     Antigravity,
     Bob,
     Zcode,
+    Kiro,
 }
 
 impl SourceChoice {
@@ -440,7 +440,8 @@ impl SourceChoice {
             SourceChoice::Muse => SourceChoice::Antigravity,
             SourceChoice::Antigravity => SourceChoice::Bob,
             SourceChoice::Bob => SourceChoice::Zcode,
-            SourceChoice::Zcode => SourceChoice::All,
+            SourceChoice::Zcode => SourceChoice::Kiro,
+            SourceChoice::Kiro => SourceChoice::All,
         }
     }
 
@@ -462,6 +463,7 @@ impl SourceChoice {
             SourceChoice::Antigravity => Some(SourceFilter::Antigravity),
             SourceChoice::Bob => Some(SourceFilter::Bob),
             SourceChoice::Zcode => Some(SourceFilter::Zcode),
+            SourceChoice::Kiro => Some(SourceFilter::Kiro),
         }
     }
 
@@ -483,6 +485,7 @@ impl SourceChoice {
             SourceChoice::Antigravity => "antigravity",
             SourceChoice::Bob => "bob",
             SourceChoice::Zcode => "zcode",
+            SourceChoice::Kiro => "kiro",
         }
     }
 
@@ -503,6 +506,7 @@ impl SourceChoice {
             SourceKind::Antigravity => SourceChoice::Antigravity,
             SourceKind::Bob => SourceChoice::Bob,
             SourceKind::Zcode => SourceChoice::Zcode,
+            SourceKind::Kiro => SourceChoice::Kiro,
         }
     }
 }
@@ -656,6 +660,8 @@ struct App {
     project_area: Option<Rect>,
     left_width: Option<u16>,
     dragging: bool,
+    text_selection: Option<TextSelection>,
+    rendered: ratatui::buffer::Buffer,
     stdio_redirect: Option<StdIoRedirect>,
 }
 
@@ -1066,6 +1072,8 @@ impl App {
             project_area: None,
             left_width: None,
             dragging: false,
+            text_selection: None,
+            rendered: ratatui::buffer::Buffer::empty(Rect::default()),
             stdio_redirect: None,
         }
     }
@@ -1150,7 +1158,6 @@ impl App {
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;
                 let opts = IngestOptions {
-                    backfill_embeddings: false,
                     claude_sources: default_claude_sources(),
                     include_agents: false,
                     include_reasoning: config.include_reasoning_default(),
@@ -1167,8 +1174,10 @@ impl App {
                     include_antigravity: true,
                     include_bob: true,
                     include_zcode: true,
+                    include_kiro: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
+                    backfill_embeddings: false,
                     prune_missing: true,
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
@@ -2593,19 +2602,29 @@ impl App {
             return Ok(());
         };
         let cwd = if remote {
-            session_context(
+            let context = match session_context(
                 &self.paths,
                 &self.config,
                 &session.machine,
                 &session.session_id,
                 &session.source_path,
-            )
-            .ok()
-            .and_then(|context| context.cwd)
+            ) {
+                Ok(context) => context,
+                Err(err) => {
+                    self.set_status(format!("cannot resolve remote resume directory: {err}"));
+                    return Ok(());
+                }
+            };
+            let Some(cwd) = context.resume_cwd.filter(|dir| !dir.is_empty()) else {
+                self.set_status(
+                    "remote resume directory unavailable; update memex on the remote machine",
+                );
+                return Ok(());
+            };
+            cwd
         } else {
-            resolve_session_cwd(&session)
-        }
-        .unwrap_or_else(|| session.source_dir.clone());
+            crate::resume::resume_cwd(resolve_session_cwd(&session), &session.source_dir)
+        };
         let local_command = expand_resume_template(&template, &session, &cwd);
         let command = if remote {
             let machine = machine_by_id(&self.config, &session.machine)
@@ -2681,6 +2700,7 @@ impl App {
             SourceKind::Antigravity => "antigravity",
             SourceKind::Bob => "bob",
             SourceKind::Zcode => "zcode",
+            SourceKind::Kiro => "kiro",
         };
         let source_path = session.source_path.clone();
 
@@ -2791,6 +2811,10 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
                             dirty = true;
                         }
                     }
+                    Event::Resize(_, _) => {
+                        app.text_selection = None;
+                        dirty = true;
+                    }
                     _ => {
                         dirty = true;
                     }
@@ -2811,6 +2835,7 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+    app.text_selection = None;
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             key.code,
@@ -3254,6 +3279,15 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
 }
 
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
+    draw_content(frame, app);
+    if let Some(selection) = &app.text_selection {
+        selection.render(frame.buffer_mut());
+    } else {
+        app.rendered = frame.buffer_mut().clone();
+    }
+}
+
+fn draw_content(frame: &mut ratatui::Frame, app: &mut App) {
     let theme = Theme::new();
     frame.render_widget(Block::default().style(theme.base), frame.area());
     let area = inset(
@@ -3428,6 +3462,9 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
                             ""
                         }
                     ),
+                    HomeChartMode::Tokens if app.source == SourceChoice::Kiro => {
+                        "Token usage unavailable · Kiro reports credits".into()
+                    }
                     HomeChartMode::Tokens => {
                         let total = activity_value_in_bounds(chart_activity, bounds);
                         format!(
@@ -4140,6 +4177,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Antigravity => label == "antigravity",
         SourceChoice::Bob => label == "bob",
         SourceChoice::Zcode => label == "zcode",
+        SourceChoice::Kiro => label == "kiro",
         SourceChoice::All => false,
     }
 }
@@ -4161,6 +4199,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Antigravity => Color::Rgb(120, 200, 140),
         SourceKind::Bob => Color::Rgb(100, 150, 255),
         SourceKind::Zcode => Color::Rgb(96, 222, 228),
+        SourceKind::Kiro => Color::Rgb(180, 130, 240),
     }
 }
 
@@ -4178,8 +4217,10 @@ fn results_project_width(results: &[SessionSummary]) -> usize {
 
 /// Columns consumed by everything before the detail text in a session row:
 /// relative time, source dot + label, project column, and the gaps between.
+const SESSION_SOURCE_WIDTH: usize = 11;
+
 fn session_row_fixed_cols(project_width: usize) -> usize {
-    4 + 2 + 2 + 9 + project_width + 2
+    4 + 2 + 2 + SESSION_SOURCE_WIDTH + 1 + project_width + 2
 }
 
 /// Splits a row of `total_width` cells into (project_width, detail_width):
@@ -4211,7 +4252,14 @@ fn session_result_line(
         Span::raw("  "),
         Span::styled("●", Style::default().fg(source_color(session.source))),
         Span::raw(" "),
-        Span::styled(format!("{:<8}", session.source.label()), theme.muted),
+        Span::styled(
+            format!(
+                "{:<width$}",
+                session.source.label(),
+                width = SESSION_SOURCE_WIDTH
+            ),
+            theme.muted,
+        ),
         Span::raw(" "),
         Span::styled(
             format!(
@@ -4909,7 +4957,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         LayoutMode::Timeline => "timeline",
         LayoutMode::Detail => "detail",
     };
-    let mut right_spans = Vec::new();
+    let mut right_spans = vec![Span::styled("drag to copy   ", theme.muted)];
     if !app.status.is_empty() {
         right_spans.push(Span::styled("\u{25cf} ", theme.accent));
         right_spans.push(Span::styled(app.status.as_str(), theme.text));
@@ -6642,69 +6690,11 @@ fn parent_dir(path: &str) -> String {
 }
 
 fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
-    if session.source == SourceKind::Copilot
-        && let Some(cwd) = resolve_copilot_workspace_cwd(session)
-    {
-        return Some(cwd);
-    }
-    if session.source == SourceKind::Bob {
-        // Virtual `<db>/<task_id>` paths are not transcripts; ask the database.
-        return crate::sources::bob::session_cwd(std::path::Path::new(&session.source_path))
-            .map(|cwd| cwd.to_string_lossy().into_owned());
-    }
-    let file = std::fs::File::open(&session.source_path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut fallback: Option<String> = None;
-    for line in reader.lines().map_while(Result::ok) {
-        let value: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let cwd = value
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        if fallback.is_none() {
-            fallback = cwd.clone();
-        }
-
-        let session_id_match = value
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .or_else(|| value.get("session_id").and_then(|v| v.as_str()))
-            .map(|s| s == session.session_id)
-            .unwrap_or(false);
-
-        if session_id_match && cwd.is_some() {
-            return cwd;
-        }
-
-        if session.source == SourceKind::Codex
-            && value.get("type").and_then(|v| v.as_str()) == Some("session_meta")
-        {
-            let payload_cwd = value
-                .get("payload")
-                .and_then(|v| v.get("cwd"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if payload_cwd.is_some() {
-                return payload_cwd;
-            }
-        }
-
-        if session.source == SourceKind::Pi
-            && value.get("type").and_then(|v| v.as_str()) == Some("session")
-        {
-            let cwd = value
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if cwd.is_some() {
-                return cwd;
-            }
-        }
-    }
-    fallback
+    crate::sources::session_cwd(
+        session.source,
+        std::path::Path::new(&session.source_path),
+        &session.session_id,
+    )
 }
 fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result<Vec<String>> {
     let mut set = HashSet::new();
@@ -6724,11 +6714,152 @@ fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result
     Ok(projects)
 }
 
+/// A snapshot keeps asynchronous search updates from changing text mid-drag.
+struct TextSelection {
+    buffer: ratatui::buffer::Buffer,
+    area: Rect,
+    anchor: ratatui::layout::Position,
+    end: ratatui::layout::Position,
+    press: MouseEvent,
+    dragged: bool,
+}
+
+impl TextSelection {
+    fn update(&mut self, column: u16, row: u16) {
+        self.end = ratatui::layout::Position::new(
+            column.clamp(self.area.x, self.area.right() - 1),
+            row.clamp(self.area.y, self.area.bottom() - 1),
+        );
+        self.dragged |= self.end != self.anchor;
+    }
+
+    fn selected(&self, x: u16, y: u16) -> bool {
+        let mut start = (self.anchor.y, self.anchor.x);
+        let mut end = (self.end.y, self.end.x);
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        (y, x) >= start && (y, x) <= end
+    }
+
+    fn text(&self) -> String {
+        let mut lines = Vec::new();
+        for y in self.anchor.y.min(self.end.y)..=self.anchor.y.max(self.end.y) {
+            let mut line = String::new();
+            let mut x = self.area.x;
+            while x < self.area.right() {
+                let cell = &self.buffer[(x, y)];
+                let width = Span::raw(cell.symbol()).width().max(1) as u16;
+                // Include a wide glyph if either of its terminal cells is selected.
+                if (x..x.saturating_add(width).min(self.area.right()))
+                    .any(|column| self.selected(column, y))
+                {
+                    line.push_str(cell.symbol());
+                }
+                x = x.saturating_add(width);
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    fn render(&self, buffer: &mut ratatui::buffer::Buffer) {
+        for y in self.area.y..self.area.bottom().min(buffer.area.bottom()) {
+            for x in self.area.x..self.area.right().min(buffer.area.right()) {
+                buffer[(x, y)] = self.buffer[(x, y)].clone();
+                if self.dragged && self.selected(x, y) {
+                    buffer[(x, y)]
+                        .set_style(Style::default().fg(Color::Black).bg(Color::LightCyan));
+                }
+            }
+        }
+    }
+}
+
+fn handle_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.text_selection = None;
+            if !app.quick_popup && app.home_dropdown != HomeDropdown::None {
+                return handle_mouse_action(mouse, terminal, app);
+            }
+            let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if !app.quick_popup
+                && app.layout_mode == LayoutMode::Split
+                && app.body_area.contains(pos)
+                && near_divider(mouse.column, app.body_area, app.left_width.unwrap_or(0))
+            {
+                return handle_mouse_action(mouse, terminal, app);
+            }
+            let area = if app.quick_popup {
+                quick_popup_area(app.body_area)
+            } else if app.layout_mode == LayoutMode::Home {
+                app.home_list_area
+            } else {
+                [
+                    app.preview_area,
+                    app.list_area,
+                    app.project_area.unwrap_or_default(),
+                ]
+                .into_iter()
+                .find(|area| area.contains(pos))
+                .unwrap_or_default()
+            };
+            if area.contains(pos) && app.rendered.area.contains(pos) {
+                let area = area.intersection(app.rendered.area);
+                app.text_selection = Some(TextSelection {
+                    buffer: app.rendered.clone(),
+                    area,
+                    anchor: pos,
+                    end: pos,
+                    press: mouse,
+                    dragged: false,
+                });
+                return Ok(true);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(selection) = app.text_selection.as_mut() {
+                selection.update(mouse.column, mouse.row);
+                return Ok(true);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(mut selection) = app.text_selection.take() {
+                selection.update(mouse.column, mouse.row);
+                if selection.dragged {
+                    let text = selection.text();
+                    if !text.trim().is_empty() {
+                        match execute!(
+                            terminal.backend_mut(),
+                            crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+                        ) {
+                            Ok(()) => app.set_status("selection sent to terminal clipboard"),
+                            Err(err) => app.set_status(format!("copy failed: {err}")),
+                        }
+                    }
+                    return Ok(true);
+                }
+                return handle_mouse_action(selection.press, terminal, app);
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            app.text_selection = None;
+        }
+        _ => {}
+    }
+    handle_mouse_action(mouse, terminal, app)
+}
+
 const WHEEL_SCROLL_LINES: isize = 3;
 
 /// Returns whether the event changed any visible state; pure motion events
 /// return false so the caller can skip redrawing.
-fn handle_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+fn handle_mouse_action(
+    mouse: MouseEvent,
+    terminal: &mut TuiTerminal,
+    app: &mut App,
+) -> Result<bool> {
     if app.quick_popup {
         return Ok(match mouse.kind {
             MouseEventKind::ScrollDown => {
@@ -7088,51 +7219,6 @@ fn list_index_from_mouse(pos: ratatui::layout::Position, area: Rect, len: usize)
     if row < len { Some(row) } else { None }
 }
 
-#[derive(Default)]
-struct CopilotWorkspaceCwd {
-    cwd: Option<String>,
-    git_root: Option<String>,
-}
-
-fn resolve_copilot_workspace_cwd(session: &SessionSummary) -> Option<String> {
-    let workspace_path = std::path::Path::new(&session.source_path)
-        .parent()?
-        .join("workspace.yaml");
-    let contents = std::fs::read_to_string(workspace_path).ok()?;
-    let workspace = parse_copilot_workspace_cwd(&contents);
-    workspace.cwd.or(workspace.git_root)
-}
-
-fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
-    let mut workspace = CopilotWorkspaceCwd::default();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with('#')
-            || line.chars().next().is_some_and(|c| c.is_whitespace())
-        {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let value = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim() {
-            "cwd" => workspace.cwd = Some(value),
-            "gitRoot" | "git_root" => workspace.git_root = Some(value),
-            _ => {}
-        }
-    }
-    workspace
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7185,6 +7271,155 @@ mod tests {
     }
 
     #[test]
+    fn text_selection_handles_reverse_multiline_and_wide_glyphs() {
+        use ratatui::{buffer::Buffer, layout::Position};
+        let buffer = Buffer::with_lines(["hello   outside", "界e\u{301}nd   outside"]);
+        let mut selection = TextSelection {
+            buffer,
+            area: Rect::new(0, 0, 8, 2),
+            anchor: Position::new(3, 1),
+            end: Position::new(3, 1),
+            press: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            },
+            dragged: false,
+        };
+        selection.update(1, 0);
+        assert_eq!(selection.text(), "ello\n界e\u{301}n");
+        selection.anchor = Position::new(1, 1);
+        selection.update(1, 1);
+        assert_eq!(selection.text(), "界");
+        selection.update(100, 100);
+        assert_eq!(selection.end, Position::new(7, 1));
+        assert_eq!(selection.text(), "界e\u{301}nd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_drag_copies_on_release_and_click_preserves_focus_behavior() {
+        use std::io::{Read, Seek, SeekFrom};
+        let (_tmp, mut app) = test_app();
+        let mut output = tempfile::tempfile().unwrap();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(output.try_clone().unwrap()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        app.layout_mode = LayoutMode::Detail;
+        app.preview_area = Rect::new(0, 0, 10, 1);
+        app.rendered = ratatui::buffer::Buffer::with_lines(["hello text"]);
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 4),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(output.metadata().unwrap().len(), 0);
+        assert!(app.text_selection.as_ref().unwrap().dragged);
+        let mut highlighted = app.rendered.clone();
+        app.text_selection
+            .as_ref()
+            .unwrap()
+            .render(&mut highlighted);
+        assert_eq!(highlighted[(2, 0)].bg, Color::LightCyan);
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 4),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut copied = String::new();
+        output.read_to_string(&mut copied).unwrap();
+        assert_eq!(copied, "\x1b]52;c;aGVsbG8=\x1b\\");
+        assert!(app.text_selection.is_none());
+        let length = output.metadata().unwrap().len();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 1),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        assert!(matches!(app.focus, Focus::Preview));
+        assert_eq!(output.metadata().unwrap().len(), length);
+        app.layout_mode = LayoutMode::Split;
+        app.body_area = Rect::new(0, 0, 80, 24);
+        app.left_width = Some(30);
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        assert!(app.dragging);
+        assert!(app.text_selection.is_none());
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 40),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 40),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        assert!(!app.dragging);
+        assert_eq!(output.metadata().unwrap().len(), length);
+    }
+
+    #[test]
+    fn resolve_session_cwd_reads_antigravity_tool_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{"Cwd":"/work/repo"}}]}"#,
+        )
+        .expect("write transcript");
+        let session = SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            session_id: "session".to_string(),
+            project: "repo".to_string(),
+            source: SourceKind::Antigravity,
+            last_ts: 0,
+            hit_count: 0,
+            top_score: 0.0,
+            title: String::new(),
+            snippet: String::new(),
+            source_path: path.to_string_lossy().into_owned(),
+            source_dir: temp.path().to_string_lossy().into_owned(),
+            label: None,
+            conversation_kind: None,
+        };
+        assert_eq!(resolve_session_cwd(&session).as_deref(), Some("/work/repo"));
+    }
+
+    #[test]
     fn tui_startup_preserves_stale_schema_with_or_without_auto_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
@@ -7195,11 +7430,7 @@ mod tests {
             let error = open_tui_index(&paths, auto_index)
                 .err()
                 .expect("stale schema error");
-            assert!(
-                error
-                    .to_string()
-                    .contains("migrate with exact-text vector reuse")
-            );
+            assert!(error.to_string().contains("vector-preserving migration"));
             assert_eq!(
                 std::fs::read(paths.index.join("meta.json")).unwrap(),
                 metadata
@@ -7567,6 +7798,45 @@ mod tests {
 
         assert!(rendered.contains("Readable session title"));
         assert!(!rendered.contains("01a00000"));
+    }
+
+    #[test]
+    fn session_source_column_accommodates_every_source_label() {
+        assert!(
+            SourceKind::ALL
+                .iter()
+                .all(|source| source.label().chars().count() <= SESSION_SOURCE_WIDTH)
+        );
+
+        let session = SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            session_id: "session".to_string(),
+            project: "BenchBox".to_string(),
+            source: SourceKind::Codex,
+            last_ts: 1,
+            hit_count: 1,
+            top_score: 0.0,
+            title: "Title".to_string(),
+            snippet: String::new(),
+            source_path: "source.jsonl".to_string(),
+            source_dir: String::new(),
+            label: None,
+            conversation_kind: None,
+        };
+        let render = |session: &SessionSummary| {
+            session_result_line(session, &[], 8, 40, &Theme::new())
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        let codex = render(&session);
+        let mut antigravity_session = session;
+        antigravity_session.source = SourceKind::Antigravity;
+        let antigravity = render(&antigravity_session);
+
+        assert_eq!(codex.find("BenchBox"), antigravity.find("BenchBox"));
     }
 
     #[test]

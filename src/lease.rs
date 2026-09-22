@@ -11,6 +11,17 @@ pub const INGEST_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const INGEST_LEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
+pub(crate) struct EmbeddingBusy;
+
+impl std::fmt::Display for EmbeddingBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("embedding writer is busy; retry after the current backfill finishes")
+    }
+}
+
+impl std::error::Error for EmbeddingBusy {}
+
+#[derive(Debug)]
 pub enum LeaseAttempt {
     Acquired(IngestLease),
     Busy(Option<LeaseHolder>),
@@ -87,10 +98,6 @@ impl Drop for IngestLease {
         let _ = self.file.set_len(0);
         let _ = self.file.unlock();
     }
-}
-
-pub fn is_held_by(paths: &Paths, pid: u32) -> bool {
-    is_path_held_by(&lease_path(paths, "ingest"), pid)
 }
 
 pub fn is_embedding_held_by(paths: &Paths, pid: u32) -> bool {
@@ -280,18 +287,6 @@ mod tests {
             IngestLease::try_acquire(&paths, "third").expect("third lease"),
             LeaseAttempt::Acquired(_)
         ));
-    }
-
-    #[test]
-    fn held_by_distinguishes_active_and_released_leases() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
-        let lease =
-            IngestLease::acquire(&paths, "backfill", Duration::from_secs(1)).expect("lease");
-
-        assert!(is_held_by(&paths, std::process::id()));
-        drop(lease);
-        assert!(!is_held_by(&paths, std::process::id()));
     }
 
     #[test]

@@ -606,7 +606,7 @@ pub(crate) fn run_with_lease(
     } else {
         VectorIndex::open_or_create(&paths.vectors, dimensions, Some(model.as_str()))?
     };
-    vector.retain_ids(&live_ids)?;
+    vector.retain_doc_ids(&live_ids)?;
     store.for_each_vector(dimensions, |doc_id, embedding| {
         if live_ids.contains(&doc_id) {
             vector.add(doc_id, &embedding)?;
@@ -714,8 +714,10 @@ fn decode_embedding(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>> {
         ));
     }
     let embedding = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     validate_embedding(&embedding, dimensions)?;
     Ok(embedding)

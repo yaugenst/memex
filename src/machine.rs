@@ -174,6 +174,24 @@ pub struct LocatedMemoryHit {
 pub struct SessionContext {
     pub records: Vec<Record>,
     pub cwd: Option<String>,
+    /// Safe resume destination selected on the machine that owns the session.
+    /// Absent in responses from older peers; never substitute a client path.
+    #[serde(default)]
+    pub resume_cwd: Option<String>,
+}
+
+impl SessionContext {
+    fn new(records: Vec<Record>, source_path: &str, session_id: &str) -> Self {
+        let path = std::path::Path::new(source_path);
+        let cwd = discover_cwd(path, session_id);
+        let source_dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let resume_cwd = crate::resume::resume_cwd(cwd.clone(), &source_dir.to_string_lossy());
+        Self {
+            records,
+            cwd,
+            resume_cwd: Some(resume_cwd),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +288,10 @@ pub struct UsageReportWire {
     pub authority: String,
     pub events: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub credits: Option<f64>,
+    #[serde(default)]
+    pub unavailable_token_events: u64,
     pub unknown_model_events: u64,
     pub conservative_events: u64,
     pub cost_mode: CostMode,
@@ -999,10 +1021,11 @@ pub fn session_context(
 ) -> Result<SessionContext> {
     if machine_id == LOCAL_MACHINE_ID {
         let index = SearchIndex::open_or_create(&paths.index)?;
-        return Ok(SessionContext {
-            records: records_for_session(&index, session_id, source_path)?,
-            cwd: discover_cwd(std::path::Path::new(source_path), session_id),
-        });
+        return Ok(SessionContext::new(
+            records_for_session(&index, session_id, source_path)?,
+            source_path,
+            session_id,
+        ));
     }
     let machine = config
         .machines
@@ -2276,10 +2299,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             let index = SearchIndex::open_or_create(&paths.index)?;
             let records = records_for_session(&index, &session_id, &source_path)?;
             Ok(RpcPayload::Session {
-                context: SessionContext {
-                    records,
-                    cwd: discover_cwd(std::path::Path::new(&source_path), &session_id),
-                },
+                context: SessionContext::new(records, &source_path, &session_id),
             })
         }
         RpcOperation::Show { doc_id } => {
@@ -2401,10 +2421,11 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
 fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionListing>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
     let config = UserConfig::load(paths)?;
+    let cwd = crate::cli::canonical_cwd_filter(spec.cwd.as_ref().map(std::path::PathBuf::from));
     let rows = store.query_sessions_detailed_selected(
         spec.source,
         spec.project.as_deref(),
-        spec.cwd.as_deref(),
+        cwd.as_deref(),
         spec.since_ms,
         spec.origin,
         spec.session_id.as_deref(),
@@ -2438,6 +2459,8 @@ fn usage_local(paths: &Paths, config: &UserConfig, spec: &UsageSpec) -> Result<U
         authority: report.authority.to_string(),
         events: report.events,
         total_tokens: report.total_tokens,
+        credits: report.credits,
+        unavailable_token_events: report.unavailable_token_events,
         unknown_model_events: report.unknown_model_events,
         conservative_events: report.conservative_events,
         cost_mode: report.cost_mode,
@@ -2572,6 +2595,8 @@ fn merge_usage_reports(
         authority: "multi-machine reconstructed usage (not subscription quota)".to_string(),
         events: 0,
         total_tokens: 0,
+        credits: None,
+        unavailable_token_events: 0,
         unknown_model_events: 0,
         conservative_events: 0,
         cost_mode,
@@ -2590,6 +2615,10 @@ fn merge_usage_reports(
     };
     for (machine, mut report) in reports {
         merged.events = merged.events.saturating_add(report.events);
+        merged.unavailable_token_events += report.unavailable_token_events;
+        if let Some(credits) = report.credits {
+            *merged.credits.get_or_insert(0.0) += credits;
+        }
         merged.total_tokens = merged.total_tokens.saturating_add(report.total_tokens);
         merged.unknown_model_events = merged
             .unknown_model_events
@@ -3102,6 +3131,7 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         include_antigravity: true,
         include_bob: true,
         include_zcode: true,
+        include_kiro: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),
         prune_missing: true,
@@ -3144,41 +3174,11 @@ fn records_for_session_page(
 }
 
 fn discover_cwd(path: &std::path::Path, session_id: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut fallback = None;
-    for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let cwd = value
-            .get("cwd")
-            .and_then(|value| value.as_str())
-            .or_else(|| {
-                value
-                    .get("payload")
-                    .and_then(|payload| payload.get("cwd"))
-                    .and_then(|value| value.as_str())
-            })
-            .map(str::to_string);
-        if fallback.is_none() {
-            fallback.clone_from(&cwd);
-        }
-        let matches_session = value
-            .get("sessionId")
-            .and_then(|value| value.as_str())
-            .or_else(|| value.get("session_id").and_then(|value| value.as_str()))
-            .is_some_and(|id| id == session_id);
-        if matches_session && cwd.is_some() {
-            return cwd;
-        }
-        if value.get("type").and_then(|value| value.as_str()) == Some("session_meta")
-            && cwd.is_some()
-        {
-            return cwd;
-        }
-    }
-    fallback
+    crate::sources::session_cwd(
+        crate::sources::classify_path(&path.to_string_lossy()),
+        path,
+        session_id,
+    )
 }
 
 fn rpc_records(
@@ -3533,6 +3533,56 @@ mod tests {
     use crate::types::{RecordLinks, SourceKind};
     use tempfile::TempDir;
 
+    #[test]
+    fn session_context_selects_resume_directory_on_owning_machine() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::env_lock();
+        let server = temp.path().join("server");
+        let client = temp.path().join("client");
+        let wire_responses = {
+            let _env = crate::test_support::pin_source_roots(&server);
+            let store = server.join("CODEX_HOME/sessions/2026/09");
+            std::fs::create_dir_all(&store).unwrap();
+            let path = store.join("session.jsonl");
+            let worktree = server.join("CODEX_HOME/worktrees/24d4/memex");
+            let cases = [
+                (None, server.join("HOME")),
+                (Some(store.clone()), server.join("HOME")),
+                (Some(worktree.clone()), worktree),
+            ];
+            cases
+                .into_iter()
+                .map(|(cwd, expected)| {
+                    std::fs::write(
+                        &path,
+                        serde_json::json!({"type": "session_meta", "payload": {"cwd": cwd}})
+                            .to_string(),
+                    )
+                    .unwrap();
+                    let context = SessionContext::new(Vec::new(), path.to_str().unwrap(), "s1");
+                    // Factual cwd stays distinct from the safe fallback.
+                    assert_eq!(
+                        context.cwd,
+                        cwd.map(|dir| dir.to_string_lossy().into_owned())
+                    );
+                    (serde_json::to_string(&context).unwrap(), expected)
+                })
+                .collect::<Vec<_>>()
+        };
+        let _env = crate::test_support::pin_source_roots(&client);
+        for (wire, expected) in wire_responses {
+            let context: SessionContext = serde_json::from_str(&wire).unwrap();
+            assert_eq!(context.resume_cwd.as_deref(), expected.to_str());
+        }
+    }
+
+    #[test]
+    fn legacy_session_context_does_not_claim_a_safe_resume_directory() {
+        let context: SessionContext =
+            serde_json::from_str(r#"{"records":[],"cwd":"/remote/.codex/sessions"}"#).unwrap();
+        assert!(context.resume_cwd.is_none());
+        assert_eq!(context.cwd.as_deref(), Some("/remote/.codex/sessions"));
+    }
     fn activity_progress_child(script: &str) -> std::process::Child {
         Command::new("sh")
             .args(["-c", script])
@@ -4526,7 +4576,7 @@ mod tests {
         paths.ensure_dirs().unwrap();
         std::fs::write(
             paths.root.join("config.toml"),
-            "codex_resume_cmd = 'configured-resume {session_id} {source_path_shell}'\n",
+            "codex_resume_cmd = 'configured-resume {session_id} {source_path_shell}'\n[multi_machine]\ndefault = ['unavailable']\n[[machines]]\nid = 'unavailable'\nssh = 'unavailable'\n",
         )
         .unwrap();
         let config = UserConfig::load(&paths).unwrap();
@@ -4850,6 +4900,8 @@ mod tests {
             authority: "local".to_string(),
             events: 1,
             total_tokens: tokens,
+            credits: None,
+            unavailable_token_events: 0,
             unknown_model_events: 0,
             conservative_events: 0,
             cost_mode: CostMode::Auto,
@@ -4882,5 +4934,21 @@ mod tests {
         assert_eq!(merged.total_tokens, 30);
         assert_eq!(merged.by_source[0].source, "local/codex");
         assert_eq!(merged.by_source[1].source, "mini/claude");
+        let mut credit_report = report(0, "kiro");
+        credit_report.credits = Some(0.75);
+        credit_report.unavailable_token_events = 1;
+        credit_report.known_cost_usd = 0.0;
+        credit_report.priced_events = 0;
+        credit_report.by_source[0].credits = Some(0.75);
+        credit_report.by_source[0].unavailable_token_events = 1;
+        let merged = merge_usage_reports(
+            vec![("local".into(), credit_report)],
+            Vec::new(),
+            CostMode::Auto,
+        );
+        assert_eq!(merged.credits, Some(0.75));
+        assert_eq!(merged.unavailable_token_events, 1);
+        assert_eq!(merged.total_tokens, 0);
+        assert_eq!(merged.by_source[0].credits, Some(0.75));
     }
 }

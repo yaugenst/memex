@@ -2130,7 +2130,7 @@ impl tantivy::collector::CustomSegmentScorer<SessionReverseOrder> for SessionOrd
 
 fn stale_schema_error(dir: &Path) -> anyhow::Error {
     anyhow!(
-        "index schema at {} is stale; migrate with exact-text vector reuse, or explicitly run `memex index rebuild` to discard and rebuild it",
+        "index schema at {} is stale; see docs/vector-migration.md for vector-preserving migration, or explicitly run `memex index rebuild` to discard and rebuild it",
         dir.display()
     )
 }

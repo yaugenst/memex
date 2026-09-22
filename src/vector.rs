@@ -239,10 +239,6 @@ impl VectorIndex {
         Ok(())
     }
 
-    pub fn retain_ids(&mut self, live_ids: &HashSet<u64>) -> Result<()> {
-        self.retain_doc_ids(live_ids)
-    }
-
     pub fn search(&self, embedding: &[f32], limit: usize) -> Result<Vec<(u64, f32)>> {
         if embedding.len() != self.dims {
             return Err(anyhow!(

@@ -1,11 +1,32 @@
-# Personal fork upstream sync — 2026-09-19
+# Personal fork upstream sync
+
+## v0.24.0 (2026-09-23)
+
+Merged upstream through `649355e` (v0.24.0). Upstream now carries our PRs #205
+to #210: watcher access-event filtering, federated session listings, atomic
+analytics rebuilds, explicit lexical migrations that preserve vectors, and
+resumable supervised embedding backfills. Conflicts were resolved to the
+upstream versions of those changes. This branch still adds `memex prune` and
+confirmed-missing pruning during ingest, published-snapshot reads while
+auto-index is busy, index size in `memex stats`, durable store directory
+creation, and `MEMEX_EXECUTION_PROVIDER` precedence over the config file.
+
+Upstream still clears the whole vector store when any parser version changes
+(`vector_migration` and `reset_vector_store` in `src/ingest`). This branch keeps
+that path removed so parser changes re-embed only the records they replace.
+Future merges must drop it again.
+
+v0.24.0 changed no lexical schema or parser versions. The usage cache drops its
+`usage_file_cache` table once on first open.
+
+## v0.23.1 (2026-09-19)
 
 Merged upstream through `6044371` (v0.23.1), including the new readers,
 checkpoint and lexical storage, stemming, sources, usage reporting, and inference
 runtime. Retained resumable embedding jobs, supervised workers, confirmed-missing
 file pruning, federated session listing, and memory section embedding reuse.
 
-## Database preservation
+### Database preservation
 
 Writable opens and TUI startup reject stale lexical schemas without replacing
 files. Parser-version changes no longer clear the entire vector store; unchanged
@@ -34,7 +55,7 @@ publishes only after all matched vectors pass bitwise checks, then verifies the
 reopened generation. This is an operator-driven migration, not automatic startup
 behavior. The original root remains untouched until the final directory switch.
 
-## Validation
+### Validation
 
 The migration regression covers changed IDs, duplicate text, UTF-8 truncation,
 missing and removed inputs, incomplete export recovery, incompatible models and

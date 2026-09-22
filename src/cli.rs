@@ -178,6 +178,12 @@ struct IndexArgs {
     /// Skip indexing Antigravity conversations
     #[arg(long = "no-antigravity", default_value_t = false, hide = true)]
     no_antigravity: bool,
+    /// Index Kiro CLI sessions from ~/.kiro/sessions [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    kiro: bool,
+    /// Skip indexing Kiro CLI sessions
+    #[arg(long = "no-kiro", default_value_t = false, hide = true)]
+    no_kiro: bool,
     /// Index IBM Bob tasks from ~/.bob/db/bob.db [default: true]
     #[arg(long, default_value_t = true, hide = true)]
     bob: bool,
@@ -352,7 +358,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long, help_heading = "Filters")]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long, help_heading = "Filters")]
         source: Option<SourceFilter>,
         /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
@@ -696,7 +702,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -941,7 +947,7 @@ enum HerdrCommand {
         /// Refuse when no resumable session exists in --cwd instead of using another project
         #[arg(long)]
         strict_cwd: bool,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -2099,7 +2105,7 @@ fn service_embedding_worker(
         if !exit {
             eprintln!("embedding worker failed; checking whether vector work remains");
         }
-        vector_work.verify = true;
+        vector_work.worker_finished(exit);
     }
 
     let desired_spec = load_embed_worker_spec(index, paths)?;
@@ -2107,10 +2113,15 @@ fn service_embedding_worker(
         worker.stop()?;
         *active_spec = desired_spec;
         vector_work.verify = true;
+        vector_work.memory_revision = None;
+        vector_work.retry_after = None;
     }
 
     let search_index = SearchIndex::open_or_create(&paths.index)?;
     vector_work.observe_lexical_revision(search_index.revision()?);
+    vector_work.observe_memory_revision(
+        MemoryStore::new(paths.root.join("memory/documents.json")).revision()?,
+    );
     let external_embedding = !worker.is_running() && crate::lease::is_embedding_held(paths);
     vector_work.observe_external_embedding(
         external_embedding,
@@ -2120,7 +2131,12 @@ fn service_embedding_worker(
     let Some(spec) = active_spec.as_ref() else {
         return Ok(());
     };
-    if !worker.is_running() && !external_embedding {
+    if !worker.is_running()
+        && !external_embedding
+        && vector_work
+            .retry_after
+            .is_none_or(|deadline| Instant::now() >= deadline)
+    {
         let should_spawn = if vector_work.pending {
             true
         } else if vector_work.verify {
@@ -2131,6 +2147,7 @@ fn service_embedding_worker(
         vector_work.verify = false;
         if should_spawn {
             worker.start(spawn_embedding_process(index, spec)?);
+            vector_work.retry_after = None;
             // The observed lexical revision is now the worker's input baseline. Any later commit
             // flips pending back to true while this child continues in isolation.
             vector_work.pending = false;
@@ -2142,12 +2159,23 @@ fn service_embedding_worker(
 #[derive(Debug, Default)]
 struct VectorWorkState {
     lexical_revision: Option<IndexRevision>,
+    memory_revision: Option<Option<crate::memory::FileFingerprint>>,
     pending: bool,
     verify: bool,
     external_embedding_seen: bool,
+    retry_after: Option<Instant>,
 }
 
 impl VectorWorkState {
+    fn worker_finished(&mut self, success: bool) {
+        self.verify = true;
+        if !success {
+            // Conversation publication can finish before memory embedding fails.
+            self.pending = true;
+            self.retry_after = Some(Instant::now() + Duration::from_secs(5));
+        }
+    }
+
     fn observe_lexical_revision(&mut self, revision: IndexRevision) {
         if self
             .lexical_revision
@@ -2157,6 +2185,15 @@ impl VectorWorkState {
             self.pending = true;
         }
         self.lexical_revision = Some(revision);
+    }
+
+    fn observe_memory_revision(&mut self, revision: Option<crate::memory::FileFingerprint>) {
+        self.pending |= self
+            .memory_revision
+            .as_ref()
+            .is_none_or(|previous| *previous != revision)
+            && revision.is_some();
+        self.memory_revision = Some(revision);
     }
 
     fn observe_external_embedding(&mut self, held: bool, checkpoint_exists: bool) {
@@ -2235,6 +2272,19 @@ impl<P: ChildProcess> EmbeddingWorker<P> {
 impl<P: ChildProcess> Drop for EmbeddingWorker<P> {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+fn retry_after_stopping_embedder<P: ChildProcess, T>(
+    worker: &mut EmbeddingWorker<P>,
+    mut ingest: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match ingest() {
+        Err(error) if error.is::<crate::lease::EmbeddingBusy>() && worker.is_running() => {
+            worker.stop()?;
+            ingest()
+        }
+        result => result,
     }
 }
 
@@ -2378,7 +2428,14 @@ fn run_poll_loop(
         if shutdown.load(AtomicOrdering::Relaxed) {
             break;
         }
-        run_index_args(index, false)?;
+        if let Err(error) =
+            retry_after_stopping_embedder(&mut worker, || run_index_args(index, false))
+        {
+            if !error.is::<crate::lease::EmbeddingBusy>() {
+                return Err(error);
+            }
+            eprintln!("index deferred while another embedding writer is active");
+        }
         std::io::stdout().flush().ok();
     }
     worker.stop()?;
@@ -2470,7 +2527,7 @@ fn run_event_loop(
                 if let Err(error) = refresh_watch_roots(&mut service, index) {
                     eprintln!("watch: root refresh failed: {error:#}");
                 }
-                match run_index_args(index, false) {
+                match retry_after_stopping_embedder(&mut worker, || run_index_args(index, false)) {
                     Ok(()) => {
                         service.mark_complete(FireCause::Resync);
                         log_watch_stats(&service);
@@ -2482,7 +2539,9 @@ fn run_event_loop(
                 let dirty = service.dirty_paths();
                 match dirty_needs_ingest(&paths, &dirty) {
                     Ok(false) => service.mark_skipped(),
-                    Ok(true) => match run_index_selection(index, false, Some(&dirty)) {
+                    Ok(true) => match retry_after_stopping_embedder(&mut worker, || {
+                        run_index_selection(index, false, Some(&dirty))
+                    }) {
                         Ok(full_scan) => {
                             if full_scan
                                 && let Err(error) = refresh_watch_roots(&mut service, index)
@@ -2502,7 +2561,11 @@ fn run_event_loop(
                     },
                     Err(error) => {
                         eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
-                        if run_index_args(index, false).is_ok() {
+                        if retry_after_stopping_embedder(&mut worker, || {
+                            run_index_args(index, false)
+                        })
+                        .is_ok()
+                        {
                             service.mark_complete(FireCause::Resync);
                             log_watch_stats(&service);
                         }
@@ -2608,6 +2671,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
         include_bob: index.source_enabled(IndexSource::Bob),
         include_zcode: index.source_enabled(IndexSource::Zcode),
+        include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
@@ -2865,8 +2929,15 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     paths.ensure_dirs()?;
     let model_choice = config.resolve_model(model)?;
     let embed_runtime = config.resolve_embed_runtime()?;
+    let lease = IngestLease::acquire_embedding(&paths, "embed", INGEST_LEASE_TIMEOUT)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
-    let report = crate::vector_backfill::run(&paths, &index, model_choice, &embed_runtime)?;
+    let report = crate::vector_backfill::run_with_lease(
+        &paths,
+        &index,
+        model_choice,
+        &embed_runtime,
+        &lease,
+    )?;
     let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
     println!("embedded {memory_embedded} memory section vectors");
     println!(
@@ -5135,7 +5206,7 @@ fn print_usage_rows(
     cache_waste: &crate::usage::CacheWaste,
     by_source: &[crate::usage::UsageSummary],
 ) {
-    const HEADERS: [&str; 10] = [
+    const HEADERS: [&str; 11] = [
         "source",
         "events",
         "input",
@@ -5144,6 +5215,7 @@ fn print_usage_rows(
         "output",
         "total",
         "cost",
+        "credits",
         "hit",
         "re-billed",
     ];
@@ -5162,23 +5234,37 @@ fn print_usage_rows(
         totals.cache_read += row.cache_read;
         totals.cache_write += row.cache_write;
         totals.output += row.output;
+        totals.unavailable_token_events += row.unavailable_token_events;
+        if let Some(credits) = row.credits {
+            *totals.credits.get_or_insert(0.0) += credits;
+        }
     }
-    let cells = |row: &crate::usage::UsageSummary| -> [String; 10] {
+    let cells = |row: &crate::usage::UsageSummary| -> [String; 11] {
         let prompt_tokens = row.uncached_input + row.cache_read + row.cache_write;
         let cache_active = row.cache_read > 0 || row.cache_write > 0;
+        let token_count = |value| {
+            if row.events > 0 && row.unavailable_token_events == row.events {
+                "unavailable".to_string()
+            } else {
+                format_count(value)
+            }
+        };
         [
             row.source.clone(),
             format_count(row.events),
-            format_count(row.uncached_input),
-            format_count(row.cache_read),
-            format_count(row.cache_write),
-            format_count(row.output),
-            format_count(row.total_tokens),
+            token_count(row.uncached_input),
+            token_count(row.cache_read),
+            token_count(row.cache_write),
+            token_count(row.output),
+            token_count(row.total_tokens),
             if row.priced_events > 0 {
                 format_usd(row.known_cost_usd)
             } else {
                 "-".to_string()
             },
+            row.credits
+                .map(|credits| format!("{credits:.6}"))
+                .unwrap_or_else(|| "-".into()),
             if cache_active && prompt_tokens > 0 {
                 format!(
                     "{:.1}%",
@@ -5196,10 +5282,10 @@ fn print_usage_rows(
             },
         ]
     };
-    let mut table: Vec<[String; 10]> = vec![HEADERS.map(str::to_string)];
+    let mut table: Vec<[String; 11]> = vec![HEADERS.map(str::to_string)];
     table.extend(by_source.iter().map(cells));
     table.push(cells(&totals));
-    let mut widths = [0usize; 10];
+    let mut widths = [0usize; 11];
     for row in &table {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.len());
@@ -5272,7 +5358,7 @@ fn open_analytics_read_only(paths: &Paths) -> Result<AnalyticsStore> {
     AnalyticsStore::open_read_only(&db)
 }
 
-fn canonical_cwd_filter(cwd: Option<PathBuf>) -> Option<String> {
+pub(crate) fn canonical_cwd_filter(cwd: Option<PathBuf>) -> Option<String> {
     let cwd = cwd?;
     let resolved = std::fs::canonicalize(&cwd).unwrap_or(cwd);
     Some(resolved.to_string_lossy().to_string())
@@ -5373,7 +5459,9 @@ pub(crate) fn session_resume_command(
 ) -> Option<(String, String)> {
     let template = crate::resume::resume_template(config, row.source, false)?;
     let source_dir = source_dir_of(&row.source_path);
-    let cwd = row.cwd.clone().unwrap_or_else(|| source_dir.clone());
+    // Transcript stores are never workspaces: falling back into one makes the
+    // resumed CLI ask the user to trust an agent's internal state directory.
+    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir);
     let command = crate::resume::expand_resume_template(
         &template,
         &crate::resume::ResumeSession {
@@ -5411,7 +5499,7 @@ fn run_sessions(
         &SessionListSpec {
             source,
             project,
-            cwd: canonical_cwd_filter(cwd),
+            cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
             since_ms: parse_ts_millis(since)?,
             limit,
             origin: match origin {
@@ -5428,9 +5516,7 @@ fn run_sessions(
     let mut items = Vec::new();
     for located in result.items {
         let row = located.session;
-        let resume_cmd = located
-            .resume_cmd
-            .or_else(|| session_resume_command(&config, &row).map(|(command, _)| command));
+        let resume_cmd = located.resume_cmd;
         let mut value = serde_json::to_value(&row)?;
         value["machine"] = Value::String(located.machine);
         value["started_at"] = Value::String(format_ts(row.started_at));
@@ -6058,6 +6144,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Antigravity => "antigravity",
         crate::types::SourceKind::Bob => "bob",
         crate::types::SourceKind::Zcode => "zcode",
+        crate::types::SourceKind::Kiro => "kiro",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -7392,6 +7479,9 @@ fn build_index_command_args(
     if !index.jcode || index.no_jcode {
         args.push("--no-jcode".to_string());
     }
+    if !index.kiro || index.no_kiro {
+        args.push("--no-kiro".to_string());
+    }
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
     }
@@ -8413,6 +8503,20 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn failed_worker_requeues_memory_work_with_retry_delay() {
+        let mut state = VectorWorkState::default();
+        state.worker_finished(false);
+        assert!(state.pending);
+        assert!(state.verify);
+        assert!(state.retry_after.unwrap() > Instant::now());
+        let mut completed = VectorWorkState::default();
+        completed.worker_finished(true);
+        assert!(completed.verify);
+        assert!(!completed.pending);
+        assert!(completed.retry_after.is_none());
+    }
+
+    #[test]
     fn vector_work_is_rechecked_only_after_relevant_events() {
         let revision = |opstamp| IndexRevision {
             opstamp,
@@ -8462,6 +8566,42 @@ mod tests {
             state.running = false;
             Ok(())
         }
+    }
+
+    #[test]
+    fn only_embedding_contention_stops_the_worker_and_retries_ingest() {
+        let state = std::rc::Rc::new(std::cell::RefCell::new(FakeProcessState {
+            running: true,
+            ..Default::default()
+        }));
+        let mut worker = EmbeddingWorker::default();
+        worker.start(FakeProcess {
+            state: state.clone(),
+        });
+        let mut calls = 0;
+        retry_after_stopping_embedder(&mut worker, || {
+            calls += 1;
+            if calls == 1 {
+                Err(crate::lease::EmbeddingBusy.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(state.borrow().terminate_and_wait_calls, 1);
+        state.borrow_mut().running = true;
+        worker.start(FakeProcess {
+            state: state.clone(),
+        });
+        assert!(
+            retry_after_stopping_embedder(&mut worker, || Err::<(), _>(anyhow!(
+                "unrelated failure"
+            )))
+            .is_err()
+        );
+        assert!(worker.is_running());
+        assert_eq!(state.borrow().terminate_and_wait_calls, 1);
     }
 
     #[test]
@@ -8918,6 +9058,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kiro: false,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8983,6 +9125,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kiro: true,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -9041,6 +9185,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kiro: true,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -9101,6 +9247,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kiro: true,
+            no_kiro: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -9816,6 +9964,7 @@ arguments = {
             "--no-grok",
             "--no-jcode",
             "--no-muse",
+            "--no-kiro",
         ])
         .unwrap();
 
