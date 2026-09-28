@@ -143,21 +143,12 @@ impl ExecutionProviderChoice {
         }
     }
 
+    /// Auto means CPU on every platform. With BGE on macOS, the CoreML provider's
+    /// memory footprint grew past 60 GB during backfill, so CoreML is explicit opt-in.
     fn effective(self) -> Self {
         match self {
-            Self::Auto => Self::default_for_platform(),
+            Self::Auto => Self::Cpu,
             other => other,
-        }
-    }
-
-    fn default_for_platform() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            Self::CoreML
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Self::Cpu
         }
     }
 }
@@ -545,12 +536,7 @@ fn init_options_with_coreml(
     let provider = CoreML::default()
         .with_subgraphs(true)
         .with_compute_units(compute_units);
-    let dispatch = if matches!(runtime.execution_provider, ExecutionProviderChoice::CoreML) {
-        provider.build().error_on_failure()
-    } else {
-        provider.build()
-    };
-    Ok(opts.with_execution_providers(vec![dispatch]))
+    Ok(opts.with_execution_providers(vec![provider.build().error_on_failure()]))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -613,8 +599,7 @@ impl EmbedderHandle {
     ) -> Result<Self> {
         crate::profiling::span!("embeddings.model_init");
         if let Some((model_type, dims)) = choice.fastembed_config() {
-            let requested_provider = runtime.execution_provider;
-            let effective_provider = requested_provider.effective();
+            let effective_provider = runtime.execution_provider.effective();
             let opts = init_options_for_model(model_type, runtime)?;
             let model = TextEmbedding::try_new(opts).map_err(|err| match effective_provider {
                 ExecutionProviderChoice::Cuda => anyhow!(
@@ -622,9 +607,7 @@ impl EmbedderHandle {
                      built with `--features cuda` and the required CUDA 13/cuDNN libraries are \
                      on the dynamic linker path (for example via LD_LIBRARY_PATH)"
                 ),
-                ExecutionProviderChoice::CoreML
-                    if matches!(requested_provider, ExecutionProviderChoice::CoreML) =>
-                {
+                ExecutionProviderChoice::CoreML => {
                     anyhow!("failed to initialize CoreML execution provider: {err}")
                 }
                 _ => err,
@@ -823,6 +806,14 @@ mod tests {
         assert_eq!(
             ExecutionProviderChoice::parse("cuda").expect("parse cuda"),
             ExecutionProviderChoice::Cuda
+        );
+    }
+
+    #[test]
+    fn test_auto_execution_provider_is_cpu() {
+        assert_eq!(
+            ExecutionProviderChoice::Auto.effective(),
+            ExecutionProviderChoice::Cpu
         );
     }
 

@@ -16,6 +16,13 @@ Upstream still clears the whole vector store when any parser version changes
 that path removed so parser changes re-embed only the records they replace.
 Future merges must drop it again.
 
+Upstream resolves `execution_provider = "auto"` to CoreML on macOS. On
+2026-09-28, a BGE backfill on CoreML with `compute_units = "ane"` grew one embed
+worker past a 60 GB footprint on a 24 GB laptop and never finished; the same
+backfill on CPU peaked near 4.5 GB and completed in about four minutes. This
+branch resolves `auto` to CPU everywhere (`ExecutionProviderChoice::effective`),
+so CoreML is explicit opt-in. Future merges must keep that default.
+
 v0.24.0 changed no lexical schema or parser versions. The usage cache drops its
 `usage_file_cache` table once on first open.
 
