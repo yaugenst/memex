@@ -218,3 +218,15 @@ leave missing copies uninstalled, and require restarting the agent to load chang
   only when that configuration is in scope.
 - Hermes primarily contributes usage data; source support alone does not establish
   that searchable transcripts are available.
+
+## Personal fork behavior
+
+CLI `sessions`, like `search`, queries configured machines by default. Use repeated
+`--machine` only to narrow that scope. Preserve machine provenance and report
+partial peer failures; do not repeat the query manually over SSH. MCP session
+listing remains local. Bounded reads require updated peers.
+
+Embedding backfills checkpoint complete batches and resume on `memex index embed`.
+The daemon keeps lexical ingestion independent of its supervised embedding worker.
+Use `memex index stats` to inspect progress; do not start maintenance merely because
+one semantic query has insufficient evidence.

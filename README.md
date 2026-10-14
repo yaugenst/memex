@@ -286,3 +286,19 @@ destination can reproduce the original session's behavior.
 | [Token usage](docs/usage.md) | Counters, pricing, cache estimates, Hermes coverage |
 | [herdr integration](docs/herdr.md) | Installation, actions, key bindings |
 | [Developer profiling](docs/profiling.md) | Index/search traces and flamegraphs |
+
+## Personal fork
+
+This branch retains resumable embedding backfill, independently supervised daemon
+embedding work, confirmed-missing-file pruning (`--no-prune` to retain history),
+and federated CLI session listing. `memex sessions` uses configured machines;
+repeat `--machine` to select peers. MCP session discovery remains local.
+
+```sh
+memex index stats
+memex sessions --machine local --machine superbaozidora --limit 20
+```
+
+Upgrading the lexical index format requires preserving and remapping existing
+embeddings before rebuilding. Do not run `memex index rebuild` on the old data
+root as a migration: it deletes the vector and memory indexes too.
