@@ -1187,11 +1187,12 @@ fn poll_daemon_defers_deletion_while_an_external_embedding_writer_holds_the_leas
         .doc_count()
         .unwrap()
         != 0
+        || !VectorIndex::open(&paths.vectors).unwrap().is_empty()
     {
         daemon.assert_running();
         assert!(
             Instant::now() < deadline,
-            "poll daemon did not retry deletion: {}",
+            "poll daemon did not finish lexical and vector deletion: {}",
             daemon.diagnostics()
         );
         std::thread::sleep(Duration::from_millis(50));

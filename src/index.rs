@@ -1039,8 +1039,36 @@ impl SearchIndex {
         writer.delete_term(term);
     }
 
-    pub fn doc_ids_by_source_scope(&self, scope: &SessionScope) -> Result<Vec<u64>> {
-        self.doc_ids_matching_query(Box::new(source_scope_query(&self.fields, scope)))
+    pub fn count_by_source_paths(&self, paths: &[String]) -> Result<usize> {
+        let Some(query) = self.source_paths_query(paths) else {
+            return Ok(0);
+        };
+        let reader = self.reader()?;
+        Ok(reader.searcher().search(query.as_ref(), &Count)?)
+    }
+
+    pub fn doc_ids_by_source_paths(&self, paths: &[String]) -> Result<Vec<u64>> {
+        let Some(query) = self.source_paths_query(paths) else {
+            return Ok(Vec::new());
+        };
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let limit = searcher.search(query.as_ref(), &Count)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(limit))?;
+        let mut doc_ids = Vec::with_capacity(top_docs.len());
+        for (_score, address) in top_docs {
+            let document = searcher.doc::<TantivyDocument>(address)?;
+            if let Some(doc_id) = document
+                .get_first(self.fields.doc_id)
+                .and_then(|value| value.as_u64())
+            {
+                doc_ids.push(doc_id);
+            }
+        }
+        Ok(doc_ids)
     }
 
     pub(crate) fn source_paths_with_records(
@@ -1068,11 +1096,31 @@ impl SearchIndex {
     }
 
     pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
-        let query = TermQuery::new(
-            Term::from_field_text(self.fields.source_path, path),
-            IndexRecordOption::Basic,
-        );
-        self.doc_ids_matching_query(Box::new(query))
+        self.doc_ids_by_source_paths(&[path.to_string()])
+    }
+
+    fn source_paths_query(&self, paths: &[String]) -> Option<Box<dyn Query>> {
+        let clauses = paths
+            .iter()
+            .map(|path| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.source_path, path),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect::<Vec<_>>();
+        match clauses.len() {
+            0 => None,
+            1 => clauses.into_iter().next().map(|(_, query)| query),
+            _ => Some(Box::new(BooleanQuery::new(clauses))),
+        }
+    }
+
+    pub fn doc_ids_by_source_scope(&self, scope: &SessionScope) -> Result<Vec<u64>> {
+        self.doc_ids_matching_query(Box::new(source_scope_query(&self.fields, scope)))
     }
 
     fn doc_ids_matching_query(&self, query: Box<dyn Query>) -> Result<Vec<u64>> {

@@ -5,7 +5,7 @@ use crate::config::{MachineConfig, Paths, UserConfig};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
-use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
+use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
 use crate::memory_search::{
     MemoryReadRequest, MemoryReadValue, MemorySearchHit, MemorySearchOptions,
 };
@@ -719,7 +719,7 @@ pub fn federated_memory_search(
                 scope.spawn(move || {
                     let result = (|| {
                         if auto_index_local {
-                            ensure_local_index(paths, config)?;
+                            ensure_local_index(paths, config, false)?;
                         }
                         crate::memory_search::search_memory(paths, &options)
                     })();
@@ -2302,7 +2302,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         }),
         RpcOperation::MemorySearch { options } => {
             options.validate()?;
-            ensure_local_index(paths, config)?;
+            ensure_local_index(paths, config, false)?;
             Ok(RpcPayload::MemoryHits {
                 hits: crate::memory_search::search_memory(paths, &options)?,
             })
@@ -2420,7 +2420,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             Ok(RpcPayload::SessionBatch { contexts })
         }
         RpcOperation::Index => {
-            let report = index_local(paths, config, false)?;
+            let report = index_local(paths, config, false, false)?;
             Ok(RpcPayload::Index {
                 records_added: report.records_added,
                 records_embedded: report.records_embedded,
@@ -2730,7 +2730,9 @@ fn search_local(
 ) -> Result<Vec<(f32, Record)>> {
     crate::profiling::span!("search.local");
     if auto_index {
-        ensure_local_index(paths, config)?;
+        let allow_busy_snapshot = spec.cwd.is_none()
+            && spec.project_grouping.unwrap_or_default() == ProjectGrouping::Flat;
+        ensure_local_index(paths, config, allow_busy_snapshot)?;
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut options = spec.query_options();
@@ -2888,7 +2890,11 @@ fn recent_local(
     auto_index: bool,
 ) -> Result<Vec<(f32, Record)>> {
     if auto_index {
-        ensure_local_index(paths, config)?;
+        ensure_local_index(
+            paths,
+            config,
+            project_grouping.unwrap_or_default() == ProjectGrouping::Flat,
+        )?;
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut records: Vec<_> = index
@@ -2983,9 +2989,9 @@ fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
     *field = abbreviated;
 }
 
-fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
+fn ensure_local_index(paths: &Paths, config: &UserConfig, allow_busy_snapshot: bool) -> Result<()> {
     if config.auto_index_on_search_default() {
-        let report = index_local(paths, config, true)?;
+        let report = index_local(paths, config, true, allow_busy_snapshot)?;
         if report.records_added > 0 || compaction_pending(paths) {
             schedule_compaction_if_fragmented(paths)?;
         }
@@ -3078,7 +3084,12 @@ pub(crate) fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<IngestReport> {
+fn index_local(
+    paths: &Paths,
+    config: &UserConfig,
+    stale_only: bool,
+    allow_busy_snapshot: bool,
+) -> Result<IngestReport> {
     crate::profiling::span!("index.local");
     let options = local_ingest_options(config)?;
     // The journal stream must be registered before this process writes anything: a write in
@@ -3089,7 +3100,30 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         journal
     });
     paths.ensure_dirs()?;
-    let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
+    let lease = if allow_busy_snapshot {
+        match IngestLease::try_acquire(paths, "RPC auto-index")? {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Busy(Some(holder))
+                if holder.operation != "reindex" && SearchIndex::exists(&paths.index) =>
+            {
+                // Use the last published generation while ordinary ingestion is busy.
+                return Ok(IngestReport {
+                    records_added: 0,
+                    records_embedded: 0,
+                    records_pruned: 0,
+                    files_pruned: 0,
+                    files_scanned: 0,
+                    files_skipped: 0,
+                    diagnostics: Default::default(),
+                });
+            }
+            LeaseAttempt::Busy(_) => {
+                IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?
+            }
+        }
+    } else {
+        IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?
+    };
     let index = match SearchIndex::open_or_create(&paths.index) {
         Ok(index) if !index.is_writable() => index,
         _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
@@ -3106,6 +3140,8 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         .unwrap_or(IngestReport {
             records_added: 0,
             records_embedded: 0,
+            records_pruned: 0,
+            files_pruned: 0,
             files_scanned: 0,
             files_skipped: 0,
             diagnostics: Default::default(),
@@ -3144,6 +3180,7 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         include_kiro: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),
+        prune_missing: true,
         backfill_embeddings: false,
         model: config.resolve_model(None)?,
         embed_runtime: config.resolve_embed_runtime()?,
@@ -3958,6 +3995,22 @@ mod tests {
         serde_json::from_slice::<RpcResponse>(&response)
             .unwrap()
             .response
+    }
+
+    #[test]
+    fn busy_auto_index_reads_published_generation() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        index.publish_generation().unwrap();
+        drop(index);
+
+        assert!(!paths.index.join("meta.json").exists());
+        assert!(SearchIndex::exists(&paths.index));
+
+        let _lease = IngestLease::acquire(&paths, "index", Duration::from_secs(1)).unwrap();
+        ensure_local_index(&paths, &UserConfig::default(), true).unwrap();
     }
 
     #[test]

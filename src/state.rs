@@ -370,7 +370,7 @@ impl PendingIngest {
     }
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let parent = parent_directory(path)?;
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
@@ -391,6 +391,11 @@ fn parent_directory(path: &Path) -> anyhow::Result<&Path> {
     }
 }
 
+/// Make a rename or removal in this directory durable before the next publication step.
+///
+/// Unix exposes directories as syncable file descriptors. Rust's portable filesystem API does
+/// not provide the equivalent on Windows and other non-Unix targets, so those platforms retain
+/// the existing atomic rename/removal behavior but cannot add this metadata durability barrier.
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
     fs::File::open(path)?.sync_all()?;
@@ -548,5 +553,15 @@ mod tests {
             serde_json::from_str::<OpencodeDatabaseState>(&round_trip).unwrap(),
             database
         );
+    }
+
+    #[test]
+    fn state_save_creates_a_missing_parent_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state").join("ingest.json");
+
+        IngestState::default().save(&path).expect("save state");
+
+        assert_eq!(IngestState::load(&path).expect("load state").next_doc_id, 1);
     }
 }

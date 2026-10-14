@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct StatsReport {
     index: String,
     documents: usize,
+    segments: usize,
+    index_bytes: u64,
     vectors: VectorStats,
     vector_backfill: Option<BackfillStatus>,
     memory: MemoryStats,
@@ -80,6 +82,8 @@ fn build_report(paths: &Paths) -> Result<StatsReport> {
     Ok(StatsReport {
         index: paths.index.display().to_string(),
         documents: index.doc_count()?,
+        segments: index.segment_count()?,
+        index_bytes: super::observed_directory_size(&paths.index),
         vectors: read_vector_stats(&paths.vectors)?,
         vector_backfill: vector_backfill::status(paths)?,
         memory: MemoryStats {
@@ -123,6 +127,8 @@ fn build_report(paths: &Paths) -> Result<StatsReport> {
 fn print_report(report: &StatsReport, out: &mut impl Write) -> Result<()> {
     writeln!(out, "index: {}", report.index)?;
     writeln!(out, "documents: {}", report.documents)?;
+    writeln!(out, "segments: {}", report.segments)?;
+    writeln!(out, "index storage: {} bytes", report.index_bytes)?;
     if let Some(status) = &report.vector_backfill {
         writeln!(out, "{}", status.line())?;
     }

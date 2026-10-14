@@ -1288,7 +1288,7 @@ pub(super) fn record_channel() -> (Sender<Record>, Receiver<Record>) {
 
 pub(super) fn parser_thread_pool() -> Result<rayon::ThreadPool> {
     build_parser_thread_pool(
-        std::thread::available_parallelism().map_or(1, |count| count.get().min(8)),
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(4)),
     )
 }
 
@@ -1370,6 +1370,8 @@ pub(super) fn execute_refresh(
     pool: &rayon::ThreadPool,
 ) -> Result<IngestReport> {
     let discovery::PreparedRefresh {
+        records_pruned,
+        files_pruned,
         full_scan,
         scan_cache,
         mut state,
@@ -1449,6 +1451,8 @@ pub(super) fn execute_refresh(
         };
         state.commit_final(cache, pending)?;
         return Ok(IngestReport {
+            records_pruned,
+            files_pruned,
             records_added: 0,
             records_embedded: 0,
             files_scanned,
@@ -1459,38 +1463,37 @@ pub(super) fn execute_refresh(
         });
     }
 
-    let mut vector_migration = vector_migration(&paths.vectors, &tasks, &options.model);
-    if recover_embeddings
-        && !options.embeddings
+    let mut model = options.model.clone();
+    if (recover_embeddings || tasks.iter().any(FileTask::parser_version_invalidated))
         && crate::vector::VectorIndex::exists(&paths.vectors)
-        && let Some(model) = crate::vector::VectorIndex::open(&paths.vectors)?
+        && let Some(existing_model) = crate::vector::VectorIndex::open(&paths.vectors)?
             .model()
             .and_then(|model| ModelChoice::parse(model).ok())
     {
-        vector_migration.model = model;
+        model = existing_model;
     }
+    // Parser changes replace only their own records; unrelated vectors remain valid.
     let mut embedding_recovery = recover_embeddings;
-    if vector_migration.model.is_remote() && options.embed_runtime.remote.is_none() {
+    if model.is_remote() && options.embed_runtime.remote.is_none() {
         if options.embeddings {
             // The configured local model replaces the remote vectors.
-            vector_migration.model = options.model.clone();
+            model = options.model.clone();
         } else {
             static REMOTE_VECTORS_WARNING: std::sync::Once = std::sync::Once::new();
             REMOTE_VECTORS_WARNING.call_once(|| {
                 eprintln!(
                     "warning: vectors use remote embedding model {}, which cannot be maintained \
                      without a remote endpoint; skipping embedding",
-                    vector_migration.model.identity()
+                    model.identity()
                 );
             });
             // Re-parsed and deleted files still lose their vectors through
             // `vector_delete_paths`, and their records get new doc IDs, so no stale
             // vector stays reachable; `memex embed` with an endpoint fills the gap.
-            vector_migration.rebuild = false;
             embedding_recovery = false;
         }
     }
-    let embeddings = options.embeddings || vector_migration.rebuild || embedding_recovery;
+    let embeddings = options.embeddings || embedding_recovery;
     let vector_publication = embeddings
         || reconcile_pending_vector_ids
         || ((recover_vector_cleanup
@@ -1559,14 +1562,12 @@ pub(super) fn execute_refresh(
         defer_merges: options.defer_merges,
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
-            || vector_migration.rebuild
             || embedding_recovery
             || (embeddings && vector_work),
-        reset_vector_store: vector_migration.rebuild,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_db.clone(),
         progress: progress.clone(),
-        model: vector_migration.model,
+        model,
         embed_runtime: options.embed_runtime.clone(),
         tool_content_limits: options.tool_content_limits,
         reconcile_vector_ids: reconcile_pending_vector_ids,
@@ -1728,6 +1729,8 @@ pub(super) fn execute_refresh(
         state.commit_final(cache, pending)?;
 
         Ok(IngestReport {
+            records_pruned,
+            files_pruned,
             records_added,
             records_embedded,
             files_scanned,

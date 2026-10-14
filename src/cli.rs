@@ -2,7 +2,10 @@ use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::{IndexRevision, QueryOptions, SearchIndex};
-use crate::ingest::{IngestOptions, ingest_all, ingest_dirty};
+use crate::ingest::{
+    IngestOptions, PruneOptions, ingest_all, ingest_dirty, preview_missing_paths,
+    prune_missing_paths,
+};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     BoundedRecord, LocatedMemoryHit, LocatedRecord, MAX_HYDRATE_INPUT_BYTES,
@@ -228,6 +231,9 @@ struct IndexArgs {
     /// `exclude_paths` in ~/.memex/config.toml.
     #[arg(long = "exclude", value_name = "GLOB", help_heading = "Sources")]
     exclude: Vec<String>,
+    /// Keep records whose source files were removed
+    #[arg(long)]
+    no_prune: bool,
 }
 
 /// `memex sessions` arguments. A separate struct keeps their parser builders out of the
@@ -359,6 +365,22 @@ EXAMPLES:
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// Remove records whose source paths no longer exist, without rebuilding the corpus
+    #[command(after_help = "\
+EXAMPLES:
+    memex prune                 # Preview missing paths and affected records
+    memex prune --apply         # Delete them and invalidate any partial embedding backfill
+    memex prune --no-codex      # Preview all enabled sources except Codex")]
+    Prune {
+        #[command(flatten)]
+        prune: PruneArgs,
+        /// Explicitly request preview mode (also the default)
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Apply deletions and invalidate any partial embedding backfill
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
     },
     /// Search indexed conversation history and memory
     #[command(after_help = "\
@@ -1426,6 +1448,13 @@ pub fn run() -> Result<()> {
         } => run_index_gc(root, dry_run, offline)?,
         Commands::Embed { model, root } => {
             run_embed(model, root)?;
+        }
+        Commands::Prune {
+            prune,
+            dry_run: _,
+            apply,
+        } => {
+            run_prune(prune, apply)?;
         }
         Commands::Search {
             query,
@@ -2723,6 +2752,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
+        prune_missing: !index.no_prune,
         model: model_choice,
         embed_runtime,
         tool_content_limits,
@@ -5689,6 +5719,14 @@ fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
     let store = AnalyticsStore::open(&db)?;
     println!("analytics: {}", db.display());
     println!("documents: {}", index.doc_count()?);
+    println!("segments: {}", index.segment_count()?);
+    println!(
+        "index storage: {} bytes",
+        observed_directory_size(&paths.index)
+    );
+    if let Some(status) = crate::vector_backfill::status(&paths)? {
+        println!("{}", status.line());
+    }
     println!("sessions: {}", store.session_count()?);
     Ok(())
 }
@@ -7392,6 +7430,9 @@ fn build_index_command_args(
     if index.diagnostics {
         args.push("--diagnostics".to_string());
     }
+    if index.no_prune {
+        args.push("--no-prune".to_string());
+    }
     if continuous && watch_mode == WatchMode::Poll {
         args.push("--watch-mode".to_string());
         args.push("poll".to_string());
@@ -8638,6 +8679,38 @@ mod tests {
     }
 
     #[test]
+    fn personal_cli_paths_survive_upstream_surface_changes() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "sessions",
+            "--machine",
+            "local",
+            "--machine",
+            "peer",
+            "--origin",
+            "subagent",
+        ])
+        .unwrap();
+        let Some(Commands::Sessions(SessionsArgs {
+            machine, origin, ..
+        })) = cli.command
+        else {
+            panic!("sessions");
+        };
+        assert_eq!(machine, ["local", "peer"]);
+        assert!(matches!(origin, SessionOrigin::Subagent));
+        let cli = Cli::try_parse_from(["memex", "index", "--no-prune", "--no-embeddings"]).unwrap();
+        let Some(Commands::Index { index, .. }) = cli.command else {
+            panic!("index");
+        };
+        assert!(index.no_prune);
+        assert_eq!(
+            build_embed_command_args(&index, &ModelChoice::bge_small()),
+            ["embed", "--model", "bge"]
+        );
+    }
+
+    #[test]
     fn activity_cli_validates_ranges_metrics_and_filter_arguments() {
         for range in ["24h", "7d", "30d", "all"] {
             for metric in ["sessions", "tokens"] {
@@ -9044,6 +9117,7 @@ mod tests {
     #[test]
     fn build_index_command_args_preserves_disabled_sources() {
         let index = IndexArgs {
+            no_prune: false,
             only_source: Vec::new(),
             exclude_source: Vec::new(),
             source: Vec::new(),
@@ -9116,6 +9190,7 @@ mod tests {
     #[test]
     fn build_index_command_args_forwards_exclude_patterns() {
         let index = IndexArgs {
+            no_prune: false,
             only_source: Vec::new(),
             exclude_source: Vec::new(),
             source: Vec::new(),
@@ -9181,6 +9256,7 @@ mod tests {
     #[test]
     fn build_index_command_args_includes_web_ui_options() {
         let index = IndexArgs {
+            no_prune: false,
             only_source: Vec::new(),
             exclude_source: Vec::new(),
             source: Vec::new(),
@@ -9248,6 +9324,7 @@ mod tests {
     #[test]
     fn build_index_command_args_emits_poll_mode_without_watch() {
         let index = IndexArgs {
+            no_prune: false,
             only_source: Vec::new(),
             exclude_source: Vec::new(),
             source: Vec::new(),
@@ -10550,6 +10627,115 @@ arguments = {
         let error = parse_systemd_unit_state("memex-index.service", &unavailable).unwrap_err();
         assert!(error.to_string().contains("Failed to connect to bus"));
     }
+}
+
+fn observed_directory_size(path: &std::path::Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn run_prune(args: PruneArgs, apply: bool) -> Result<()> {
+    let paths = Paths::new(args.root)?;
+    if !SearchIndex::exists(&paths.index) {
+        return Err(anyhow!(
+            "memex index not found at {}; run `memex index` first",
+            paths.index.display()
+        ));
+    }
+    let options = PruneOptions {
+        claude_sources: if args.source.is_empty() {
+            UserConfig::load(&paths)?.claude_sources()
+        } else {
+            args.source
+        },
+        include_agents: args.include_agents,
+        include_codex: !args.no_codex,
+        include_opencode: !args.no_opencode,
+        include_cursor: !args.no_cursor,
+        include_pi: !args.no_pi,
+        include_omp: !args.no_omp,
+        include_openclaw: !args.no_openclaw,
+        include_copilot: !args.no_copilot,
+    };
+    let report = if apply {
+        let ingest_lease = IngestLease::acquire(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
+        let embedding_lease =
+            IngestLease::acquire_embedding(&paths, "prune", INGEST_LEASE_TIMEOUT)?;
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+        let report =
+            prune_missing_paths(&paths, &index, &options, &ingest_lease, &embedding_lease)?;
+        if !report.source_paths.is_empty() {
+            index.publish_generation()?;
+        }
+        report
+    } else {
+        let index = SearchIndex::open_or_create(&paths.index)?;
+        preview_missing_paths(&paths, &index, &options)?
+    };
+    if report.source_paths.is_empty() {
+        println!("no missing indexed paths found beneath readable source roots");
+        return Ok(());
+    }
+
+    if apply {
+        println!(
+            "pruned {} records from {} missing paths:",
+            report.records,
+            report.source_paths.len()
+        );
+    } else {
+        println!(
+            "would prune {} records from {} missing paths:",
+            report.records,
+            report.source_paths.len()
+        );
+    }
+    for source_path in report.source_paths {
+        println!("  {source_path}");
+    }
+    if !apply {
+        println!("rerun with --apply to delete these records without rebuilding the corpus");
+    }
+    Ok(())
+}
+
+#[derive(Args, Debug, Clone)]
+struct PruneArgs {
+    /// Claude projects directory (repeatable) [default: as for `memex index`]
+    #[arg(long)]
+    source: Vec<PathBuf>,
+    /// Include missing Claude Code subagent transcript paths
+    #[arg(long)]
+    include_agents: bool,
+    /// Skip pruning Codex paths
+    #[arg(long = "no-codex")]
+    no_codex: bool,
+    /// Skip pruning OpenCode paths
+    #[arg(long = "no-opencode")]
+    no_opencode: bool,
+    /// Skip pruning Cursor paths
+    #[arg(long = "no-cursor")]
+    no_cursor: bool,
+    /// Skip pruning Pi paths
+    #[arg(long = "no-pi")]
+    no_pi: bool,
+    /// Skip pruning Oh My Pi paths
+    #[arg(long = "no-omp")]
+    no_omp: bool,
+    /// Skip pruning OpenClaw paths
+    #[arg(long = "no-openclaw")]
+    no_openclaw: bool,
+    /// Skip pruning GitHub Copilot CLI paths
+    #[arg(long = "no-copilot")]
+    no_copilot: bool,
+    /// Path to memex data directory [default: ~/.memex]
+    #[arg(long)]
+    root: Option<PathBuf>,
 }
 
 #[cfg(test)]

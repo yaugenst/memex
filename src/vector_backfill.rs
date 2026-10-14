@@ -214,6 +214,16 @@ impl BackfillStore {
         Ok(())
     }
 
+    fn update_scope(&mut self, total: u64, base_completed: u64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE backfill_meta
+             SET total = ?1, base_completed = ?2, updated_at_ms = ?3
+             WHERE id = 1",
+            params![total as i64, base_completed as i64, now_ms() as i64],
+        )?;
+        Ok(())
+    }
+
     fn ids(&self) -> Result<HashSet<u64>> {
         let count =
             self.connection
@@ -413,6 +423,53 @@ pub(crate) fn needs_work(
     Ok(inventory
         .map(|inventory| inventory.doc_ids != live_ids)
         .unwrap_or(!live_ids.is_empty()))
+}
+
+/// Remove deleted records from a durable in-progress backfill and refresh its totals.
+/// Callers must hold the embedding lease.
+pub fn reconcile(paths: &Paths, index: &SearchIndex) -> Result<()> {
+    let path = backfill_path(paths);
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut store = BackfillStore::open(path)?;
+    let Some(meta) = store.meta()? else {
+        return Ok(());
+    };
+    let live_ids = live_embeddable_ids(index)?;
+    let active_ids = VectorIndex::inventory(&paths.vectors)?
+        .filter(|inventory| {
+            inventory.dimensions == meta.dimensions
+                && inventory.model.as_deref() == Some(meta.model.as_str())
+        })
+        .map(|inventory| inventory.doc_ids)
+        .unwrap_or_default();
+    store.retain_pending(&live_ids, &active_ids)?;
+    let base_completed = live_ids.intersection(&active_ids).count() as u64;
+    store.update_scope(live_ids.len() as u64, base_completed)?;
+    Ok(())
+}
+
+/// Remove deleted records from the active generation and discard any partial generation.
+///
+/// A checkpoint stores staged vectors and aggregate progress but not its complete input scope.
+/// Once lexical records are removed, adjusting its totals without rescanning the full corpus can
+/// misclassify unprocessed records. Dropping the checkpoint is conservative: the next backfill
+/// resumes from every vector still present in the active generation.
+///
+/// Callers must hold the embedding lease so a backfill cannot publish between vector removal and
+/// checkpoint invalidation.
+pub(crate) fn prune_deleted(
+    paths: &Paths,
+    doc_ids: &HashSet<u64>,
+    _embedding_lease: &IngestLease,
+) -> Result<usize> {
+    let removed = VectorIndex::remove_ids(&paths.vectors, doc_ids)?;
+    let checkpoint = backfill_path(paths);
+    if checkpoint.exists() {
+        remove_sqlite_files(&checkpoint)?;
+    }
+    Ok(removed)
 }
 
 pub fn run(
@@ -751,6 +808,19 @@ fn format_duration(seconds: u64) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn seed_checkpoint_for_test(
+    paths: &Paths,
+    model: &str,
+    dimensions: usize,
+    rows: &[(u64, Vec<f32>)],
+) -> Result<()> {
+    let mut store = BackfillStore::open(backfill_path(paths))?;
+    store.prepare(model, dimensions, rows.len() as u64, 0)?;
+    store.checkpoint(rows)?;
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Record, RecordLinks, SourceKind};
@@ -975,6 +1045,41 @@ mod tests {
             .filter(|doc_id| doc_id % 4 == 2)
             .collect::<HashSet<_>>();
         assert_eq!(store.ids().unwrap(), expected);
+    }
+
+    #[test]
+    fn reconcile_discards_deleted_staged_vectors_and_updates_progress() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "live.jsonl"))
+            .unwrap();
+        index
+            .add_record(&mut writer, &test_record(2, "deleted.jsonl"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+
+        let mut store = BackfillStore::open(backfill_path(&paths)).unwrap();
+        store.prepare("test", 4, 2, 0).unwrap();
+        store
+            .checkpoint(&[(1, test_vector(1.0)), (2, test_vector(2.0))])
+            .unwrap();
+        drop(store);
+
+        let mut writer = index.writer().unwrap();
+        index.delete_by_source_path(&mut writer, "deleted.jsonl");
+        writer.commit().unwrap();
+        reconcile(&paths, &index).unwrap();
+
+        let store = BackfillStore::open(backfill_path(&paths)).unwrap();
+        let status = store.status().unwrap().unwrap();
+        assert_eq!(status.total, 1);
+        assert_eq!(status.completed, 1);
+        assert_eq!(store.ids().unwrap(), HashSet::from([1]));
     }
 
     #[test]

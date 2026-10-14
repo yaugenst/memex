@@ -6,9 +6,7 @@ use super::execution::{
     RecordSender, build_parser_thread_pool, execute_refresh, finish_file_task, parse_claude_file,
     parse_codex_session, parse_copilot_session, parse_pi_file, record_channel,
 };
-use super::publication::{
-    open_vector_index_for_ingest, prepare_pending_ingest_recovery, recover_checkpoint,
-};
+use super::publication::{prepare_pending_ingest_recovery, recover_checkpoint};
 use crate::analytics::backfill_from_index;
 
 fn run_writer_fixture(
@@ -36,6 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
     IngestOptions {
+        prune_missing: true,
         claude_sources: vec![PathBuf::from("/does/not/exist")],
         exclude_patterns: Vec::new(),
         include_agents: false,
@@ -607,7 +606,14 @@ fn assert_recovers_vector_crash(publish_interrupted_vectors: bool, embedding_pub
     let vectors = VectorIndex::inventory(&paths.vectors)
         .expect("recovered vector inventory")
         .expect("recovered vectors");
-    assert_eq!(vectors.doc_ids, HashSet::from([records[0].doc_id]));
+    assert_eq!(
+        vectors.doc_ids,
+        if embedding_publication {
+            HashSet::from([records[0].doc_id])
+        } else {
+            HashSet::new()
+        }
+    );
     assert!(!vectors.doc_ids.contains(&99));
     assert_eq!(
         fs::read_dir(paths.vectors.join("generations"))
@@ -948,7 +954,6 @@ fn cancelled_writer_does_not_publish_staged_records() {
         defer_merges: false,
         embeddings: false,
         do_backfill_embeddings: false,
-        reset_vector_store: false,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_path(&paths.state),
         progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false)),
@@ -1025,7 +1030,6 @@ fn checkpoint_only_writer_skips_embedding_initialization() {
             input_bytes: Some(0),
             embeddings: true,
             do_backfill_embeddings: false,
-            reset_vector_store: false,
             vector_dir: paths.vectors.clone(),
             analytics_path: analytics_path(&paths.state),
             progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
@@ -1163,7 +1167,6 @@ fn parser_cancellation_preserves_active_vectors() {
         defer_merges: false,
         embeddings: true,
         do_backfill_embeddings: false,
-        reset_vector_store: true,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_path(&paths.state),
         progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
@@ -2820,56 +2823,6 @@ fn grown_jcode_file_reparses_atomically_instead_of_resuming() {
 }
 
 #[test]
-fn parser_version_migration_rebuilds_vectors_with_the_existing_model() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-    save_vector_store(&paths, "bge", 384);
-    let transcript = tmp.path().join("session.jsonl");
-    fs::write(&transcript, "{}\n").expect("transcript");
-    let mut task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
-    task.change = FileChange::ParserChanged;
-
-    let migration = vector_migration(&paths.vectors, &[task], &ModelChoice::gemma());
-
-    assert!(migration.rebuild);
-    assert_eq!(migration.model, ModelChoice::bge_small());
-}
-
-#[test]
-fn ordinary_file_replacement_does_not_rebuild_the_vector_store() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-    save_vector_store(&paths, "bge", 384);
-    let transcript = tmp.path().join("session.jsonl");
-    fs::write(&transcript, "{}\n").expect("transcript");
-    let task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
-
-    let migration = vector_migration(&paths.vectors, &[task], &ModelChoice::gemma());
-
-    assert!(!migration.rebuild);
-    assert_eq!(migration.model, ModelChoice::gemma());
-}
-
-#[test]
-fn parser_rebuild_keeps_published_vectors_until_replacement_is_saved() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-    save_vector_store(&paths, "bge", 384);
-
-    let replacement =
-        open_vector_index_for_ingest(&paths.vectors, 384, &ModelChoice::bge_small(), true)
-            .expect("start replacement");
-
-    assert!(replacement.is_empty());
-    assert_eq!(
-        crate::vector::VectorIndex::open(&paths.vectors)
-            .expect("published vectors")
-            .len(),
-        1
-    );
-}
-
-#[test]
 fn ingest_claude_records_preserve_sidechain_and_tool_links() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let claude_root = tmp.path().join("claude-projects");
@@ -2890,6 +2843,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
     let index = SearchIndex::open_or_create(&paths.index).expect("index");
     let options = IngestOptions {
         include_kiro: false,
+        prune_missing: true,
         claude_sources: vec![claude_root],
         exclude_patterns: Vec::new(),
         include_agents: false,
@@ -3669,6 +3623,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
     let index = SearchIndex::open_or_create(&paths.index).expect("index");
     let options = IngestOptions {
         include_kiro: false,
+        prune_missing: true,
         claude_sources: vec![tmp.path().join("missing-claude")],
         exclude_patterns: Vec::new(),
         include_agents: false,
@@ -4484,7 +4439,6 @@ fn writer_loop_accepts_copilot_source_progress() {
         defer_merges: false,
         embeddings: false,
         do_backfill_embeddings: false,
-        reset_vector_store: false,
         vector_dir,
         analytics_path: tmp.path().join("state").join("analytics.sqlite"),
         progress,
@@ -5829,7 +5783,7 @@ fn bob_recovery_keeps_history_while_its_database_is_unreadable() {
 }
 
 #[test]
-fn cleanup_recovery_restores_reparsed_survivor_vectors() {
+fn cleanup_recovery_defers_reparsed_vectors_without_starting_inference() {
     assert_recovers_vector_crash(false, false);
     assert_recovers_vector_crash(true, false);
 }
@@ -6891,6 +6845,292 @@ fn zcode_migrates_database_checkpoint_and_honors_session_exclusions() {
     options.exclude_patterns = vec![database.to_string_lossy().into_owned()];
     run(&options);
     assert!(indexed_texts(&paths).is_empty());
+}
+
+fn claude_prune_fixture(
+    temporary: &tempfile::TempDir,
+) -> (Paths, PathBuf, PathBuf, SearchIndex, IngestOptions) {
+    let claude_root = temporary.path().join("claude-projects");
+    let project_root = claude_root.join("-tmp-project");
+    fs::create_dir_all(&project_root).expect("create Claude project");
+    let transcript = project_root.join("session.jsonl");
+    fs::write(
+        &transcript,
+        r#"{"type":"user","uuid":"u1","sessionId":"prune-session","timestamp":"2026-08-08T10:00:00Z","message":{"content":"keep this searchable"}}
+"#,
+    )
+    .expect("write Claude transcript");
+    let paths = Paths::new(Some(temporary.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure paths");
+    let index = SearchIndex::open_or_create(&paths.index).expect("index");
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![claude_root.clone()];
+    (paths, claude_root, transcript, index, options)
+}
+
+#[test]
+fn incremental_ingest_prunes_a_confirmed_missing_path() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+    {
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+        assert_eq!(report.records_added, 1);
+    }
+    assert_eq!(index.doc_count().expect("document count"), 1);
+
+    fs::remove_file(&transcript).expect("remove transcript");
+    let report = {
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &index, &options, &lease).expect("pruning ingest")
+    };
+
+    assert_eq!(report.files_pruned, 1);
+    assert_eq!(report.records_pruned, 1);
+    assert_eq!(index.doc_count().expect("document count"), 0);
+    let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
+    assert!(
+        !state
+            .files
+            .contains_key(&transcript.to_string_lossy().to_string())
+    );
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+    assert_eq!(analytics.session_count().expect("session count"), 0);
+}
+
+#[test]
+fn unavailable_source_root_does_not_authorize_pruning() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let (paths, claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+    {
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+    }
+
+    fs::remove_dir_all(&claude_root).expect("remove unavailable source root");
+    let report = {
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &index, &options, &lease).expect("safe ingest")
+    };
+
+    assert_eq!(report.files_pruned, 0);
+    assert_eq!(report.records_pruned, 0);
+    assert_eq!(index.doc_count().expect("document count"), 1);
+    let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
+    assert!(
+        state
+            .files
+            .contains_key(&transcript.to_string_lossy().to_string())
+    );
+}
+
+#[test]
+fn operator_prune_removes_vectors_and_invalidates_partial_backfill() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let (paths, _claude_root, transcript, index, options) = claude_prune_fixture(&temporary);
+    let survivor = transcript.with_file_name("survivor.jsonl");
+    fs::write(
+        &survivor,
+        r#"{"type":"user","uuid":"u2","sessionId":"survivor-session","timestamp":"2026-08-08T11:00:00Z","message":{"content":"survivor remains searchable"}}
+"#,
+    )
+    .expect("write survivor transcript");
+    {
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &index, &options, &lease).expect("initial ingest");
+    }
+    let target_doc_id = index
+        .doc_ids_by_source_path(&transcript.to_string_lossy())
+        .expect("document IDs")[0];
+    let survivor_doc_id = index
+        .doc_ids_by_source_path(&survivor.to_string_lossy())
+        .expect("survivor document IDs")[0];
+    let mut vectors =
+        VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).expect("vectors");
+    vectors
+        .add(target_doc_id, &vec![0.0; 384])
+        .expect("add target vector");
+    vectors
+        .add(survivor_doc_id, &vec![0.1; 384])
+        .expect("add survivor vector");
+    vectors.save().expect("save vectors");
+    drop(vectors);
+    crate::vector_backfill::seed_checkpoint_for_test(
+        &paths,
+        "bge",
+        384,
+        &[(target_doc_id, vec![0.2; 384])],
+    )
+    .expect("seed backfill checkpoint");
+
+    assert_eq!(index.doc_count().expect("document count"), 2);
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+    assert_eq!(analytics.session_count().expect("session count"), 2);
+
+    fs::remove_file(&transcript).expect("remove transcript");
+    let prune_options = PruneOptions::from(&options);
+    // Preview is read-only and remains available while mutation leases are held elsewhere.
+    let held_ingest = ingest_lease(&paths);
+    let held_embedding =
+        IngestLease::acquire_embedding(&paths, "test embedding", Duration::from_secs(1))
+            .expect("acquire embedding lease");
+    let preview = preview_missing_paths(&paths, &index, &prune_options).expect("preview prune");
+    assert_eq!(preview.records, 1);
+    assert_eq!(preview.source_paths, vec![transcript.to_string_lossy()]);
+    assert_eq!(index.doc_count().expect("document count"), 2);
+    let vectors = VectorIndex::open(&paths.vectors).expect("vectors after preview");
+    assert!(vectors.contains(target_doc_id));
+    assert!(vectors.contains(survivor_doc_id));
+    assert!(crate::vector_backfill::status(&paths).unwrap().is_some());
+    drop(held_embedding);
+    drop(held_ingest);
+
+    let ingest_lease = ingest_lease(&paths);
+    let embedding_lease =
+        IngestLease::acquire_embedding(&paths, "test prune", Duration::from_secs(1))
+            .expect("acquire embedding lease");
+    let applied = prune_missing_paths(
+        &paths,
+        &index,
+        &prune_options,
+        &ingest_lease,
+        &embedding_lease,
+    )
+    .expect("apply prune");
+    assert_eq!(applied, preview);
+    assert_eq!(index.doc_count().expect("document count"), 1);
+    assert!(
+        index
+            .get_by_doc_id(target_doc_id)
+            .expect("pruned lexical record")
+            .is_none()
+    );
+    let survivor_record = index
+        .get_by_doc_id(survivor_doc_id)
+        .expect("survivor lexical record")
+        .expect("survivor remains in lexical index");
+    assert_eq!(survivor_record.source_path, survivor.to_string_lossy());
+
+    let vectors = VectorIndex::open(&paths.vectors).expect("reopen pruned vector generation");
+    assert!(!vectors.contains(target_doc_id));
+    assert!(vectors.contains(survivor_doc_id));
+    assert!(crate::vector_backfill::status(&paths).unwrap().is_none());
+
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+    assert_eq!(analytics.session_count().expect("session count"), 1);
+    let sessions = analytics
+        .query_sessions_detailed(None, None, None, None, None)
+        .expect("analytics sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, survivor_record.session_id);
+    assert_eq!(sessions[0].source_path, survivor.to_string_lossy());
+
+    let state = IngestState::load(&paths.state.join("ingest.json")).expect("state");
+    assert!(
+        !state
+            .files
+            .contains_key(&transcript.to_string_lossy().to_string())
+    );
+    assert!(
+        state
+            .files
+            .contains_key(&survivor.to_string_lossy().to_string())
+    );
+}
+
+#[test]
+fn parser_change_without_embeddings_preserves_unaffected_vectors_and_defers_new_ids() {
+    check_parser_change_preserves_unaffected_vectors(false);
+}
+
+#[test]
+#[ignore = "requires the BGE model; run explicitly for upstream integration"]
+fn parser_change_with_bge_embeds_only_replaced_records() {
+    check_parser_change_preserves_unaffected_vectors(true);
+}
+
+fn check_parser_change_preserves_unaffected_vectors(embeddings: bool) {
+    let temporary = tempfile::tempdir().unwrap();
+    let (paths, _, transcript, index, mut options) = claude_prune_fixture(&temporary);
+    let survivor = transcript.with_file_name("survivor.jsonl");
+    fs::write(&survivor, "{\"type\":\"user\",\"uuid\":\"u2\",\"sessionId\":\"survivor\",\"message\":{\"content\":\"unchanged\"}}\n").unwrap();
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let changed_id = index
+        .doc_ids_by_source_path(&transcript.to_string_lossy())
+        .unwrap()[0];
+    let survivor_id = index
+        .doc_ids_by_source_path(&survivor.to_string_lossy())
+        .unwrap()[0];
+    let unchanged_vector = vec![0.25; 384];
+    let mut vectors = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
+    vectors.add(changed_id, &vec![0.5; 384]).unwrap();
+    vectors.add(survivor_id, &unchanged_vector).unwrap();
+    vectors.save().unwrap();
+    drop(vectors);
+    let state_path = paths.state.join("ingest.json");
+    let mut state = IngestState::load(&state_path).unwrap();
+    state
+        .files
+        .get_mut(transcript.to_str().unwrap())
+        .unwrap()
+        .parser_version = 0;
+    state.save_with_lease(&state_path, &lease).unwrap();
+
+    options.embeddings = embeddings;
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(report.records_embedded, usize::from(embeddings));
+    let replacement_id = index
+        .doc_ids_by_source_path(&transcript.to_string_lossy())
+        .unwrap()[0];
+    assert!(replacement_id > changed_id.max(survivor_id));
+    let vectors = VectorIndex::open(&paths.vectors).unwrap();
+    assert!(!vectors.contains(changed_id));
+    assert_eq!(vectors.contains(replacement_id), embeddings);
+    assert_eq!(
+        vectors.embedding(survivor_id).unwrap().unwrap(),
+        unchanged_vector
+    );
+    assert_eq!(vectors.len(), 1 + usize::from(embeddings));
+    // Restarting ingestion must neither trigger inference nor clear the survivor.
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .unwrap()
+            .records_embedded,
+        0
+    );
+    assert_eq!(
+        VectorIndex::open(&paths.vectors).unwrap().len(),
+        1 + usize::from(embeddings)
+    );
+}
+
+#[test]
+fn empty_lexical_recovery_refuses_to_discard_existing_vectors() {
+    let temporary = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut state = IngestState::default();
+    state
+        .opencode_databases
+        .insert("old.db".into(), Default::default());
+    state.save(&paths.state.join("ingest.json")).unwrap();
+    save_vector_store(&paths, "bge", 384);
+    let before = fs::read(paths.vectors.join("current.json")).unwrap();
+    let index = open_search_index(&paths);
+    let error = ingest_all(
+        &paths,
+        &index,
+        &ingest_options(false, ModelChoice::bge_small()),
+        &ingest_lease(&paths),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("refusing to discard"));
+    assert_eq!(
+        fs::read(paths.vectors.join("current.json")).unwrap(),
+        before
+    );
+    assert_eq!(VectorIndex::open(&paths.vectors).unwrap().len(), 1);
 }
 
 #[test]

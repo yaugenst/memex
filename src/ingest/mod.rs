@@ -4,14 +4,16 @@ pub(crate) mod discovery;
 mod execution;
 pub mod journal;
 mod plan;
+mod prune;
 mod publication;
+pub use prune::{PruneOptions, PruneReport, preview_missing_paths, prune_missing_paths};
 mod selection;
 
 use checkpoint::CheckpointSession;
 pub(crate) use discovery::{PathExcluder, build_path_excluder};
 use discovery::{
     can_skip_fresh_scan, can_skip_noop_index, is_not_found, record_needs_embedding,
-    vector_index_covers_embeddable_records, vector_migration,
+    vector_index_covers_embeddable_records,
 };
 use execution::{
     cleanup_opencode_spools, flush_embeddings, is_embedding_role, limit_record_tool_content,
@@ -58,6 +60,7 @@ const RECORD_CHANNEL_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
+    pub prune_missing: bool,
     pub claude_sources: Vec<PathBuf>,
     pub include_agents: bool,
     pub include_reasoning: bool,
@@ -91,6 +94,8 @@ pub struct IngestOptions {
 
 #[derive(Debug)]
 pub struct IngestReport {
+    pub records_pruned: usize,
+    pub files_pruned: usize,
     pub records_added: usize,
     pub records_embedded: usize,
     pub files_scanned: usize,
@@ -178,7 +183,6 @@ struct WriterContext {
     input_bytes: Option<u64>,
     embeddings: bool,
     do_backfill_embeddings: bool,
-    reset_vector_store: bool,
     vector_dir: PathBuf,
     analytics_path: PathBuf,
     progress: Arc<Progress>,
@@ -208,12 +212,6 @@ enum WriterOutcome {
     },
     CheckpointsOnly,
     Cancelled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VectorMigration {
-    rebuild: bool,
-    model: ModelChoice,
 }
 
 /// Check if scan cache is fresh and vector state is usable; if so, skip indexing entirely.

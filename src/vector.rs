@@ -100,6 +100,22 @@ impl VectorIndex {
         Ok(())
     }
 
+    pub fn remove_ids(dir: &Path, doc_ids: &HashSet<u64>) -> Result<usize> {
+        if doc_ids.is_empty() {
+            return Ok(0);
+        }
+        let Some(storage) = active_storage(dir)? else {
+            return Ok(0);
+        };
+        let mut index = Self::open_active_snapshot(dir, storage)?;
+        let removed = index.doc_id_set.intersection(doc_ids).count();
+        index.remove_doc_ids(doc_ids)?;
+        if removed > 0 {
+            index.save()?;
+        }
+        Ok(removed)
+    }
+
     pub fn open_or_create(dir: &Path, dimensions: usize, model: Option<&str>) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let model = model.map(str::to_string);
@@ -720,6 +736,22 @@ mod tests {
     }
 
     #[test]
+    fn remove_ids_publishes_only_the_requested_deletions() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.add(2, &make_vector(4, 2.0)).unwrap();
+        idx.save().unwrap();
+
+        let removed = VectorIndex::remove_ids(tmp.path(), &HashSet::from([1, 3])).unwrap();
+
+        assert_eq!(removed, 1);
+        let reopened = VectorIndex::open(tmp.path()).unwrap();
+        assert!(!reopened.contains(1));
+        assert!(reopened.contains(2));
+    }
+
+    #[test]
     fn test_duplicate_add_ignored() {
         let tmp = TempDir::new().unwrap();
         let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
@@ -834,6 +866,7 @@ mod tests {
             assert!(idx.contains(100));
             assert!(idx.contains(200));
             assert!(!idx.contains(300));
+            assert_eq!(idx.len(), 2);
             assert_eq!(idx.dimensions(), 64);
 
             // Verify search still works

@@ -1,19 +1,5 @@
 use super::*;
 
-pub(super) fn open_vector_index_for_ingest(
-    vector_dir: &Path,
-    dimensions: usize,
-    model: &ModelChoice,
-    replace: bool,
-) -> Result<crate::vector::VectorIndex> {
-    let identity = model.identity();
-    if replace {
-        crate::vector::VectorIndex::empty_replacement(vector_dir, dimensions, Some(&identity))
-    } else {
-        crate::vector::VectorIndex::open_or_create(vector_dir, dimensions, Some(&identity))
-    }
-}
-
 pub(super) fn writer_loop(
     index: SearchIndex,
     rx: Receiver<Record>,
@@ -27,7 +13,6 @@ pub(super) fn writer_loop(
         && delete_paths.is_empty()
         && ctx.scope_targets.is_empty()
         && !ctx.do_backfill_embeddings
-        && !ctx.reset_vector_store
         && !ctx.reconcile_vector_ids
         && !writer_fast_path_needs_vectors(&index, &ctx)?
     {
@@ -56,7 +41,6 @@ pub(super) fn writer_loop(
         defer_merges: _,
         embeddings,
         do_backfill_embeddings,
-        reset_vector_store,
         vector_dir,
         analytics_path,
         progress,
@@ -107,11 +91,10 @@ pub(super) fn writer_loop(
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(&model, &embed_runtime)?;
         let dims = handle.dims;
-        vector_index = Some(open_vector_index_for_ingest(
+        vector_index = Some(crate::vector::VectorIndex::open_or_create(
             &vector_dir,
             dims,
-            &model,
-            reset_vector_store,
+            Some(&model.identity()),
         )?);
         embedder = Some(handle);
         progress.set_embed_ready();
@@ -140,7 +123,7 @@ pub(super) fn writer_loop(
         analytics.record(&record)?;
         #[cfg(feature = "profiling")]
         stamp("writer.analytics_us", &mut last_stamp);
-        let embed_text = (embeddings && !reset_vector_store && record_needs_embedding(&record))
+        let embed_text = (embeddings && record_needs_embedding(&record))
             .then(|| truncate_for_embedding(record.text.clone()));
         let (doc_id, source) = (record.doc_id, record.source);
         index.add_record_owned(&mut writer, record)?;

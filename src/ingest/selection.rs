@@ -585,6 +585,7 @@ mod tests {
 
     fn options() -> IngestOptions {
         IngestOptions {
+            prune_missing: true,
             claude_sources: Vec::new(),
             include_agents: false,
             include_reasoning: false,

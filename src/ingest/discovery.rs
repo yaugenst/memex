@@ -1654,6 +1654,8 @@ pub(crate) fn build_path_excluder(options: &IngestOptions) -> Result<PathExclude
 }
 
 pub(super) struct PreparedRefresh {
+    pub records_pruned: usize,
+    pub files_pruned: usize,
     pub full_scan: bool,
     pub scan_cache: Option<ScanCache>,
     pub state: CheckpointSession,
@@ -2014,44 +2016,20 @@ pub(super) fn prepare_refresh(
     let opencode_database_outcomes = opencode.database_outcomes;
     let opencode_legacy_paths_to_delete = opencode.legacy_paths_to_delete;
 
-    // Discovery inventories can be incomplete when a source is disabled or a root is
-    // unavailable, so absence from discovery never removes state on its own. A direct
-    // NotFound confirms removal only while the file's immediate container is still
-    // readable: otherwise one unavailable ancestor looks like every transcript under it
-    // was deleted individually. A Claude transcript found at the same relative path under
-    // another readable root also confirms a move, even when its old config directory is gone.
-    let mut missing_state_paths = Vec::new();
-    if full_scan {
-        let claude_roots = options
-            .claude_sources
-            .iter()
-            .filter(|root| root.is_dir() && std::fs::read_dir(root).is_ok())
-            .collect::<Vec<_>>();
-        for path in state.file_keys()? {
-            let confirmed_missing = match Path::new(&path).metadata() {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let path = Path::new(&path);
-                    path.parent()
-                        .is_some_and(|parent| parent.metadata().is_ok_and(|meta| meta.is_dir()))
-                        || crate::sources::claude::project_relative_path(path).is_some_and(
-                            |relative| {
-                                claude_roots.iter().any(|root| {
-                                    !path.starts_with(root) && root.join(&relative).is_file()
-                                })
-                            },
-                        )
-                }
-                _ => false,
-            };
-            if confirmed_missing {
-                state.delete_file(&path);
-                missing_state_paths.push(path);
-            }
-        }
+    let mut missing_state_paths = if full_scan && options.prune_missing {
+        let prune_options = prune::PruneOptions::from(options);
+        prune::missing_state_paths(state.file_keys()?, &prune_options)
+    } else {
+        Vec::new()
+    };
+    for path in &missing_state_paths {
+        state.delete_file(path);
     }
     missing_state_paths.extend(bob_missing_paths);
     missing_state_paths.extend(zcode.missing_paths);
     missing_state_paths.extend(kilocode.missing_paths);
+    let files_pruned = missing_state_paths.len();
+    let records_pruned = index.count_by_source_paths(&missing_state_paths)?;
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
@@ -2074,28 +2052,12 @@ pub(super) fn prepare_refresh(
         HashMap::new()
     };
 
-    // Markers written before `embedding_publication` existed recorded every vector
-    // publication as an embedding publication; preserve that recovery behavior. Pure
-    // deletion recovery needs no model, but a mixed batch can also replay surviving files
-    // under new document IDs, so restore their vector coverage before live-ID
-    // reconciliation discards the previous IDs.
+    // Resume inference only if the interrupted operation requested it. A lexical-only
+    // reparse may remove obsolete IDs, but leaves new IDs for the resumable backfill.
     let recover_embeddings = pending_recovery.as_ref().is_some_and(|pending| {
         pending
             .embedding_publication
             .unwrap_or(pending.vector_publication)
-            || (pending.vector_publication
-                && crate::vector::VectorIndex::exists(&paths.vectors)
-                && tasks.iter().any(|task| {
-                    let path = task.path.to_string_lossy();
-                    pending
-                        .source_paths
-                        .iter()
-                        .any(|source| source == path.as_ref())
-                        && !pending
-                            .vector_delete_paths
-                            .iter()
-                            .any(|source| source == path.as_ref())
-                }))
     });
     // Pure deletion recovery needs no embedder, but it still crossed the vector
     // publication boundary and must remove every vector that is no longer live.
@@ -2201,6 +2163,8 @@ pub(super) fn prepare_refresh(
     }
 
     Ok(PreparedRefresh {
+        records_pruned,
+        files_pruned,
         full_scan,
         scan_cache,
         state,
@@ -2306,26 +2270,4 @@ pub(super) fn vector_index_covers_embeddable_records(
 
 pub(super) fn record_needs_embedding(record: &Record) -> bool {
     is_embedding_role(&record.role) && crate::vector_backfill::has_embeddable_text(&record.text)
-}
-
-pub(super) fn vector_migration(
-    vector_dir: &Path,
-    tasks: &[FileTask],
-    configured_model: &ModelChoice,
-) -> VectorMigration {
-    let rebuild = tasks.iter().any(|task| task.parser_version_invalidated())
-        && crate::vector::VectorIndex::exists(vector_dir);
-    let model = if rebuild {
-        crate::vector::VectorIndex::open(vector_dir)
-            .ok()
-            .and_then(|index| {
-                index
-                    .model()
-                    .and_then(|model| ModelChoice::parse(model).ok())
-            })
-            .unwrap_or_else(|| configured_model.clone())
-    } else {
-        configured_model.clone()
-    };
-    VectorMigration { rebuild, model }
 }
