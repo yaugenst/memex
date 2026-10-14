@@ -39,11 +39,48 @@ impl Paths {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.index)?;
-        std::fs::create_dir_all(&self.vectors)?;
-        std::fs::create_dir_all(&self.state)?;
+        create_dir_all_durable(&self.index)?;
+        create_dir_all_durable(&self.vectors)?;
+        create_dir_all_durable(&self.state)?;
         Ok(())
     }
+}
+
+/// Create a directory hierarchy and durably publish every newly created directory entry.
+fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing = Vec::new();
+    let mut current = Some(path.as_path());
+    while let Some(directory) = current {
+        if directory.try_exists()? {
+            break;
+        }
+        missing.push(directory.to_path_buf());
+        current = directory.parent();
+    }
+
+    fs::create_dir_all(&path)?;
+    for directory in missing.iter().rev() {
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Claude Code `projects` directories named by the environment: the comma-separated
@@ -569,16 +606,17 @@ impl UserConfig {
     }
 
     pub fn resolve_execution_provider(&self) -> Result<ExecutionProviderChoice> {
+        match std::env::var("MEMEX_EXECUTION_PROVIDER") {
+            Ok(provider) => return ExecutionProviderChoice::parse(&provider),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(anyhow!("MEMEX_EXECUTION_PROVIDER is not valid unicode"));
+            }
+        }
         if let Some(provider) = self.execution_provider.as_deref() {
             return ExecutionProviderChoice::parse(provider);
         }
-        match std::env::var("MEMEX_EXECUTION_PROVIDER") {
-            Ok(provider) => ExecutionProviderChoice::parse(&provider),
-            Err(std::env::VarError::NotPresent) => Ok(ExecutionProviderChoice::Auto),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                Err(anyhow!("MEMEX_EXECUTION_PROVIDER is not valid unicode"))
-            }
-        }
+        Ok(ExecutionProviderChoice::Auto)
     }
 
     pub fn resolve_cuda_device_id(&self) -> Result<Option<i32>> {
@@ -1000,6 +1038,21 @@ mod tests {
     }
 
     #[test]
+    fn ensure_dirs_creates_a_nested_store_hierarchy() {
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(
+            temporary.path().join("new").join("parent").join("memex"),
+        ))
+        .expect("paths");
+
+        paths.ensure_dirs().expect("ensure durable directories");
+
+        assert!(paths.index.is_dir());
+        assert!(paths.vectors.is_dir());
+        assert!(paths.state.is_dir());
+    }
+
+    #[test]
     fn token_usage_is_disabled_by_default() {
         assert!(!UserConfig::default().token_usage_enabled());
     }
@@ -1200,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_execution_provider_prefers_config_over_env() {
+    fn resolve_execution_provider_prefers_env_over_config() {
         let _guard = env_lock();
         let _env = EnvVarGuard::set(&[("MEMEX_EXECUTION_PROVIDER", Some("cpu"))]);
         let config = UserConfig {
@@ -1211,7 +1264,7 @@ mod tests {
             config
                 .resolve_execution_provider()
                 .expect("resolve execution provider"),
-            ExecutionProviderChoice::Cuda
+            ExecutionProviderChoice::Cpu
         );
     }
 

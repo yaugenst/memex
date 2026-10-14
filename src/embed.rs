@@ -260,21 +260,12 @@ impl ExecutionProviderChoice {
         }
     }
 
+    /// Auto means CPU on every platform. With BGE on macOS, the CoreML provider's
+    /// memory footprint grew past 60 GB during backfill, so CoreML is explicit opt-in.
     fn effective(self) -> Self {
         match self {
-            Self::Auto => Self::default_for_platform(),
+            Self::Auto => Self::Cpu,
             other => other,
-        }
-    }
-
-    fn default_for_platform() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            Self::CoreML
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Self::Cpu
         }
     }
 }
@@ -681,12 +672,7 @@ fn init_options_with_coreml(
     let provider = CoreML::default()
         .with_subgraphs(true)
         .with_compute_units(compute_units);
-    let dispatch = if matches!(runtime.execution_provider, ExecutionProviderChoice::CoreML) {
-        provider.build().error_on_failure()
-    } else {
-        provider.build()
-    };
-    Ok(opts.with_execution_providers(vec![dispatch]))
+    Ok(opts.with_execution_providers(vec![provider.build().error_on_failure()]))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -711,7 +697,7 @@ fn init_options_with_cuda(opts: InitOptions, runtime: &EmbedRuntimeConfig) -> Re
     if !provider.is_available()? {
         return Err(anyhow!(
             "CUDA execution provider is not available; ensure this binary was built with \
-             `--features cuda` and that the required CUDA 12/cuDNN runtime libraries are installed"
+             `--features cuda` and that the required CUDA 13/cuDNN runtime libraries are installed"
         ));
     }
     Ok(opts.with_execution_providers(vec![provider.build().error_on_failure()]))
@@ -769,18 +755,15 @@ impl EmbedderHandle {
             }
             ModelChoice::Local(LocalModel::Fastembed(model_type)) => {
                 let dims = TextEmbedding::get_model_info(model_type)?.dim;
-                let requested_provider = runtime.execution_provider;
-                let effective_provider = requested_provider.effective();
+                let effective_provider = runtime.execution_provider.effective();
                 let opts = init_options_for_model(model_type.clone(), runtime)?;
                 let model = TextEmbedding::try_new(opts).map_err(|err| match effective_provider {
                     ExecutionProviderChoice::Cuda => anyhow!(
                         "failed to initialize CUDA execution provider: {err}. Ensure the binary was \
-                         built with `--features cuda` and the required CUDA 12/cuDNN libraries are \
+                         built with `--features cuda` and the required CUDA 13/cuDNN libraries are \
                          on the dynamic linker path (for example via LD_LIBRARY_PATH)"
                     ),
-                    ExecutionProviderChoice::CoreML
-                        if matches!(requested_provider, ExecutionProviderChoice::CoreML) =>
-                    {
+                    ExecutionProviderChoice::CoreML => {
                         anyhow!("failed to initialize CoreML execution provider: {err}")
                     }
                     _ => err,
@@ -929,10 +912,14 @@ mod tests {
                 | Some("potion-base-8m")
                 | Some("model2vec")
         );
+        let dimensions = embedder.dims;
+        // Exercise backend teardown before the test process exits. Backfill relies on this drop
+        // returning before it opens the complete vector generation.
+        drop(embedder);
         if is_potion {
-            assert!(embedder.dims > 0);
+            assert!(dimensions > 0);
         } else {
-            assert!(embedder.dims == 384 || embedder.dims == 768);
+            assert!(dimensions == 384 || dimensions == 768);
         }
     }
 
@@ -1279,6 +1266,14 @@ mod tests {
         assert_eq!(
             ExecutionProviderChoice::parse("cuda").expect("parse cuda"),
             ExecutionProviderChoice::Cuda
+        );
+    }
+
+    #[test]
+    fn test_auto_execution_provider_is_cpu() {
+        assert_eq!(
+            ExecutionProviderChoice::Auto.effective(),
+            ExecutionProviderChoice::Cpu
         );
     }
 
