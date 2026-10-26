@@ -35,6 +35,17 @@ parser changes and refusal to discard vectors during empty-index recovery.
 Validation: formatting, strict Clippy across all targets, and all 1,427 default
 tests passed (three ignored); the BGE regression above passed separately.
 
+### Mac deployment
+
+Built and installed the optimized v0.31.1 CLI at the existing stow target, keeping
+the service definition and configuration unchanged. With writers stopped, saved
+the previous binary and an APFS clone of the root. The new binary read the live
+index and completed semantic search without changing any of its 10,404 vectors
+or 3,067 cached memory-section embeddings. After restarting the service, all
+10,404 pre-install vectors still matched bit for bit; only three new vectors were
+added. Service status reported v0.31.1 running, ready, and matching the installed
+binary. No index rebuild or embedding import was performed.
+
 ## PR #250 and v0.28.0 (2026-10-14)
 
 Merged upstream through `c59f46f`, including the final multi-profile session and
