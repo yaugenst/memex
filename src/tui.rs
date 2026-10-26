@@ -422,6 +422,7 @@ enum SourceChoice {
     Kiro,
     Kilocode,
     Kimi,
+    Goose,
 }
 
 impl SourceChoice {
@@ -445,7 +446,8 @@ impl SourceChoice {
             SourceChoice::Zcode => SourceChoice::Kiro,
             SourceChoice::Kiro => SourceChoice::Kilocode,
             SourceChoice::Kilocode => SourceChoice::Kimi,
-            SourceChoice::Kimi => SourceChoice::All,
+            SourceChoice::Kimi => SourceChoice::Goose,
+            SourceChoice::Goose => SourceChoice::All,
         }
     }
 
@@ -470,6 +472,7 @@ impl SourceChoice {
             SourceChoice::Kiro => Some(SourceFilter::Kiro),
             SourceChoice::Kilocode => Some(SourceFilter::Kilocode),
             SourceChoice::Kimi => Some(SourceFilter::Kimi),
+            SourceChoice::Goose => Some(SourceFilter::Goose),
         }
     }
 
@@ -494,6 +497,7 @@ impl SourceChoice {
             SourceChoice::Kiro => "kiro",
             SourceChoice::Kilocode => "kilocode",
             SourceChoice::Kimi => "kimi",
+            SourceChoice::Goose => "goose",
         }
     }
 
@@ -517,6 +521,7 @@ impl SourceChoice {
             SourceKind::Kiro => SourceChoice::Kiro,
             SourceKind::Kilocode => SourceChoice::Kilocode,
             SourceKind::Kimi => SourceChoice::Kimi,
+            SourceKind::Goose => SourceChoice::Goose,
         }
     }
 }
@@ -898,6 +903,16 @@ impl StdIoRedirect {
     }
 }
 
+/// The freshness a TUI refresh runs under. `force` is the user asking for one, which runs as
+/// `strict` whatever `index_freshness` says; automatic refreshes follow `index_freshness`.
+fn index_refresh_freshness(config: &UserConfig, force: bool) -> Result<crate::ingest::Freshness> {
+    if force {
+        Ok(crate::ingest::Freshness::Strict)
+    } else {
+        config.index_freshness()
+    }
+}
+
 fn open_tui_index(paths: &Paths, auto_index: bool) -> Result<SearchIndex> {
     if SearchIndex::exists(&paths.index) {
         return SearchIndex::open_or_create(&paths.index);
@@ -918,7 +933,7 @@ pub fn run(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let auto_index = config.auto_index_on_search_default();
+    let auto_index = config.index_freshness()? != crate::ingest::Freshness::None;
     if auto_index {
         paths.ensure_dirs()?;
     }
@@ -1153,7 +1168,8 @@ impl App {
     }
 
     fn kickoff_index_refresh(&mut self, force: bool) {
-        if (!force && !self.config.auto_index_on_search_default())
+        let freshness = index_refresh_freshness(&self.config, force);
+        if matches!(freshness, Ok(crate::ingest::Freshness::None))
             || self.index_state == IndexState::Loading
         {
             return;
@@ -1189,6 +1205,7 @@ impl App {
                     include_zcode: true,
                     include_kilocode: true,
                     include_kimi: true,
+                    include_goose: true,
                     include_kiro: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
@@ -1209,14 +1226,7 @@ impl App {
                     Ok(index) if !index.is_writable() => index,
                     _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
                 };
-                ingest_if_stale(
-                    &paths,
-                    &index,
-                    &opts,
-                    config.scan_cache_ttl(),
-                    &lease,
-                    Some(journal),
-                )
+                ingest_if_stale(&paths, &index, &opts, freshness?, &lease, Some(journal))
             })();
             match result {
                 Ok(Some(report)) => {
@@ -2669,6 +2679,17 @@ impl App {
         if crate::herdr::inside_herdr() {
             let placement = crate::herdr::resume_placement(&self.config);
             if placement != crate::herdr::ResumePlacement::Off {
+                // Already open in a herdr pane: jump there instead of opening a duplicate.
+                if !remote
+                    && let Some(pane_id) = crate::herdr::pane_running_session(&session.session_id)
+                    && crate::herdr::focus_pane(&pane_id).is_ok()
+                {
+                    self.set_status(format!(
+                        "{} is already open; focused herdr pane {pane_id}",
+                        session.session_id
+                    ));
+                    return Ok(());
+                }
                 let herdr_cwd = (!remote).then_some(cwd.as_str());
                 match crate::herdr::open_resume_pane(
                     placement,
@@ -2734,6 +2755,7 @@ impl App {
             SourceKind::Kilocode => "kilocode",
             SourceKind::Kiro => "kiro",
             SourceKind::Kimi => "kimi",
+            SourceKind::Goose => "goose",
         };
         let source_path = session.source_path.clone();
 
@@ -4213,6 +4235,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Zcode => label == "zcode",
         SourceChoice::Kilocode => label == "kilocode",
         SourceChoice::Kimi => label == "kimi",
+        SourceChoice::Goose => label == "goose",
         SourceChoice::Kiro => label == "kiro",
         SourceChoice::All => false,
     }
@@ -4237,6 +4260,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Zcode => Color::Rgb(96, 222, 228),
         SourceKind::Kilocode => Color::Rgb(255, 122, 189),
         SourceKind::Kimi => Color::Rgb(86, 170, 255),
+        SourceKind::Goose => Color::Rgb(255, 173, 66),
         SourceKind::Kiro => Color::Rgb(180, 130, 240),
     }
 }
@@ -7351,6 +7375,32 @@ mod tests {
             },
         );
         (tmp, app)
+    }
+
+    #[test]
+    fn manual_refreshes_always_run_and_automatic_ones_follow_index_freshness() {
+        use crate::ingest::Freshness;
+        let off = UserConfig {
+            auto_index_on_search: Some(false),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            index_refresh_freshness(&off, false).unwrap(),
+            Freshness::None
+        );
+        assert_eq!(
+            index_refresh_freshness(&off, true).unwrap(),
+            Freshness::Strict
+        );
+        let bounded = UserConfig {
+            index_freshness: Some("bounded".to_string()),
+            scan_cache_ttl: Some(60),
+            ..off
+        };
+        assert_eq!(
+            index_refresh_freshness(&bounded, false).unwrap(),
+            Freshness::Bounded { ttl_seconds: 60 }
+        );
     }
 
     #[test]

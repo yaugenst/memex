@@ -12,7 +12,7 @@ use crate::machine::{
     MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
     SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_sessions,
     federated_usage, read_context, read_memory, read_record, read_session_pages,
-    session_page_context,
+    refresh_local_sessions, session_page_context,
 };
 use crate::memory::MemoryStore;
 use crate::memory_search::{
@@ -211,6 +211,12 @@ struct IndexArgs {
     /// Skip indexing Kimi Code CLI sessions
     #[arg(long = "no-kimi", default_value_t = false, hide = true)]
     no_kimi: bool,
+    /// Index goose sessions from ~/.local/share/goose/sessions/sessions.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    goose: bool,
+    /// Skip indexing goose sessions
+    #[arg(long = "no-goose", default_value_t = false, hide = true)]
+    no_goose: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -2748,6 +2754,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_zcode: index.source_enabled(IndexSource::Zcode),
         include_kilocode: index.source_enabled(IndexSource::Kilocode),
         include_kimi: index.source_enabled(IndexSource::Kimi),
+        include_goose: index.source_enabled(IndexSource::Goose),
         include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
@@ -3714,6 +3721,13 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             limit,
         } => {
             check_index(&machine)?;
+            if machine == crate::machine::LOCAL_MACHINE_ID {
+                refresh_local_sessions(
+                    paths,
+                    &config,
+                    [(session_id.as_str(), source_path.as_str())],
+                )?;
+            }
             let (records, page) = collect_session_page(
                 paths,
                 &config,
@@ -3745,6 +3759,13 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             max_chars,
         } => {
             check_index(&machine)?;
+            if machine == crate::machine::LOCAL_MACHINE_ID {
+                refresh_local_sessions(
+                    paths,
+                    &config,
+                    [(session_id.as_str(), source_path.as_str())],
+                )?;
+            }
             let (records, page) = collect_session_page(
                 paths,
                 &config,
@@ -4494,6 +4515,18 @@ fn run_hydrate(
             )
         })
         .collect();
+    // One refresh covers every local request; when a strict refresh fails, only the local
+    // pages report it.
+    let local_refresh = refresh_local_sessions(
+        &paths,
+        &config,
+        requests
+            .iter()
+            .filter(|(machine, _)| machine == crate::machine::LOCAL_MACHINE_ID)
+            .map(|(_, request)| (request.session_id.as_str(), request.source_path.as_str())),
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
     let mut writer = output.writer();
     let mut remaining = budget.remaining();
     let mut position = 0;
@@ -4508,6 +4541,15 @@ fn run_hydrate(
             .iter()
             .map(|(_, request)| request.clone())
             .collect();
+        if machine == crate::machine::LOCAL_MACHINE_ID
+            && let Some(error) = &local_refresh
+        {
+            for request in &batch {
+                writer.write(hydrate_error_value(machine, request, error)?)?;
+            }
+            position = end;
+            continue;
+        }
         match read_session_pages(&paths, &config, machine, &batch, remaining) {
             Ok(pages) => {
                 for page in pages {
@@ -4705,6 +4747,13 @@ fn run_session(args: SessionRunArgs) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let source_path = source_path.unwrap_or_default();
+    if machine == crate::machine::LOCAL_MACHINE_ID {
+        refresh_local_sessions(
+            &paths,
+            &config,
+            [(session_id.as_str(), source_path.as_str())],
+        )?;
+    }
     let (records, page) = collect_session_page(
         &paths,
         &config,
@@ -5684,6 +5733,16 @@ fn run_herdr_resume(
         if placement == crate::herdr::ResumePlacement::Off {
             return Err(anyhow!("herdr resume is disabled (herdr_resume = \"off\")"));
         }
+        if let Some(pane_id) = crate::herdr::pane_running_session(&row.session_id)
+            && crate::herdr::focus_pane(&pane_id).is_ok()
+        {
+            println!(
+                "{} ({}) is already open; focused herdr pane {pane_id}",
+                row.session_id,
+                row.source.label()
+            );
+            return Ok(());
+        }
         let label = row
             .repo_project
             .clone()
@@ -6054,6 +6113,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Kiro => "kiro",
         crate::types::SourceKind::Kilocode => "kilocode",
         crate::types::SourceKind::Kimi => "kimi",
+        crate::types::SourceKind::Goose => "goose",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -6069,6 +6129,11 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
     if record.source == crate::types::SourceKind::Kilocode {
         return Err(anyhow!(
             "sharing is not supported for KiloCode sessions: {source_path} is a database, not a transcript file"
+        ));
+    }
+    if record.source == crate::types::SourceKind::Goose {
+        return Err(anyhow!(
+            "sharing is not supported for goose sessions: {source_path} is a database entry, not a transcript file"
         ));
     }
 
@@ -7402,6 +7467,9 @@ fn build_index_command_args(
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
     }
+    if !index.antigravity || index.no_antigravity {
+        args.push("--no-antigravity".to_string());
+    }
     if !index.bob || index.no_bob {
         args.push("--no-bob".to_string());
     }
@@ -7413,6 +7481,9 @@ fn build_index_command_args(
     }
     if !index.kimi || index.no_kimi {
         args.push("--no-kimi".to_string());
+    }
+    if !index.goose || index.no_goose {
+        args.push("--no-goose".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -7605,11 +7676,11 @@ fn build_systemd_service(
     continuous: bool,
     env_vars: &[(String, String)],
 ) -> String {
-    let exec_start = if program_args.is_empty() {
-        exe_path.to_string()
-    } else {
-        format!("{} {}", exe_path, program_args.join(" "))
-    };
+    let exec_start = std::iter::once(exe_path)
+        .chain(program_args.iter().map(String::as_str))
+        .map(systemd_exec_word)
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let mut out = String::new();
     out.push_str("[Unit]\n");
@@ -7637,6 +7708,34 @@ fn build_systemd_service(
     if continuous {
         out.push_str("WantedBy=default.target\n");
     }
+    out
+}
+
+/// One ExecStart argument. systemd splits on whitespace, expands `%` specifiers and
+/// `$` variables, and reads C escapes inside double quotes, so anything that is not a
+/// plain word is quoted rather than split or turned into another unit directive.
+fn systemd_exec_word(input: &str) -> String {
+    let escaped = input.replace('%', "%%").replace('$', "$$");
+    let plain = !escaped.is_empty()
+        && !escaped.chars().any(|ch| {
+            ch.is_whitespace() || ch.is_control() || matches!(ch, '"' | '\'' | '\\' | ';')
+        });
+    if plain {
+        return escaped;
+    }
+    let mut out = String::from("\"");
+    for ch in escaped.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_ascii_control() => out.push_str(&format!("\\x{:02x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
     out
 }
 
@@ -9155,6 +9254,8 @@ mod tests {
             no_kilocode: false,
             kimi: false,
             no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: false,
             no_kiro: false,
             embeddings: false,
@@ -9184,6 +9285,7 @@ mod tests {
         assert!(args.contains(&"--no-grok".to_string()));
         assert!(args.contains(&"--no-jcode".to_string()));
         assert!(args.contains(&"--no-muse".to_string()));
+        assert!(args.contains(&"--no-antigravity".to_string()));
         assert!(args.contains(&"--no-bob".to_string()));
     }
 
@@ -9228,6 +9330,8 @@ mod tests {
             no_kilocode: false,
             kimi: false,
             no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9294,6 +9398,8 @@ mod tests {
             no_kilocode: false,
             kimi: false,
             no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9362,6 +9468,8 @@ mod tests {
             no_kilocode: false,
             kimi: false,
             no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -10463,6 +10571,25 @@ arguments = {
             "Environment=\"PI_CODING_AGENT_SESSION_DIR=/tmp/pi \\\"sessions\\\" 100%%\"\n"
         ));
         assert!(service.contains("ExecStart=/usr/bin/memex index --no-pi\n"));
+    }
+
+    #[test]
+    fn systemd_exec_start_keeps_each_argument_one_word() {
+        let service = build_systemd_service(
+            "/opt/my tools/memex",
+            &[
+                "--exclude".to_string(),
+                "~/My Work/**".to_string(),
+                "%h\nExecStartPre=/bin/evil $HOME".to_string(),
+            ],
+            true,
+            &[],
+        );
+        assert!(service.contains(
+            "ExecStart=\"/opt/my tools/memex\" --exclude \"~/My Work/**\" \
+             \"%%h\\nExecStartPre=/bin/evil $$HOME\"\n"
+        ));
+        assert!(!service.contains("\nExecStartPre="));
     }
 
     #[test]

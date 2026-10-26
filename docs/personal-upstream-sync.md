@@ -1,5 +1,40 @@
 # Personal fork upstream sync
 
+## v0.31.1 (2026-10-26)
+
+Merged the released upstream tag through `a205ca7`: read-time session freshness,
+literal fallback for malformed search syntax, safe resume quoting, post-publication
+cleanup fixes, Goose support, and client and usage corrections. The subsequent
+release-authoring skill is outside this runtime update.
+
+Retained vector-preserving parser updates, confirmed-missing pruning, durable
+directories, environment provider precedence, and the CPU default. Goose virtual
+session paths are excluded from filesystem-based pruning. Published-snapshot reads
+remain available during ordinary ingest, but explicit `index_freshness = "strict"`
+must acquire the lease rather than use that fallback. The existing setting
+`auto_index_on_search = false` continues to disable read-time refreshes.
+
+### Embedding preservation
+
+Claude/Codex parser versions, vector format, lexical schema, and embedding runtime
+dependencies are unchanged. Upstream's parser-triggered whole-vector reset remains
+removed. No index rebuild, model change, or vector import is needed.
+
+An isolated copy of the Mac index contained 10,378 BGE vectors (384 dimensions).
+Normal lexical ingestion with v0.31.1 preserved all 10,366 surviving vectors bit
+for bit. An independent v0.28.0 control retired exactly the same 12 old record IDs
+as live transcripts changed; there was no upgrade-specific invalidation. All 3,067
+entries in the memory-section embedding cache retained their exact bytes. Semantic
+search and pasted-URL lexical search passed on the staged index.
+
+The explicit real-BGE parser-change regression passed: exactly one replacement
+record was embedded, the unaffected vector stayed identical, and repeat ingestion
+performed zero inference. The ordinary regression suite also covers lexical-only
+parser changes and refusal to discard vectors during empty-index recovery.
+
+Validation: formatting, strict Clippy across all targets, and all 1,427 default
+tests passed (three ignored); the BGE regression above passed separately.
+
 ## PR #250 and v0.28.0 (2026-10-14)
 
 Merged upstream through `c59f46f`, including the final multi-profile session and

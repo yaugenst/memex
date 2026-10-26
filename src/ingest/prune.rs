@@ -110,6 +110,10 @@ pub(super) fn missing_state_paths(
     let mut missing = paths
         .into_iter()
         .filter_map(|path| {
+            // Goose owns virtual session paths; filesystem absence is not a deletion.
+            if crate::sources::goose::split_virtual_path(Path::new(&path)).is_some() {
+                return None;
+            }
             // Discovery can omit a path because of a transient read or permission error. Only
             // delete state after the filesystem itself confirms that the path is gone.
             if !path_is_missing(&path) {

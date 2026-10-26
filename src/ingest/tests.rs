@@ -55,6 +55,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_zcode: false,
         include_kilocode: false,
         include_kimi: false,
+        include_goose: false,
         include_kiro: false,
         embeddings,
         backfill_embeddings: false,
@@ -239,9 +240,16 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     fs::write(&memory, "# Decisions\n\nRevised middle paragraph.\n").unwrap();
     assert!(can_skip_fresh_scan(&paths, &published, &options, 3600).unwrap());
     assert!(
-        ingest_if_stale(&paths, &published, &options, 3600, &lease, None)
-            .unwrap()
-            .is_none()
+        ingest_if_stale(
+            &paths,
+            &published,
+            &options,
+            Freshness::Bounded { ttl_seconds: 3600 },
+            &lease,
+            None
+        )
+        .unwrap()
+        .is_none()
     );
     let updated = store.load().unwrap();
     assert_eq!(updated.documents[0].stable_id, original_id);
@@ -251,7 +259,15 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     assert_eq!(published.doc_count().unwrap(), 1);
 
     fs::remove_file(memory).unwrap();
-    ingest_if_stale(&paths, &published, &options, 3600, &lease, None).unwrap();
+    ingest_if_stale(
+        &paths,
+        &published,
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        None,
+    )
+    .unwrap();
     assert!(store.load().unwrap().documents.is_empty());
 }
 
@@ -2596,6 +2612,7 @@ fn device_renumbering_preserves_append_continuity() {
         bob_database: None,
         zcode_database: None,
         kilocode_database: None,
+        goose_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2620,6 +2637,7 @@ fn device_renumbering_does_not_hide_file_replacement() {
         bob_database: None,
         zcode_database: None,
         kilocode_database: None,
+        goose_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2864,6 +2882,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_zcode: false,
         include_kilocode: false,
         include_kimi: false,
+        include_goose: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -3644,6 +3663,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_zcode: false,
         include_kilocode: false,
         include_kimi: false,
+        include_goose: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -6402,7 +6422,18 @@ fn journal_refreshes_narrow_to_changed_paths_and_walk_after_a_directory_rename()
         let journal = discovery::start_journal_replay(&paths, &options);
         journal.wait_until_streaming(journal::REPLAY_BUDGET);
         let index = open_search_index(&paths);
-        ingest_selected(&paths, &index, &options, &lease, None, None, Some(journal)).unwrap()
+        ingest_selected(
+            &paths,
+            &index,
+            &options,
+            &lease,
+            Narrowing::Journal {
+                replay: journal,
+                walk: true,
+            },
+            None,
+        )
+        .unwrap()
     };
     let indexed = || {
         let index = open_search_index(&paths);
@@ -7552,6 +7583,170 @@ fn kilocode_store_removed_with_its_directory_keeps_indexed_sessions() {
 }
 
 #[test]
+fn goose_sessions_index_conversations_but_not_turn_context() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let database = root.join("data").join("sessions").join("sessions.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    crate::sources::goose::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::potion());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let run = |options: &IngestOptions| {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, options, &lease).unwrap()
+    };
+    run(&options);
+    let indexed = indexed_texts(&paths);
+    assert!(indexed.contains(&"List the files".to_string()));
+    assert!(indexed.contains(&"One file".to_string()));
+    assert!(indexed.contains(&"Count the entries".to_string()));
+    // Turn scaffolding and internal CLI sessions never reach the index.
+    assert!(!indexed.iter().any(|text| text.contains("<turn-context>")));
+    assert!(
+        !indexed
+            .iter()
+            .any(|text| text.contains("internal plumbing"))
+    );
+    // Reasoning blocks are opt-in, like every other source.
+    assert!(!indexed.iter().any(|text| text == "thinking about it"));
+    let reader =
+        crate::state::checkpoint::CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
+    assert_eq!(
+        reader.goose_database_paths().unwrap(),
+        HashSet::from([database.to_string_lossy().into_owned()])
+    );
+
+    // An excluded session keeps its records out of a fresh index while its
+    // sibling still indexes.
+    let fresh = Paths::new(Some(temp.path().join("memex-excluded"))).unwrap();
+    fresh.ensure_dirs().unwrap();
+    let fresh_lease = ingest_lease(&fresh);
+    options.exclude_patterns = vec![
+        crate::sources::goose::virtual_path(&database, "sess_main")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&fresh.index).unwrap();
+    ingest_all(&fresh, &index, &options, &fresh_lease).unwrap();
+    assert_eq!(
+        indexed_texts(&fresh),
+        [
+            "Count the entries",
+            "[image: image/png]",
+            "invalid arguments"
+        ]
+    );
+}
+
+#[test]
+fn goose_refresh_preserves_unchanged_sessions_and_reconciles_deletions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let database = root.join("data/sessions/sessions.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    crate::sources::goose::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::potion());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    let session_ids = |session| {
+        let mut ids = SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .records_by_session_id(session)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    full();
+    let original = indexed_texts(&paths);
+    let main_ids = session_ids("sess_main");
+    let child_ids = session_ids("sess_child");
+    assert!(!main_ids.is_empty());
+    assert!(!child_ids.is_empty());
+    assert_eq!(full().records_added, 0);
+    assert_eq!(indexed_texts(&paths), original);
+    assert_eq!(session_ids("sess_main"), main_ids);
+    assert_eq!(session_ids("sess_child"), child_ids);
+
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer
+        .execute_batch("ALTER TABLE sessions RENAME TO unavailable_sessions")
+        .unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), original);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+    writer
+        .execute_batch("ALTER TABLE unavailable_sessions RENAME TO sessions")
+        .unwrap();
+
+    // A narrowed refresh must publish the session deletion, not just drop its checkpoint.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE session_id = 'sess_child';
+             DELETE FROM sessions WHERE id = 'sess_child';",
+        )
+        .unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let dirty = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([database.clone()]),
+    )
+    .unwrap();
+    assert!(!dirty.full_scan);
+    drop(index);
+    assert!(session_ids("sess_child").is_empty());
+    assert_eq!(session_ids("sess_main"), main_ids);
+
+    // Full discovery must publish deletions too, without resurrecting the child.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE session_id = 'sess_main';
+             DELETE FROM sessions WHERE id = 'sess_main';",
+        )
+        .unwrap();
+    full();
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn goose_store_that_never_existed_is_not_reported_unreadable() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert_eq!(report.files_skipped, 0);
+}
+
+#[test]
 fn ingest_kimi_journals_from_kimi_code_home_override() {
     use std::io::Write;
 
@@ -7772,4 +7967,246 @@ fn kimi_undo_appended_after_indexing_retracts_the_undone_turn() {
         .collect::<Vec<_>>();
     texts.sort();
     assert_eq!(texts, ["keep this", "retyped"]);
+}
+
+fn unanswerable_journal() -> journal::ReplayHandle {
+    journal::ReplayHandle::spawn(Vec::new(), "no roots".to_string(), |_| None)
+}
+
+#[test]
+fn bounded_reads_keep_the_index_when_the_journal_cannot_answer_and_strict_reads_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    append_claude_message(&transcript, "appended");
+
+    let bounded = Freshness::Bounded { ttl_seconds: 3600 };
+    let index = open_search_index(&paths);
+    let report = ingest_if_stale(
+        &paths,
+        &index,
+        &options,
+        bounded,
+        &lease,
+        Some(unanswerable_journal()),
+    )
+    .unwrap()
+    .expect("a journal refresh runs within the TTL");
+    assert_eq!(report.records_added, 0);
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
+
+    assert!(
+        ingest_if_stale(&paths, &index, &options, Freshness::None, &lease, None)
+            .unwrap()
+            .is_none()
+    );
+
+    let report = ingest_if_stale(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Strict,
+        &lease,
+        Some(unanswerable_journal()),
+    )
+    .unwrap()
+    .expect("a strict read refreshes");
+    assert_eq!(report.records_added, 1);
+    assert_eq!(indexed_texts(&paths), ["appended", "indexed"]);
+}
+
+#[test]
+fn session_refresh_targets_name_appended_rewritten_and_unrecorded_transcripts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let appended = source.join("appended.jsonl");
+    let rewritten = source.join("rewritten.jsonl");
+    let quiet = source.join("quiet.jsonl");
+    append_claude_message(&appended, "appended original");
+    append_claude_message(&rewritten, "rewritten original, long enough to shrink");
+    append_claude_message(&quiet, "quiet original");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    let key = |path: &Path| path.to_string_lossy().into_owned();
+    let all = [key(&appended), key(&rewritten), key(&quiet)];
+    assert_eq!(
+        session_refresh_targets(&paths, all.iter().map(String::as_str)).unwrap(),
+        Some(HashSet::new())
+    );
+
+    append_claude_message(&appended, "appended later");
+    fs::write(&rewritten, "").unwrap();
+    append_claude_message(&rewritten, "rewritten");
+    let unrecorded = source.join("unrecorded.jsonl");
+    append_claude_message(&unrecorded, "unrecorded");
+    let sources = [
+        key(&appended),
+        key(&rewritten),
+        key(&quiet),
+        key(&unrecorded),
+    ];
+    let targets = session_refresh_targets(&paths, sources.iter().map(String::as_str))
+        .unwrap()
+        .expect("every source is a transcript on disk");
+    assert_eq!(
+        targets,
+        HashSet::from([appended.clone(), rewritten.clone(), unrecorded.clone()])
+    );
+
+    ingest_session_sources(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        &targets,
+    )
+    .unwrap();
+    assert_eq!(
+        indexed_texts(&paths),
+        [
+            "appended later",
+            "appended original",
+            "quiet original",
+            "rewritten",
+            "unrecorded"
+        ]
+    );
+}
+
+#[test]
+fn session_refresh_targets_route_database_sessions_to_their_store_and_refuse_other_shapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let database = tmp.path().join("zcode").join("db.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    fs::write(&database, "").unwrap();
+    let session = crate::sources::zcode::virtual_path(&database, "session")
+        .to_string_lossy()
+        .into_owned();
+    // The store is always handed on: a WAL-only commit leaves its own metadata unchanged.
+    assert_eq!(
+        session_refresh_targets(&paths, [session.as_str()]).unwrap(),
+        Some(HashSet::from([database.clone()]))
+    );
+
+    // A legacy OpenCode session is a directory, and a transcript that is gone cannot be
+    // stat'ed; neither can be refreshed on its own.
+    let directory = tmp.path().join("storage").join("session");
+    fs::create_dir_all(&directory).unwrap();
+    let missing = tmp.path().join("missing.jsonl");
+    for untargetable in [directory, missing] {
+        let untargetable = untargetable.to_string_lossy().into_owned();
+        assert_eq!(
+            session_refresh_targets(&paths, [session.as_str(), untargetable.as_str()]).unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn session_reads_that_cannot_be_narrowed_walk_only_when_freshness_allows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    append_claude_message(&source.join("other.jsonl"), "elsewhere");
+    // A transcript removed after the read stat'ed it sends the dirty selection to a resync.
+    let vanished = HashSet::from([source.join("vanished.jsonl")]);
+
+    ingest_session_sources(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        &vanished,
+    )
+    .unwrap();
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
+
+    ingest_session_sources(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Strict,
+        &lease,
+        &vanished,
+    )
+    .unwrap();
+    assert_eq!(indexed_texts(&paths), ["elsewhere", "indexed"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn bounded_reads_keep_the_stored_cursor_and_scan_cache_when_the_journal_cannot_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    append_claude_message(&source.join("session.jsonl"), "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    let state_path = paths.state.join("ingest.json");
+    // The replay never finds a previous cursor, so it cannot name changes, but on macOS it
+    // still captures where the volume's journal stands.
+    let journal = || journal::ReplayHandle::spawn(vec![source.clone()], "claude".into(), |_| None);
+    // A walking refresh stores the cursor its replay captured.
+    ingest_selected(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        &lease,
+        Narrowing::Journal {
+            replay: journal(),
+            walk: true,
+        },
+        None,
+    )
+    .unwrap();
+    let stored = || {
+        let reader = CheckpointReader::open(&state_path).unwrap();
+        (
+            reader.load_journal_cursor("claude").unwrap(),
+            reader.header().unwrap().scan_cache.last_scan_ts,
+        )
+    };
+    let before = stored();
+    assert!(before.0.is_some(), "the walk stored a cursor");
+    append_claude_message(&source.join("session.jsonl"), "appended");
+
+    ingest_if_stale(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        Some(journal()),
+    )
+    .unwrap();
+    assert_eq!(stored(), before);
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
 }
