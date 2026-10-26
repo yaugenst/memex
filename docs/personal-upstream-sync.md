@@ -46,6 +46,26 @@ or 3,067 cached memory-section embeddings. After restarting the service, all
 added. Service status reported v0.31.1 running, ready, and matching the installed
 binary. No index rebuild or embedding import was performed.
 
+### Superbaozidora deployment
+
+Fast-forwarded the Linux checkout to the same fork revision, built the default
+release features, and retained CPU embeddings and the existing systemd service
+and resource limits. Formatting, strict Clippy, all 1,412 Linux tests, and the
+separate real-BGE preservation regression passed.
+
+A stopped-root Btrfs clone passed normal ingestion with all 248,023 conversation
+vectors bitwise unchanged and all 3,006 memory-cache entries intact. Installation
+and semantic search on the stopped live root preserved all 248,029 vectors then
+present. The first live ingestion subsequently retired 570 old IDs; a v0.28.0
+control using the same pre-install snapshot reproduced every retirement, with
+zero upgrade-only losses. The remaining 247,459 pre-install vectors matched bit
+for bit. Sampled retired records belonged to a changing Claude transcript.
+
+The old binary and final pre-install root remain under
+`.codex/validation-v0311/` on Superbaozidora. Configuration and service-file hashes
+are unchanged. Local and Mac-to-Superbaozidora federated semantic search passed.
+No index rebuild, model change, or embedding import was performed.
+
 ## PR #250 and v0.28.0 (2026-10-14)
 
 Merged upstream through `c59f46f`, including the final multi-profile session and
