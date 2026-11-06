@@ -9,6 +9,21 @@ pruning, vector-preserving parser updates, published-snapshot reads, durable
 directories, and environment provider precedence. Upstream now defaults to CPU.
 Bounded reads use upstream's short refresh wait; strict reads still require the lease.
 
+### Codex history correction
+
+The Linux corpus exposed an upstream data-loss regression before installation:
+`subagent_history_start_ordinal` can exceed every ordinal in a real child rollout,
+including the child's own final answer. Filtering earlier ordinals erased entire
+conversations. Remove that filter and its metadata plumbing, retaining the prior
+history behavior (including possible copied parent context), and use Codex index
+parser version 11 to repair already-parsed files. A synthetic regression models a
+completed child conversation whose boundary is beyond its final ordinal. Future
+upstream integrations must reconcile this personal parser version explicitly.
+
+The corrected Mac staging run retained or restored all 17,747 vectors available
+after its first backfill, with zero missing inputs and no inference. All 3,640
+memory-cache entries remained bitwise identical; retrieval checks passed again.
+
 ### Mac validation and rollout
 
 Formatting, strict Clippy across all targets, and all 1,505 default tests passed

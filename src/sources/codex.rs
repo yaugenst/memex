@@ -22,8 +22,9 @@ pub const VERSIONS: ParserVersions = ParserVersions {
     // Recompute ownership after excluding copied parent session metadata.
     identity: 4,
     // Index injected user context as system text, compaction summaries, messages between
-    // agents and voice transcripts, and skip history a forked subagent copied.
-    index: 10,
+    // agents and voice transcripts. Retain subagent history: real rollouts can place
+    // subagent_history_start_ordinal beyond their own final record.
+    index: 11,
     usage: 6,
 };
 
@@ -263,8 +264,6 @@ struct SessionMeta {
     cwd: Option<PathBuf>,
     links: SessionLinks,
     source_turn_id: Option<String>,
-    /// First `ordinal` of a forked subagent's own history; earlier lines copy its parent's.
-    history_start: Option<u64>,
 }
 
 fn fallback_meta(path: &Path) -> SessionMeta {
@@ -274,7 +273,6 @@ fn fallback_meta(path: &Path) -> SessionMeta {
         project: SourceKind::Codex.label().to_string(),
         cwd: None,
         source_turn_id: None,
-        history_start: None,
         links: SessionLinks {
             conversation_kind: Some(ConversationKind::Main.as_str().to_string()),
             ..SessionLinks::default()
@@ -362,9 +360,6 @@ fn apply_meta(payload: &simd_json::borrowed::Object<'_>, metadata: &mut SessionM
         })
         .or_else(|| subagent_present.then(|| "subagent".to_string()))
         .or_else(|| forked_from_id.as_ref().map(|_| "fork".to_string()));
-    metadata.history_start = payload
-        .get("subagent_history_start_ordinal")
-        .and_then(|value| value.as_u64());
     metadata.links.parent_session_id = forked_from_id.clone().or(parent_thread_id);
     metadata.links.thread_source = thread_source.clone();
     metadata.links.conversation_kind = Some(
@@ -624,16 +619,6 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
                 apply_meta(payload, &mut metadata);
                 metadata_offsets.push(line_start as u64);
             }
-            continue;
-        }
-        // A subagent forked with its parent's context starts with a copy of the parent's
-        // rollout, indexed where it began.
-        if metadata.history_start.is_some_and(|history_start| {
-            object
-                .get("ordinal")
-                .and_then(|value| value.as_u64())
-                .is_some_and(|ordinal| ordinal < history_start)
-        }) {
             continue;
         }
         // The model output of a compaction call; the `compacted` line after it holds the
@@ -3877,6 +3862,8 @@ not json
                 .collect::<Vec<_>>()
         };
         let expected = [
+            ("user", "SPAWNFORK a helper"),
+            ("assistant", "Spawning a helper."),
             (
                 "system",
                 "# AGENTS.md instructions for /work/memex\n\n<INSTRUCTIONS>\nRun cargo fmt before committing.\n</INSTRUCTIONS>",
@@ -3900,8 +3887,8 @@ not json
             ),
         ]
         .map(|(role, text)| (role.to_string(), text.to_string()));
-        // History the subagent copied from its parent, compaction output and ciphertext are
-        // not indexed.
+        // Keep history when the rollout boundary is not independently verified.
+        // Compaction output and ciphertext are not indexed.
         assert_eq!(roles_and_texts(&records), expected);
         assert!(records.iter().all(|record| {
             record.links.conversation_kind.as_deref() == Some("subagent")
@@ -3918,9 +3905,9 @@ not json
             .filter(|(_, record)| record.links.source_record_offset.is_some())
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        assert_eq!(newly_retained, [3, 5, 6, 7, 8]);
+        assert_eq!(newly_retained, [5, 7, 8, 9, 10]);
 
-        // Resumed past its start, the parser still knows which lines are inherited.
+        // Resuming past the metadata preserves the same conversation records.
         let second_line = fixture.find('\n').unwrap() + 1;
         let (resumed, _) = parse_transcript(
             &path,
@@ -3931,6 +3918,30 @@ not json
             },
         );
         assert_eq!(roles_and_texts(&resumed), expected);
+    }
+
+    #[test]
+    fn subagent_boundary_beyond_final_ordinal_does_not_erase_own_conversation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("child.jsonl");
+        fs::write(&path, concat!(
+            r#"{"type":"session_meta","ordinal":0,"payload":{"id":"child","parent_thread_id":"parent","thread_source":"subagent","subagent_history_start_ordinal":4}}"#, "\n",
+            r#"{"type":"response_item","ordinal":1,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Audit the package."}]}}"#, "\n",
+            r#"{"type":"response_item","ordinal":2,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Audit complete."}]}}"#, "\n",
+            r#"{"type":"event_msg","ordinal":3,"payload":{"type":"task_complete"}}"#, "\n",
+        )).unwrap();
+        let (records, _) = parse_transcript(&path, IndexParseState::default());
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.role.as_str(), r.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("user", "Audit the package."),
+                ("assistant", "Audit complete."),
+                ("lifecycle", "Turn completed"),
+            ]
+        );
     }
 
     #[test]
