@@ -45,6 +45,35 @@ The ready daemon reports v0.32.0 and matches the installed binary. All 12,483
 migrated vectors survived restart bit for bit. The daemon resumed the checkpointed
 new-content backfill. Configuration and launchd definition hashes are unchanged.
 
+### Corrected deployment validation
+
+The corrected build passed 1,506 Mac tests and 1,491 Linux tests, plus the explicit
+real-BGE preservation regression on both hosts. One Linux retrieval fixture hit
+a transient Tantivy writer-lock race; its isolated rerun and a complete suite
+rerun passed. Formatting and strict Clippy passed on both platforms.
+
+On the Mac, all 17,747 vectors present before the correction survived the live
+restart bit for bit, and all retrieval checks passed. The daemon is ready and
+has completed the initial new-content backfill.
+
+On Linux, exported all 272,938 existing vectors (17 eligible records were not yet
+embedded). The corrected staged root retained 46,995 vectors and imported 202,377
+by exact input, for 249,372 reusable destination vectors. Of the old embedded
+records, 249,296 had reusable text, 22,957 became non-embedding context, and 685
+changed text. No old events remained unexplained or missing. The previously lost
+real child answer was also checked directly with scoped search.
+
+All 249,372 migrated vectors and 3,258 memory-cache entries survived Linux restart
+bit for bit. Local retrieval and Mac-to-Linux federated semantic search passed.
+Both daemons report ready, version 0.32.0, and matching installed binaries. Model
+cache files, configuration, service definitions, and Linux resource limits are
+unchanged. The 100,279 newly exposed/changed/missing inputs enter the ordinary
+checkpointed Linux backfill; existing vectors are not rebuilt.
+
+GitHub SSH signing through the personal 1Password key did not complete. The exact
+commits were transferred to Linux using verified Git bundles without switching
+accounts. They remain committed on both machines pending publication to origin.
+
 ## v0.31.1 (2026-10-26)
 
 Merged the released upstream tag through `a205ca7`: read-time session freshness,
