@@ -57,7 +57,7 @@ mod stats;
 mod surface;
 use surface::{
     CliSearchMode, DaemonMcpArgs, DebugCommand, EvaluationArgs, IndexCommand, IndexSource,
-    OutputArgs, OutputFormat, OutputOptions, SessionCommand, WebCommand,
+    OutputArgs, OutputFormat, OutputOptions, SessionCommand, TagCommand, WebCommand,
 };
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -66,7 +66,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  rex          Install the Rex module\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
@@ -264,9 +264,12 @@ struct SessionsArgs {
     /// Only sessions whose cwd is this path, lives under it, or whose git root is it
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// Filter by project (repository grouping)
+    /// Filter by project (repository grouping, after user assignments)
     #[arg(long)]
     project: Option<String>,
+    /// Only sessions with this user tag (repeatable; all must match)
+    #[arg(long = "tag", value_name = "TAG")]
+    tags: Vec<String>,
     /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
     #[arg(long)]
     source: Option<SourceFilter>,
@@ -404,7 +407,7 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches
+    kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches, rolled_up_to
     memory_id, content_version, section_ref, title, heading, cwd, mtime_ms, event_dates, start_line, end_line, document_kind, refs, freshness, changed_since_search
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
     parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
@@ -423,6 +426,9 @@ OUTPUT FIELDS (--fields):
         /// Filter by project name
         #[arg(long, help_heading = "Filters")]
         project: Option<String>,
+        /// Only sessions with this user tag (repeatable; all must match)
+        #[arg(long = "tag", value_name = "TAG", help_heading = "Filters")]
+        tags: Vec<String>,
         /// Filter by role (user, assistant, tool_use, tool_result)
         #[arg(long, help_heading = "Filters")]
         role: Option<String>,
@@ -732,6 +738,9 @@ The input contains at most 32 requests; each page is limited to 500 records."
         /// Filter by source
         #[arg(long)]
         source: Option<SourceFilter>,
+        /// Count only sessions with this user tag (repeatable; all must match)
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
         /// Read one machine (defaults to local; ignores configured search defaults)
         #[arg(long)]
         machine: Option<String>,
@@ -754,6 +763,15 @@ EXAMPLES:
     Herdr {
         #[command(subcommand)]
         action: HerdrCommand,
+    },
+    /// Rex integration: install the memex module for Rex's init.lua
+    #[command(after_help = "\
+EXAMPLES:
+    memex rex install                     # write memex.lua beside Rex's init.lua
+    memex rex install --dir ~/dotfiles/rex")]
+    Rex {
+        #[command(subcommand)]
+        action: RexCommand,
     },
     /// Show index statistics, vector state, and indexing config
     #[command(hide = true)]
@@ -995,6 +1013,59 @@ enum HerdrCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum RexCommand {
+    /// Write memex.lua beside Rex's init.lua (rerun after upgrading memex)
+    Install {
+        /// Directory to write memex.lua to [default: the directory of Rex's init.lua]
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Replace a memex.lua that `memex rex install` did not write
+        #[arg(long)]
+        force: bool,
+    },
+    /// Resume the most recent resumable session, opening a new Rex tab
+    #[command(hide = true)]
+    ResumeLast {
+        /// Prefer sessions from this directory (falls back to the global latest unless strict)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Refuse when no resumable session exists in --cwd instead of using another project
+        #[arg(long)]
+        strict_cwd: bool,
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Rex session to open the tab in [default: $REX_SESSION]
+        #[arg(long)]
+        rex_session: Option<String>,
+        /// Rex block a split opens beside [default: $REX_BLOCK]
+        #[arg(long)]
+        rex_block: Option<String>,
+    },
+    /// Resume a specific session by id, opening a new Rex tab
+    #[command(hide = true)]
+    Resume {
+        /// Session ID (from `memex sessions` or search results)
+        session_id: String,
+        /// Filter by source when a session id appears in multiple backends
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Rex session to open the tab in [default: $REX_SESSION]
+        #[arg(long)]
+        rex_session: Option<String>,
+        /// Rex block a split opens beside [default: $REX_BLOCK]
+        #[arg(long)]
+        rex_block: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 enum TransferTarget {
@@ -1130,6 +1201,9 @@ pub(crate) struct SearchRequest {
     pub(crate) cwd: Option<String>,
     /// Repository/project grouping to search.
     pub(crate) project: Option<String>,
+    /// Only sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tags: Vec<String>,
     /// Record role such as user, assistant, tool_use, or tool_result.
     pub(crate) role: Option<String>,
     /// Tool name such as Read, Edit, or Bash.
@@ -1186,6 +1260,9 @@ pub(crate) struct SessionsRequest {
     pub(crate) cwd: Option<String>,
     /// Repository/project grouping to list.
     pub(crate) project: Option<String>,
+    /// Only sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tags: Vec<String>,
     /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
     pub(crate) source: Option<String>,
     /// Claude config directory name, such as `work` for `~/.claude-profiles/work`.
@@ -1468,6 +1545,7 @@ pub fn run() -> Result<()> {
             additional_queries,
             cwd,
             project,
+            tags,
             role,
             tool,
             session,
@@ -1501,6 +1579,7 @@ pub fn run() -> Result<()> {
                 additional_queries,
                 cwd,
                 project,
+                tags,
                 role,
                 tool,
                 session,
@@ -1673,7 +1752,11 @@ pub fn run() -> Result<()> {
             }
         },
         Commands::Session {
-            action: _,
+            action: Some(action),
+            ..
+        } => run_session_assignment(action)?,
+        Commands::Session {
+            action: None,
             session_id,
             machine,
             source_path,
@@ -1868,19 +1951,21 @@ pub fn run() -> Result<()> {
         }
         Commands::Projects {
             source,
+            tags,
             machine,
             root,
             output,
         } => {
             let paths = Paths::new(root)?;
+            let tags = normalize_tags(&tags)?;
             let mut items = if let Some(id) = machine
                 .as_deref()
                 .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
             {
                 let config = UserConfig::load(&paths)?;
-                crate::machine::remote_project_summaries(&config, id, source)?
+                crate::machine::remote_project_summaries(&config, id, source, tags)?
             } else {
-                collect_projects(&paths, source)?
+                collect_projects(&paths, source, tags)?
             };
             if let Some(machine) = machine {
                 for item in &mut items {
@@ -1899,6 +1984,7 @@ pub fn run() -> Result<()> {
             source_path,
             cwd,
             project,
+            tags,
             source,
             profile,
             since,
@@ -1921,6 +2007,7 @@ pub fn run() -> Result<()> {
                     source_path,
                     cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
                     project,
+                    tags,
                     source: source.map(|value| value.as_str().to_string()),
                     profile,
                     since,
@@ -1953,6 +2040,7 @@ pub fn run() -> Result<()> {
                 source_path,
                 cwd,
                 project,
+                tags,
                 source,
                 profile,
                 since,
@@ -1982,6 +2070,36 @@ pub fn run() -> Result<()> {
                 root,
             } => {
                 run_herdr_resume(Some(session_id), None, false, source, root)?;
+            }
+        },
+        Commands::Rex { action } => match action {
+            RexCommand::Install { dir, force } => run_rex_install(dir, force)?,
+            RexCommand::ResumeLast {
+                cwd,
+                strict_cwd,
+                source,
+                root,
+                rex_session,
+                rex_block,
+            } => {
+                let target = RexTarget {
+                    session: rex_session,
+                    block: rex_block,
+                };
+                run_rex_resume(None, cwd, strict_cwd, source, root, target)?;
+            }
+            RexCommand::Resume {
+                session_id,
+                source,
+                root,
+                rex_session,
+                rex_block,
+            } => {
+                let target = RexTarget {
+                    session: rex_session,
+                    block: rex_block,
+                };
+                run_rex_resume(Some(session_id), None, false, source, root, target)?;
             }
         },
         Commands::Stats { json, root, output } => {
@@ -2601,19 +2719,26 @@ fn run_event_loop(
                 }
                 match retry_after_stopping_embedder(&mut worker, || run_index_args(index, false)) {
                     Ok(()) => {
-                        service.mark_complete(FireCause::Resync);
+                        mark_watch_ingest_complete(&mut service, &paths, FireCause::Resync);
                         log_watch_stats(&service);
                     }
                     Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
                         return Err(error);
                     }
-                    Err(error) => eprintln!("watch: resync ingest failed, retrying: {error:#}"),
+                    Err(error) => {
+                        mark_watch_ingest_failed(&mut service, &paths, "resync ingest", &error)
+                    }
                 }
             }
             Some(FireCause::Dirty) => {
                 let dirty = service.dirty_paths();
                 match dirty_needs_ingest(&paths, &dirty) {
-                    Ok(false) => service.mark_skipped(),
+                    Ok(false) => {
+                        if service.is_failing() {
+                            clear_watch_ingest_failure(&paths);
+                        }
+                        service.mark_skipped();
+                    }
                     Ok(true) => match retry_after_stopping_embedder(&mut worker, || {
                         run_index_selection(index, false, Some(&dirty))
                     }) {
@@ -2623,18 +2748,22 @@ fn run_event_loop(
                             {
                                 eprintln!("watch: root refresh failed: {error:#}");
                             }
-                            service.mark_complete(if full_scan {
-                                FireCause::Resync
-                            } else {
-                                FireCause::Dirty
-                            });
+                            mark_watch_ingest_complete(
+                                &mut service,
+                                &paths,
+                                if full_scan {
+                                    FireCause::Resync
+                                } else {
+                                    FireCause::Dirty
+                                },
+                            );
                             log_watch_stats(&service);
                         }
                         Err(error) => {
                             if error.is::<crate::index::IndexCompatibilityError>() {
                                 return Err(error);
                             }
-                            eprintln!("watch: ingest failed, retrying: {error:#}");
+                            mark_watch_ingest_failed(&mut service, &paths, "ingest", &error);
                         }
                     },
                     Err(error) => {
@@ -2643,13 +2772,15 @@ fn run_event_loop(
                             run_index_args(index, false)
                         }) {
                             Ok(()) => {
-                                service.mark_complete(FireCause::Resync);
+                                mark_watch_ingest_complete(&mut service, &paths, FireCause::Resync);
                                 log_watch_stats(&service);
                             }
                             Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
                                 return Err(error);
                             }
-                            Err(error) => eprintln!("watch: ingest failed, retrying: {error:#}"),
+                            Err(error) => {
+                                mark_watch_ingest_failed(&mut service, &paths, "ingest", &error)
+                            }
                         }
                     }
                 }
@@ -2677,6 +2808,45 @@ fn run_event_loop(
     }
     worker.stop()?;
     Ok(())
+}
+
+fn mark_watch_ingest_complete(
+    service: &mut crate::watch::WatchService,
+    paths: &Paths,
+    cause: crate::watch::FireCause,
+) {
+    if service.is_failing() {
+        clear_watch_ingest_failure(paths);
+    }
+    service.mark_complete(cause);
+}
+
+fn clear_watch_ingest_failure(paths: &Paths) {
+    if let Err(error) = crate::ingest::failures::DaemonIngestStatus::clear(&paths.state) {
+        eprintln!("watch: could not clear the ingest failure status: {error:#}");
+    }
+}
+
+/// Back the failed ingest off exponentially and record the streak for `memex stats`.
+fn mark_watch_ingest_failed(
+    service: &mut crate::watch::WatchService,
+    paths: &Paths,
+    operation: &str,
+    error: &anyhow::Error,
+) {
+    let (failures, delay) = service.mark_failed(Instant::now());
+    eprintln!(
+        "watch: {operation} failed ({failures} in a row), retrying in {}s: {error:#}",
+        delay.as_secs()
+    );
+    if let Err(status_error) = crate::ingest::failures::DaemonIngestStatus::record_failure(
+        &paths.state,
+        failures,
+        error,
+        delay,
+    ) {
+        eprintln!("watch: could not record the ingest failure status: {status_error:#}");
+    }
 }
 
 /// Re-resolve watch roots (cheap; call on resync) so newly installed agent
@@ -2764,6 +2934,8 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         embed_runtime,
         tool_content_limits,
         defer_merges: false,
+        embedding_budget: None,
+        redaction: config.redactor()?,
     })
 }
 
@@ -2820,6 +2992,12 @@ fn run_index_selection(
     }
     for path in &report.diagnostics.unreadable_sources {
         eprintln!("warning: skipped unreadable source {path}; its indexed records are kept");
+    }
+    if report.files_deferred > 0 {
+        eprintln!(
+            "warning: {} previously failing file(s) left as indexed until they change or their retry is due; see `memex stats`",
+            report.files_deferred
+        );
     }
     if print_diagnostics && !report.diagnostics.is_empty() {
         println!(
@@ -3043,6 +3221,7 @@ fn run_search(
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3093,6 +3272,7 @@ fn run_search(
             additional_queries,
             cwd,
             project,
+            tags,
             role,
             tool,
             session,
@@ -3122,6 +3302,7 @@ fn run_search(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3185,6 +3366,7 @@ struct MemorySurfaceSearchArgs {
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3262,6 +3444,7 @@ fn collect_search_with_memories(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3291,10 +3474,11 @@ fn collect_search_with_memories(
     let conversation_only_filters = role.is_some()
         || tool.is_some()
         || session.is_some()
+        || !tags.is_empty()
         || !matches!(origin, SessionOrigin::Regular | SessionOrigin::All);
     if content == SearchContent::Memories && conversation_only_filters {
         return Err(anyhow!(
-            "--role, --tool, --session, and --origin filter conversations; use --content conversations or all"
+            "--role, --tool, --session, --tag, and --origin filter conversations; use --content conversations or all"
         ));
     }
     if trace {
@@ -3316,6 +3500,7 @@ fn collect_search_with_memories(
             additional_queries: additional_queries.clone(),
             cwd: cwd.clone(),
             project: project.clone(),
+            tags,
             role,
             tool,
             session,
@@ -3518,6 +3703,7 @@ struct SearchCollectRequest {
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3610,9 +3796,9 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
         Operation::Projects { machine } => {
             check_analytics(&machine)?;
             let items = if machine == crate::machine::LOCAL_MACHINE_ID {
-                collect_projects(paths, None)?
+                collect_projects(paths, None, Vec::new())?
             } else {
-                crate::machine::remote_project_summaries(&config, &machine, None)?
+                crate::machine::remote_project_summaries(&config, &machine, None, Vec::new())?
             };
             Ok(tag(items, machine))
         }
@@ -3628,6 +3814,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     filters.source_path,
                     filters.cwd.map(PathBuf::from),
                     filters.project,
+                    filters.tags,
                     parse_source_filter(filters.source)?,
                     filters.profile,
                     filters.since,
@@ -3676,6 +3863,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     query,
                     additional_queries: Vec::new(),
                     cwd: None,
+                    tags: Vec::new(),
                     project,
                     role: None,
                     tool: None,
@@ -3805,6 +3993,7 @@ fn collect_search_with_auto_index(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3899,6 +4088,7 @@ fn collect_search_with_auto_index(
             min_score,
             project_grouping: None,
             text_limit,
+            tags: normalize_tags(&tags)?,
         },
         &crate::search::Selection {
             sort: if sort == SortBy::Score {
@@ -3972,6 +4162,9 @@ struct SearchHit {
     text: String,
     snippet: String,
     matches: Vec<MatchSpan>,
+    /// Root session a child-session hit is shown under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rolled_up_to: Option<crate::search::SessionRollup>,
     #[serde(flatten)]
     links: RecordLinks,
 }
@@ -3982,13 +4175,21 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
             machine,
             score,
             record,
+            rollup,
         } in results
         {
             let ts = format_ts(record.ts);
             let text = match_preview(&record.text, &render.matchers, 200);
+            let session = match rollup {
+                Some(rollup) => format!(
+                    "{} ({} of {})",
+                    record.session_id, rollup.matched_kind, rollup.session_id
+                ),
+                None => record.session_id,
+            };
             println!(
                 "[{score:.3}] {} {} {} {} {} {} {}",
-                machine, ts, record.doc_id, record.project, record.role, record.session_id, text
+                machine, ts, record.doc_id, record.project, record.role, session, text
             );
         }
         return Ok(());
@@ -4020,6 +4221,7 @@ fn project_located_results(
         machine,
         score,
         record,
+        rollup,
     } in results
     {
         let ts = format_ts(record.ts);
@@ -4134,6 +4336,11 @@ fn project_located_results(
             if fields.contains("matches") {
                 map.insert("matches".to_string(), serde_json::to_value(matches)?);
             }
+            if fields.contains("rolled_up_to")
+                && let Some(rollup) = &rollup
+            {
+                map.insert("rolled_up_to".to_string(), serde_json::to_value(rollup)?);
+            }
             Value::Object(map)
         } else {
             serde_json::to_value(SearchHit {
@@ -4150,6 +4357,7 @@ fn project_located_results(
                 text,
                 snippet,
                 matches,
+                rolled_up_to: rollup,
                 links: record.links,
             })?
         };
@@ -4167,6 +4375,7 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
                 query: request.query,
                 additional_queries: request.additional_queries,
                 cwd: request.cwd.map(PathBuf::from),
+                tags: request.tags,
                 project: request.project,
                 role: request.role,
                 tool: request.tool,
@@ -4201,6 +4410,7 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
         query: request.query,
         additional_queries: request.additional_queries,
         cwd: request.cwd.map(PathBuf::from),
+        tags: request.tags,
         project: request.project,
         role: request.role,
         tool: request.tool,
@@ -5323,6 +5533,12 @@ fn format_usd(value: f64) -> String {
     }
 }
 
+fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
+    tags.iter()
+        .map(|tag| crate::session_meta::normalize_tag(tag))
+        .collect()
+}
+
 fn open_analytics_read_only(paths: &Paths) -> Result<AnalyticsStore> {
     let db = analytics_path(&paths.state);
     if !db.exists() {
@@ -5446,6 +5662,7 @@ fn run_sessions(
     source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     source: Option<SourceFilter>,
     profile: Option<String>,
     since: Option<String>,
@@ -5464,6 +5681,7 @@ fn run_sessions(
         &SessionListSpec {
             source,
             project,
+            tags: normalize_tags(&tags)?,
             cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
             since_ms: parse_ts_millis(since)?,
             limit,
@@ -5495,8 +5713,12 @@ fn run_sessions(
     output.print_values(items)
 }
 
-pub(crate) fn collect_projects(paths: &Paths, source: Option<SourceFilter>) -> Result<Vec<Value>> {
-    let store = open_analytics_read_only(paths)?;
+pub(crate) fn collect_projects(
+    paths: &Paths,
+    source: Option<SourceFilter>,
+    tags: Vec<String>,
+) -> Result<Vec<Value>> {
+    let store = open_analytics_read_only(paths)?.with_tags(tags);
     Ok(store.query_project_summaries(source)?.into_iter().map(|row| {
         let last_at = row.last_at.and_then(|timestamp| {
             let formatted = format_ts(timestamp);
@@ -5512,6 +5734,7 @@ pub(crate) fn collect_sessions(
     source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     source: Option<SourceFilter>,
     profile: Option<String>,
     since: Option<String>,
@@ -5522,7 +5745,7 @@ pub(crate) fn collect_sessions(
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let claude_sources = config.claude_sources();
-    let store = open_analytics_read_only(&paths)?;
+    let store = open_analytics_read_only(&paths)?.with_tags(normalize_tags(&tags)?);
     let since_ms = parse_ts_millis(since)?;
     let cwd_filter = canonical_cwd_filter(cwd);
     let kind_filter = match origin {
@@ -5582,6 +5805,9 @@ pub(crate) fn collect_session_count(
         if request.cwd.is_some() {
             return Err(anyhow!("--query count does not support --cwd"));
         }
+        if !request.tags.is_empty() {
+            return Err(anyhow!("--query count does not support --tag"));
+        }
         if !SearchIndex::exists(&paths.index) {
             return Ok(SessionCount {
                 total: None,
@@ -5638,7 +5864,7 @@ pub(crate) fn collect_session_count(
                 .then(|| "canonical session metadata incomplete".into()),
         })
     } else {
-        let store = open_analytics_read_only(paths)?;
+        let store = open_analytics_read_only(paths)?.with_tags(normalize_tags(&request.tags)?);
         let cwd = canonical_cwd_filter(request.cwd.map(PathBuf::from));
         let total = store.count_sessions_selected(
             source,
@@ -5665,6 +5891,7 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
         request.source_path,
         request.cwd.map(PathBuf::from),
         request.project,
+        request.tags,
         source,
         request.profile,
         request.since,
@@ -5682,17 +5909,24 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
     }))
 }
 
-fn run_herdr_resume(
+/// What `memex herdr|rex resume[-last]` resumes: the session, its resume
+/// command, and the directory to run it in.
+struct ResumeTarget {
+    row: crate::analytics::SessionDetailRow,
+    command: String,
+    cwd: String,
+}
+
+fn resume_target(
+    paths: &Paths,
+    config: &UserConfig,
     session_id: Option<String>,
     cwd: Option<PathBuf>,
     strict_cwd: bool,
     source: Option<SourceFilter>,
-    root: Option<PathBuf>,
-) -> Result<()> {
-    let paths = Paths::new(root)?;
-    let config = UserConfig::load(&paths)?;
+) -> Result<ResumeTarget> {
     let claude_sources = config.claude_sources();
-    let store = open_analytics_read_only(&paths)?;
+    let store = open_analytics_read_only(paths)?;
     let cwd_filter = canonical_cwd_filter(cwd);
 
     let mut rows =
@@ -5715,18 +5949,54 @@ fn run_herdr_resume(
         // selection falls through to the global fallback or reports none.
         rows.retain(&interactive);
         if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
-            // The public CLI keeps its historical global fallback unless the Herdr plugin
-            // explicitly requires the focused directory to match.
+            // The public CLI keeps its historical global fallback unless the herdr or Rex
+            // plugin explicitly requires the focused directory to match.
             rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
             rows.retain(&interactive);
         }
     }
 
-    let Some((row, command, cwd)) = rows.iter().find_map(|row| {
-        session_resume_command(&config, row, &claude_sources).map(|(cmd, cwd)| (row, cmd, cwd))
-    }) else {
-        return Err(anyhow!("no resumable session found"));
-    };
+    rows.into_iter()
+        .find_map(|row| {
+            let (command, cwd) = session_resume_command(config, &row, &claude_sources)?;
+            Some(ResumeTarget { row, command, cwd })
+        })
+        .ok_or_else(|| anyhow!("no resumable session found"))
+}
+
+/// Outside a terminal multiplexer, run the resume command directly.
+fn run_resume_inline(target: &ResumeTarget) -> Result<()> {
+    let status = std::process::Command::new("sh")
+        .args(["-lc", &target.command])
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("resume command exited with {status}"));
+    }
+    println!(
+        "resumed {} ({})",
+        target.row.session_id,
+        target.row.source.label()
+    );
+    Ok(())
+}
+
+fn resume_label(row: &crate::analytics::SessionDetailRow) -> String {
+    row.repo_project
+        .clone()
+        .unwrap_or_else(|| row.project.clone())
+}
+
+fn run_herdr_resume(
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    strict_cwd: bool,
+    source: Option<SourceFilter>,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let target = resume_target(&paths, &config, session_id, cwd, strict_cwd, source)?;
+    let ResumeTarget { row, command, cwd } = &target;
 
     if crate::herdr::inside_herdr() {
         let placement = crate::herdr::resume_placement(&config);
@@ -5743,12 +6013,12 @@ fn run_herdr_resume(
             );
             return Ok(());
         }
-        let label = row
-            .repo_project
-            .clone()
-            .unwrap_or_else(|| row.project.clone());
-        let pane_id =
-            crate::herdr::open_resume_pane(placement, Some(cwd.as_str()), &label, &command)?;
+        let pane_id = crate::herdr::open_resume_pane(
+            placement,
+            Some(cwd.as_str()),
+            &resume_label(row),
+            command,
+        )?;
         println!(
             "resumed {} ({}) in herdr pane {pane_id}",
             row.session_id,
@@ -5757,15 +6027,181 @@ fn run_herdr_resume(
         return Ok(());
     }
 
-    // Outside herdr, run the resume command directly.
-    let status = std::process::Command::new("sh")
-        .args(["-lc", &command])
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("resume command exited with {status}"));
+    run_resume_inline(&target)
+}
+
+/// Where `memex rex resume[-last]` opens the session. The Rex module passes
+/// both from its action context; from a shell they default to the terminal's
+/// own `REX_SESSION` and `REX_BLOCK`.
+struct RexTarget {
+    session: Option<String>,
+    block: Option<String>,
+}
+
+fn run_rex_resume(
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    strict_cwd: bool,
+    source: Option<SourceFilter>,
+    root: Option<PathBuf>,
+    rex: RexTarget,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let target = resume_target(&paths, &config, session_id, cwd, strict_cwd, source)?;
+    let ResumeTarget { row, command, cwd } = &target;
+
+    // A block id only means something in the session it came from.
+    let (rex_session, rex_block) = match rex.session {
+        Some(session) => (Some(session), rex.block),
+        None => (
+            crate::rex::current_session(),
+            rex.block.or_else(crate::rex::current_block),
+        ),
+    };
+    let Some(rex_session) = rex_session else {
+        return run_resume_inline(&target);
+    };
+    let placement = crate::rex::resume_placement(&config);
+    if placement == crate::rex::ResumePlacement::Off {
+        return Err(anyhow!("Rex resume is disabled (rex_resume = \"off\")"));
     }
-    println!("resumed {} ({})", row.session_id, row.source.label());
+    if let Some(block_id) = crate::rex::block_running_session(&rex_session, &row.session_id)
+        && crate::rex::focus_block(&rex_session, &block_id).is_ok()
+    {
+        println!(
+            "{} ({}) is already open; focused Rex block {block_id}",
+            row.session_id,
+            row.source.label()
+        );
+        return Ok(());
+    }
+    let block_id = crate::rex::open_resume_block(
+        placement,
+        &rex_session,
+        rex_block.as_deref(),
+        Some(cwd.as_str()),
+        &resume_label(row),
+        command,
+    )?;
+    println!(
+        "resumed {} ({}) in Rex block {block_id}",
+        row.session_id,
+        row.source.label()
+    );
     Ok(())
+}
+
+fn run_rex_install(dir: Option<PathBuf>, force: bool) -> Result<()> {
+    let dir = match dir {
+        Some(dir) => dir,
+        None => crate::rex::config_dir()
+            .ok_or_else(|| anyhow!("cannot locate Rex's config directory; pass --dir"))?,
+    };
+    let path = dir.join("memex.lua");
+    let contents = crate::rex::module_contents();
+    let status = match std::fs::read_to_string(&path) {
+        Ok(existing) if existing == contents => "unchanged",
+        Ok(existing) if !force && !existing.starts_with(crate::rex::MODULE_MARKER) => {
+            return Err(anyhow!(
+                "{} was not written by memex; pass --force to replace it",
+                path.display()
+            ));
+        }
+        Ok(_) => "updated",
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "created",
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    if status != "unchanged" {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        std::fs::write(&path, &contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    println!("{status} {}", path.display());
+
+    let init = dir.join("init.lua");
+    let loaded = std::fs::read_to_string(&init).is_ok_and(|text| {
+        [
+            "require(\"memex\")",
+            "require('memex')",
+            "require \"memex\"",
+        ]
+        .iter()
+        .any(|call| text.contains(call))
+    });
+    if loaded {
+        println!(
+            "\n{} already loads it; run `rex config reload` to apply.",
+            init.display()
+        );
+    } else {
+        println!(
+            "\nAdd to {}:\n\n  require(\"memex\").setup{{}}\n  rex.bind(\"cmd+shift+m\", \"memex_palette\")\n\nthen run `rex config reload`.",
+            init.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_session_assignment(command: SessionCommand) -> Result<()> {
+    use crate::session_meta::{AssignmentAction, AssignmentRequest};
+    let (session_id, action, target) = match command {
+        SessionCommand::Batch { .. } => unreachable!("batch normalizes to hydrate"),
+        SessionCommand::SetProject {
+            session_id,
+            project,
+            target,
+        } => (session_id, AssignmentAction::SetProject { project }, target),
+        SessionCommand::ClearProject { session_id, target } => {
+            (session_id, AssignmentAction::ClearProject, target)
+        }
+        SessionCommand::Inspect { session_id, target } => {
+            (session_id, AssignmentAction::Inspect, target)
+        }
+        SessionCommand::Tag { action } => match action {
+            TagCommand::Add {
+                session_id,
+                tags,
+                target,
+            } => (session_id, AssignmentAction::AddTags { tags }, target),
+            TagCommand::Rm {
+                session_id,
+                tags,
+                target,
+            } => (session_id, AssignmentAction::RemoveTags { tags }, target),
+            TagCommand::Ls { root, output } => {
+                let paths = Paths::new(root)?;
+                let store = open_analytics_read_only(&paths)?;
+                let output = output.resolve(OutputFormat::Jsonl, None, false)?;
+                return output.print_values(
+                    store
+                        .query_tags()?
+                        .into_iter()
+                        .map(|(tag, sessions)| serde_json::json!({"tag": tag, "session_count": sessions}))
+                        .collect(),
+                );
+            }
+        },
+    };
+    let paths = Paths::new(target.root)?;
+    let config = UserConfig::load(&paths)?;
+    let report = crate::machine::session_assignment(
+        &paths,
+        &config,
+        &target.machine,
+        &AssignmentRequest {
+            session_id,
+            source: target.source.map(|source| source.as_str().to_string()),
+            action,
+        },
+    )?;
+    target
+        .output
+        .resolve(OutputFormat::Json, None, false)?
+        .print_value(&serde_json::to_value(report)?)
 }
 
 fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
@@ -6797,7 +7233,11 @@ fn run_index_service_status(
         ))
     };
     result?;
-    daemon_upgrade::print_runtime(&paths)
+    daemon_upgrade::print_runtime(&paths)?;
+    for line in crate::ingest::failures::status_lines(&paths.state)? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 fn run_index_service_open(
@@ -7830,7 +8270,7 @@ enum SortBy {
     Ts,
 }
 
-const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search";
+const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,rolled_up_to,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search";
 
 fn search_fields(fields: Option<String>, full: bool) -> Result<Option<HashSet<String>>> {
     if full {
@@ -7936,17 +8376,19 @@ pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
         .collect()
 }
 
-// Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.
+/// Characters of context a preview shows before its first literal hit.
+const PREVIEW_LEAD_CHARS: usize = 80;
+
+// Preview the window with the most specific literal hits, such as an identifier past an
+// early common word; semantic-only hits fall back to a compact prefix.
 pub(crate) fn match_preview(text: &str, matchers: &[regex::Regex], max_chars: usize) -> String {
-    let first = matchers
-        .iter()
-        .filter_map(|matcher| matcher.find(text))
-        .min_by_key(|m| m.start());
-    let Some(hit) = first else {
+    let Some(anchor) =
+        crate::text_window::best_anchor(text, matchers, max_chars, PREVIEW_LEAD_CHARS)
+    else {
         return summarize(text, max_chars);
     };
-    let prefix = take_last_chars(&text[..hit.start()], 80);
-    let start = hit.start() - prefix.len();
+    let prefix = take_last_chars(&text[..anchor.byte], PREVIEW_LEAD_CHARS);
+    let start = anchor.byte - prefix.len();
     let preview = summarize(&text[start..], max_chars.saturating_sub(1));
     if start > 0 {
         format!("…{preview}")
@@ -8019,6 +8461,9 @@ fn command_reports_updates(command: &Commands) -> bool {
             | Commands::Rpc { .. }
             | Commands::Mcp { .. }
             | Commands::Herdr { .. }
+            | Commands::Rex {
+                action: RexCommand::ResumeLast { .. } | RexCommand::Resume { .. }
+            }
             | Commands::IndexService {
                 action: IndexServiceCommand::Run { .. }
             }
@@ -9111,6 +9556,21 @@ mod tests {
             "semantic fallback"
         );
         assert!(build_matchers("project:memex").unwrap().is_empty());
+    }
+
+    #[test]
+    fn previews_show_an_identifier_past_an_early_common_word() {
+        let text = format!(
+            "error: the build failed {} then parse_retry_budget_v2 rejected the request",
+            "while compiling the workspace ".repeat(40)
+        );
+        let matchers = build_matchers("error parse_retry_budget_v2").unwrap();
+        let preview = match_preview(&text, &matchers, 400);
+        assert!(preview.contains("parse_retry_budget_v2"), "{preview}");
+        assert!(preview.chars().count() <= 400);
+        // A single term still previews its earliest hit.
+        let preview = match_preview(&text, &build_matchers("error").unwrap(), 400);
+        assert!(preview.starts_with("error: the build failed"), "{preview}");
     }
 
     #[test]

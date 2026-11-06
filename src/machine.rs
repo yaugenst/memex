@@ -78,6 +78,9 @@ pub struct SearchSpec {
     /// starts at the first query term when that lies beyond the cap.
     #[serde(default)]
     pub text_limit: Option<usize>,
+    /// Only records from sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 impl SearchSpec {
@@ -85,14 +88,15 @@ impl SearchSpec {
         let Some(limit) = self.text_limit else {
             return;
         };
-        let terms = crate::cli::query_literals(&self.query);
+        // Escaped literals always compile; without matchers each field keeps its start.
+        let matchers = crate::cli::build_matchers(&self.query).unwrap_or_default();
         for (_, record) in records {
-            abbreviate_field(&mut record.text, limit, &terms);
+            abbreviate_field(&mut record.text, limit, &matchers);
             if let Some(input) = record.tool_input.as_mut() {
-                abbreviate_field(input, limit, &terms);
+                abbreviate_field(input, limit, &matchers);
             }
             if let Some(output) = record.tool_output.as_mut() {
-                abbreviate_field(output, limit, &terms);
+                abbreviate_field(output, limit, &matchers);
             }
         }
     }
@@ -162,6 +166,9 @@ pub struct LocatedRecord {
     pub machine: String,
     pub score: f32,
     pub record: Record,
+    /// Set when search shows this child-session hit on its root session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollup: Option<crate::search::SessionRollup>,
 }
 
 /// Memory results keep document identity and provenance without acquiring a
@@ -356,6 +363,9 @@ pub struct SessionListSpec {
     pub cwd: Option<String>,
     pub since_ms: Option<u64>,
     pub limit: usize,
+    /// Only sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -398,6 +408,8 @@ enum RpcOperation {
     Ping,
     Projects {
         source: Option<SourceFilter>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     Sessions {
         #[serde(flatten)]
@@ -469,6 +481,9 @@ enum RpcOperation {
     HomeActivity {
         request: crate::web::ActivityRequest,
         now: u64,
+    },
+    SessionAssignment {
+        request: crate::session_meta::AssignmentRequest,
     },
 }
 
@@ -546,6 +561,9 @@ enum RpcPayload {
     },
     HomeActivity {
         activity: crate::web::RawActivityPayload,
+    },
+    SessionAssignment {
+        report: Box<crate::session_meta::AssignmentReport>,
     },
     Error {
         message: String,
@@ -686,6 +704,7 @@ pub fn federated_search(
                         score
                     },
                     record,
+                    rollup: None,
                 }),
         );
     }
@@ -898,6 +917,7 @@ pub fn federated_recent(
                     machine: id.clone(),
                     score,
                     record,
+                    rollup: None,
                 }));
             }
             Err(err) => failures.push((id, err.to_string())),
@@ -2059,8 +2079,14 @@ pub(crate) fn remote_project_summaries(
     config: &UserConfig,
     id: &str,
     source: Option<SourceFilter>,
+    tags: Vec<String>,
 ) -> Result<Vec<serde_json::Value>> {
-    match metadata_rpc(config, id, RpcOperation::Projects { source }, "projects")? {
+    match metadata_rpc(
+        config,
+        id,
+        RpcOperation::Projects { source, tags },
+        "projects",
+    )? {
         RpcPayload::Projects { projects } => Ok(projects),
         _ => bail!("machine '{id}' returned an unexpected projects metadata response"),
     }
@@ -2081,6 +2107,34 @@ pub(crate) fn remote_sessions(
     )? {
         RpcPayload::Sessions { sessions } => Ok(sessions),
         _ => bail!("machine '{id}' returned an unexpected sessions metadata response"),
+    }
+}
+
+/// Change or inspect a session's user assignments on the machine that indexes it, so
+/// that machine's own project and tag filters see them.
+pub fn session_assignment(
+    paths: &Paths,
+    config: &UserConfig,
+    machine: &str,
+    request: &crate::session_meta::AssignmentRequest,
+) -> Result<crate::session_meta::AssignmentReport> {
+    if machine == LOCAL_MACHINE_ID {
+        return crate::session_meta::apply_local(paths, request);
+    }
+    match metadata_rpc(
+        config,
+        machine,
+        RpcOperation::SessionAssignment {
+            request: request.clone(),
+        },
+        "session assignment",
+    )? {
+        RpcPayload::SessionAssignment { report } => {
+            let mut report = *report;
+            report.machine = machine.to_string();
+            Ok(report)
+        }
+        _ => bail!("machine '{machine}' returned an unexpected session assignment response"),
     }
 }
 
@@ -2285,8 +2339,8 @@ pub fn run_rpc_stdio(root: Option<std::path::PathBuf>) -> Result<()> {
 
 fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Result<RpcPayload> {
     match request {
-        RpcOperation::Projects { source } => Ok(RpcPayload::Projects {
-            projects: crate::cli::collect_projects(paths, source)?,
+        RpcOperation::Projects { source, tags } => Ok(RpcPayload::Projects {
+            projects: crate::cli::collect_projects(paths, source, tags)?,
         }),
         RpcOperation::Sessions {
             input: SessionsInput::Request { request },
@@ -2296,6 +2350,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
                 request.source_path,
                 request.cwd.map(std::path::PathBuf::from),
                 request.project,
+                request.tags,
                 crate::cli::parse_source_filter(request.source)?,
                 request.profile,
                 request.since,
@@ -2306,6 +2361,9 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         }),
         RpcOperation::SessionCount { request, query } => Ok(RpcPayload::SessionCount {
             count: crate::cli::collect_session_count(paths, request, query)?,
+        }),
+        RpcOperation::SessionAssignment { request } => Ok(RpcPayload::SessionAssignment {
+            report: Box::new(crate::session_meta::apply_local(paths, &request)?),
         }),
         RpcOperation::Ping => Ok(RpcPayload::Pong {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2461,7 +2519,8 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
 }
 
 fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionListing>> {
-    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let store =
+        AnalyticsStore::open_read_only(analytics_path(&paths.state))?.with_tags(spec.tags.clone());
     let config = UserConfig::load(paths)?;
     let claude_sources = config.claude_sources();
     let cwd = crate::cli::canonical_cwd_filter(spec.cwd.as_ref().map(std::path::PathBuf::from));
@@ -2744,23 +2803,33 @@ fn search_local(
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut options = spec.query_options();
-    let repository_project = spec
-        .project
-        .as_deref()
-        .filter(|_| spec.project_grouping == Some(ProjectGrouping::Repository));
-    if repository_project.is_some() || spec.cwd.is_some() {
-        let db = analytics_path(&paths.state);
-        if db.exists() {
-            let store = AnalyticsStore::open_read_only(db)?;
-            let mut scope = store.query_search_scopes(repository_project, spec.cwd.as_deref())?;
+    let db = analytics_path(&paths.state);
+    let store = if db.exists() {
+        Some(AnalyticsStore::open_read_only(db)?.with_tags(spec.tags.clone()))
+    } else {
+        None
+    };
+    let grouping = spec.project_grouping.unwrap_or(ProjectGrouping::Flat);
+    // Project filters resolve through the analytics catalog whenever user assignments
+    // can move a session between projects; otherwise flat names filter the index.
+    let catalog_project = spec.project.as_deref().filter(|_| {
+        grouping == ProjectGrouping::Repository
+            || store
+                .as_ref()
+                .is_some_and(|store| store.has_project_assignments().unwrap_or(false))
+    });
+    if catalog_project.is_some() || spec.cwd.is_some() || !spec.tags.is_empty() {
+        if let Some(store) = &store {
+            let mut scope =
+                store.query_search_scopes(catalog_project, grouping, spec.cwd.as_deref())?;
             if let Some(existing) = &options.session_scope {
                 scope.retain(|key| existing.contains(key));
             }
             options.session_scope = Some(scope);
-            if repository_project.is_some() {
+            if catalog_project.is_some() {
                 options.project = None;
             }
-        } else if spec.cwd.is_some() {
+        } else if spec.cwd.is_some() || !spec.tags.is_empty() {
             options.session_scope = Some(Vec::new());
         }
     }
@@ -2919,12 +2988,16 @@ fn apply_project_grouping(
     records: &mut [(f32, Record)],
     grouping: Option<ProjectGrouping>,
 ) {
-    let Some(grouping) = grouping.filter(|grouping| *grouping != ProjectGrouping::Flat) else {
+    let Some(grouping) = grouping else {
         return;
     };
     let Ok(store) = AnalyticsStore::open_read_only(analytics_path(&paths.state)) else {
         return;
     };
+    // Flat names come from the index unless a user assignment moves the session.
+    if grouping == ProjectGrouping::Flat && !store.has_project_assignments().unwrap_or(false) {
+        return;
+    }
     let keys: Vec<_> = records
         .iter()
         .map(|(_, record)| {
@@ -2950,34 +3023,17 @@ fn apply_project_grouping(
     }
 }
 
-/// Lowercasing can change a character's byte length, so an offset into the lowercased string
-/// does not index the original.
-fn chars_before_lowercase(field: &str, lower_byte: usize) -> usize {
-    let mut lowered = 0;
-    for (index, character) in field.chars().enumerate() {
-        if lowered >= lower_byte {
-            return index;
-        }
-        lowered += character.to_lowercase().map(char::len_utf8).sum::<usize>();
-    }
-    field.chars().count()
-}
-
-/// Keep `limit` characters of `field`: from the start, or from the first occurrence of a query
-/// term when every term lies beyond the first `limit` characters.
-fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
+/// Keep `limit` characters of `field`: from the start, or from a quarter of `limit` before
+/// the window whose query hits are more specific than those of the start, such as an
+/// identifier far past an early common word.
+fn abbreviate_field(field: &mut String, limit: usize, matchers: &[regex::Regex]) {
     if field.chars().count() <= limit {
         return;
     }
-    let lower = field.to_lowercase();
-    let first_hit = terms
-        .iter()
-        .filter(|term| !term.is_empty())
-        .filter_map(|term| lower.find(term.as_str()))
-        .min();
-    let start_byte = match first_hit.map(|byte| (byte, chars_before_lowercase(field, byte))) {
-        Some((_, chars_before)) if chars_before >= limit => {
-            let skip = chars_before.saturating_sub(limit / 4);
+    let lead = limit / 4;
+    let start_byte = match crate::text_window::best_anchor(field, matchers, limit, lead) {
+        Some(anchor) if !anchor.head_suffices => {
+            let skip = anchor.chars.saturating_sub(lead);
             field.char_indices().nth(skip).map_or(0, |(index, _)| index)
         }
         _ => 0,
@@ -2997,8 +3053,28 @@ fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
     *field = abbreviated;
 }
 
+/// Refresh the index before a search. Under `strict` freshness the search waits up to
+/// [`INGEST_LEASE_TIMEOUT`] for the lease and fails if the refresh does. Under `bounded` it
+/// waits [`SESSION_READ_LEASE_WAIT`], and a refresh that fails or finds the lease held
+/// leaves the search on the index as it stands with a warning, as session reads do.
 fn ensure_local_index(paths: &Paths, config: &UserConfig, allow_busy_snapshot: bool) -> Result<()> {
-    ensure_local_index_within(paths, config, allow_busy_snapshot, INGEST_LEASE_TIMEOUT)
+    match config.index_freshness()? {
+        Freshness::None => Ok(()),
+        Freshness::Strict => ensure_local_index_within(paths, config, false, INGEST_LEASE_TIMEOUT),
+        Freshness::Bounded { .. } => {
+            if let Err(error) = ensure_local_index_within(
+                paths,
+                config,
+                allow_busy_snapshot,
+                SESSION_READ_LEASE_WAIT,
+            ) {
+                eprintln!(
+                    "warning: searching the index as it stands; refreshing it first failed: {error:#}"
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn ensure_local_index_within(
@@ -3121,7 +3197,8 @@ fn refresh_sessions(
     if targets.is_empty() {
         return Ok(());
     }
-    let options = local_ingest_options(config)?;
+    let mut options = local_ingest_options(config)?;
+    options.embedding_budget = Some(crate::ingest::READ_REFRESH_EMBEDDING_BUDGET);
     paths.ensure_dirs()?;
     let lease = IngestLease::acquire(paths, "session read", lease_timeout)?;
     let report = ingest_session_sources(
@@ -3210,7 +3287,10 @@ fn index_local(
     lease_timeout: Duration,
 ) -> Result<IngestReport> {
     crate::profiling::span!("index.local");
-    let options = local_ingest_options(config)?;
+    let mut options = local_ingest_options(config)?;
+    if stale_only {
+        options.embedding_budget = Some(crate::ingest::READ_REFRESH_EMBEDDING_BUDGET);
+    }
     // The journal stream must be registered before this process writes anything: a write in
     // the milliseconds before registration makes fseventsd hold the replay for ~160 ms.
     let journal = stale_only.then(|| {
@@ -3226,15 +3306,7 @@ fn index_local(
                 if holder.operation != "reindex" && SearchIndex::exists(&paths.index) =>
             {
                 // Use the last published generation while ordinary ingestion is busy.
-                return Ok(IngestReport {
-                    records_added: 0,
-                    records_embedded: 0,
-                    records_pruned: 0,
-                    files_pruned: 0,
-                    files_scanned: 0,
-                    files_skipped: 0,
-                    diagnostics: Default::default(),
-                });
+                return Ok(IngestReport::default());
             }
             LeaseAttempt::Busy(_) => IngestLease::acquire(paths, "RPC index", lease_timeout)?,
         }
@@ -3251,15 +3323,7 @@ fn index_local(
             &lease,
             journal,
         )?
-        .unwrap_or(IngestReport {
-            records_added: 0,
-            records_embedded: 0,
-            records_pruned: 0,
-            files_pruned: 0,
-            files_scanned: 0,
-            files_skipped: 0,
-            diagnostics: Default::default(),
-        }))
+        .unwrap_or_default())
     } else {
         let report = ingest_all(paths, &index, &options, &lease)?;
         drop(lease);
@@ -3301,6 +3365,8 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
         defer_merges: true,
+        embedding_budget: None,
+        redaction: config.redactor()?,
     })
 }
 
@@ -3360,6 +3426,7 @@ fn rpc_sessions(
     machine: &MachineConfig,
     spec: SessionListSpec,
 ) -> Result<Vec<SessionListing>> {
+    let tags = spec.tags.clone();
     match metadata_rpc(
         config,
         &machine.id,
@@ -3368,11 +3435,15 @@ fn rpc_sessions(
         },
         "sessions",
     )? {
-        RpcPayload::Sessions { sessions } => sessions
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<std::result::Result<_, _>>()
-            .map_err(Into::into),
+        RpcPayload::Sessions { sessions } => {
+            let mut listings = sessions
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<std::result::Result<Vec<SessionListing>, _>>()?;
+            // A peer too old to filter by tag reports none; never show its unfiltered rows.
+            listings.retain(|listing| tags.iter().all(|tag| listing.session.tags.contains(tag)));
+            Ok(listings)
+        }
         RpcPayload::Error { message } => Err(anyhow!("sessions failed: {message}")),
         other => Err(anyhow!("sessions returned unexpected response: {other:?}")),
     }
@@ -3633,21 +3704,43 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod abbreviate_tests {
-    use super::abbreviate_field;
+    use super::{SEARCH_TEXT_BUDGET, abbreviate_field};
+    use crate::cli::build_matchers;
 
     #[test]
     fn query_syntax_keeps_the_positive_text_window() {
         for query in ["\"needle\"", "text:needle AND NOT text:padding"] {
             let mut field = format!("padding {} needle evidence", "x".repeat(200));
-            abbreviate_field(&mut field, 40, &crate::cli::query_literals(query));
+            abbreviate_field(&mut field, 40, &build_matchers(query).unwrap());
             assert!(field.contains("needle"));
             assert!(!field.contains("padding"));
         }
     }
 
     #[test]
+    fn an_identifier_past_an_early_common_word_stays_in_the_window() {
+        let mut field = format!(
+            "error: the build failed {} then parse_retry_budget_v2 rejected the request",
+            "while compiling the workspace ".repeat(200)
+        );
+        let matchers = build_matchers("error parse_retry_budget_v2").unwrap();
+        abbreviate_field(&mut field, SEARCH_TEXT_BUDGET, &matchers);
+        assert!(field.contains("parse_retry_budget_v2"), "{field}");
+        assert!(field.starts_with('…'));
+        assert!(field.chars().count() <= SEARCH_TEXT_BUDGET + 2);
+
+        // When the start already shows the identifier, the field keeps its start.
+        let mut early = format!(
+            "error in parse_retry_budget_v2 {}error again",
+            "while compiling the workspace ".repeat(200)
+        );
+        abbreviate_field(&mut early, SEARCH_TEXT_BUDGET, &matchers);
+        assert!(early.starts_with("error in parse_retry_budget_v2"));
+    }
+
+    #[test]
     fn short_fields_are_untouched_and_long_ones_keep_the_query_window() {
-        let terms = vec!["needle".to_string()];
+        let terms = build_matchers("needle").unwrap();
         let mut short = "a needle in here".to_string();
         abbreviate_field(&mut short, 100, &terms);
         assert_eq!(short, "a needle in here");
@@ -3665,10 +3758,10 @@ mod abbreviate_tests {
 
     #[test]
     fn a_prefix_that_grows_when_lowercased_still_keeps_the_query_window() {
-        let terms = vec!["needle".to_string()];
+        let terms = build_matchers("needle").unwrap();
 
-        // `İ` lowercases to two characters, so the hit's offset in the lowercased string
-        // overshoots the original.
+        // `İ` lowercases to two characters, so an offset taken from a lowercased copy
+        // would overshoot the original; hits must be located in the original text.
         let mut turkish = format!("{}needle tail", "İ".repeat(100));
         abbreviate_field(&mut turkish, 40, &terms);
         assert!(turkish.contains("needle"), "{turkish}");
@@ -4056,6 +4149,7 @@ mod tests {
             min_score: None,
             project_grouping: None,
             text_limit: None,
+            tags: Vec::new(),
         }
     }
 
@@ -5125,6 +5219,9 @@ mod tests {
                 last_at,
                 message_count: 1,
                 profile: None,
+                parent_session_id: None,
+                assigned_project: None,
+                tags: Vec::new(),
             },
         };
         let result = merge_sessions(
@@ -5162,6 +5259,9 @@ mod tests {
                 last_at,
                 message_count: 1,
                 profile: reported.then(|| profile.to_string()),
+                parent_session_id: None,
+                assigned_project: None,
+                tags: Vec::new(),
             },
         };
         // An older peer ignores the filter and reports no profile; its newer rows must not
@@ -5425,5 +5525,24 @@ mod tests {
             page_texts(&paths, &unrefreshed, &request),
             ["first", "second"]
         );
+    }
+
+    #[test]
+    fn bounded_search_reads_the_index_as_it_stands_while_an_ingest_holds_the_lease() {
+        let _lock = crate::test_support::env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let _held = IngestLease::acquire(&paths, "slow refresh", Duration::ZERO).unwrap();
+        let bounded = UserConfig {
+            index_freshness: Some("bounded".to_string()),
+            ..UserConfig::default()
+        };
+
+        assert!(ensure_local_index_within(&paths, &bounded, false, Duration::ZERO).is_err());
+        let started = std::time::Instant::now();
+        ensure_local_index(&paths, &bounded, false)
+            .expect("bounded search proceeds without a refresh");
+        assert!(started.elapsed() < INGEST_LEASE_TIMEOUT / 2);
     }
 }

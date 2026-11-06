@@ -1,5 +1,35 @@
 # Personal fork upstream sync
 
+## v0.32.0 (2026-11-06)
+
+Merged released upstream tag `4c8d37d`: parser fidelity, child-session hit rollup,
+more specific snippets, per-file parse failure isolation, project assignments and
+tags, opt-in index redaction, and CPU-only ONNX sessions. Retained personal
+pruning, vector-preserving parser updates, published-snapshot reads, durable
+directories, and environment provider precedence. Upstream now defaults to CPU.
+Bounded reads use upstream's short refresh wait; strict reads still require the lease.
+
+### Mac validation and rollout
+
+Formatting, strict Clippy across all targets, and all 1,505 default tests passed
+(four ignored). The explicit real-BGE parser-preservation regression also passed.
+
+Stopped the daemon and verified the snapshot against the live files. Exported all
+14,381 conversation vectors, reparsed a cloned root with inference disabled, and
+imported by exact embedding-input hash. The new index reused 12,483 vectors,
+verified bit for bit. Of the old records, 12,454 had reusable text, 1,710 became
+non-embedding system context, and 217 Claude messages changed text while retaining
+their event identity (injected context, commands, or continuation summaries).
+There were no unexplained removed events. The changed parser output introduced
+5,248 missing inputs; only these entered backfill. All 3,640 cached memory-section
+embeddings and the model-cache files were preserved exactly.
+
+Installed at the existing stow target and switched to the staged root. Live
+lexical, semantic, hybrid, memory, record, context, and session reads passed.
+The ready daemon reports v0.32.0 and matches the installed binary. All 12,483
+migrated vectors survived restart bit for bit. The daemon resumed the checkpointed
+new-content backfill. Configuration and launchd definition hashes are unchanged.
+
 ## v0.31.1 (2026-10-26)
 
 Merged the released upstream tag through `a205ca7`: read-time session freshness,

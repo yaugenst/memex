@@ -529,6 +529,9 @@ impl SourceChoice {
 #[derive(Clone, Debug)]
 struct SessionSummary {
     best_record_id: Option<String>,
+    /// Child session the best hit came from when search rolled it up to this
+    /// session; `best_record_id` then names a record of that child.
+    matched_in: Option<MatchedChild>,
     best_record_source: Option<SourceKind>,
     machine: String,
     session_id: String,
@@ -543,6 +546,12 @@ struct SessionSummary {
     source_dir: String,
     label: Option<String>,
     conversation_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MatchedChild {
+    session_id: String,
+    kind: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1215,6 +1224,8 @@ impl App {
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,
                     defer_merges: true,
+                    embedding_budget: Some(crate::ingest::READ_REFRESH_EMBEDDING_BUDGET),
+                    redaction: config.redactor()?,
                 };
                 let journal = crate::ingest::discovery::start_journal_replay(&paths, &opts);
                 journal.wait_until_streaming(crate::ingest::journal::REPLAY_BUDGET);
@@ -1477,7 +1488,7 @@ impl App {
         let machines = self.selected_machines();
         let source = self.source.as_filter();
         let session_kind = self.session_kind;
-        let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
+        let project = split_project_filter(&self.project).0;
         let project_grouping = self.project_display.grouping();
         let tx = self.search_tx.clone();
         let range = self.home_activity_range;
@@ -1568,7 +1579,7 @@ impl App {
         let config = self.config.clone();
         let machines = self.selected_machines();
         let source = self.source.as_filter();
-        let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
+        let project = split_project_filter(&self.project).0;
         let project_grouping = self.project_display.grouping();
         let session_keys = home_token_session_keys(&self.query, &self.results);
         let local_session_keys = session_keys.as_ref().map(|keys| {
@@ -1580,7 +1591,10 @@ impl App {
         let session_kind = self.session_kind;
         let mut query = home_token_usage_query(
             self.source,
-            &self.project,
+            split_project_filter(&self.project)
+                .0
+                .as_deref()
+                .unwrap_or(""),
             self.project_display.grouping(),
             local_session_keys,
             self.home_activity_range,
@@ -1721,7 +1735,9 @@ impl App {
                 }
                 let mut projects: Vec<(String, u64)> = latest.into_iter().collect();
                 projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                Ok((sources, projects.into_iter().map(|(p, _)| p).collect()))
+                let mut projects: Vec<String> = projects.into_iter().map(|(p, _)| p).collect();
+                projects.extend(tag_filter_options(&store));
+                Ok((sources, projects))
             })()
             .unwrap_or_default();
             let _ = tx.send(SearchUpdate::HomeFilters {
@@ -2711,6 +2727,48 @@ impl App {
                     }
                     Err(err) => {
                         self.set_status(format!("herdr resume failed ({err}); running inline"));
+                    }
+                }
+            }
+        } else if let Some(rex_session) = crate::rex::current_session() {
+            // Inside a Rex terminal, the same: a new Rex tab/split, or the block
+            // already running the session.
+            let placement = crate::rex::resume_placement(&self.config);
+            if placement != crate::rex::ResumePlacement::Off {
+                if !remote
+                    && let Some(block_id) =
+                        crate::rex::block_running_session(&rex_session, &session.session_id)
+                    && crate::rex::focus_block(&rex_session, &block_id).is_ok()
+                {
+                    self.set_status(format!(
+                        "{} is already open; focused Rex block {block_id}",
+                        session.session_id
+                    ));
+                    return Ok(());
+                }
+                let rex_cwd = (!remote).then_some(cwd.as_str());
+                match crate::rex::open_resume_block(
+                    placement,
+                    &rex_session,
+                    crate::rex::current_block().as_deref(),
+                    rex_cwd,
+                    &session.project,
+                    &command,
+                ) {
+                    Ok(_) => {
+                        self.set_status(format!(
+                            "resumed {} in a new Rex {}",
+                            session.session_id,
+                            if placement == crate::rex::ResumePlacement::Split {
+                                "split"
+                            } else {
+                                "tab"
+                            }
+                        ));
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        self.set_status(format!("Rex resume failed ({err}); running inline"));
                     }
                 }
             }
@@ -4367,15 +4425,36 @@ fn session_result_line(
         }
     } else {
         let snippet = strip_ansi_and_controls(&session.snippet);
-        if is_subagent {
+        let badge = match &session.matched_in {
+            // The hit came from a child rolled up onto this session.
+            Some(child) => Some(format!("[via {}] ", short_kind(&child.kind))),
+            None => is_subagent.then(|| "[sub] ".to_string()),
+        };
+        let mut snippet_width = detail_width;
+        if let Some(badge) = badge {
+            snippet_width = snippet_width.saturating_sub(badge.chars().count());
             spans.push(Span::styled(
-                "[sub] ",
+                badge,
                 Style::default().fg(Color::Rgb(160, 120, 80)),
             ));
         }
-        spans.extend(match_context_spans(&snippet, matchers, detail_width, theme));
+        spans.extend(match_context_spans(
+            &snippet,
+            matchers,
+            snippet_width,
+            theme,
+        ));
     }
     Line::from(spans)
+}
+
+fn short_kind(kind: &str) -> &str {
+    match kind {
+        "subagent" => "sub",
+        "sidechain" => "side",
+        "compaction" => "compact",
+        other => other,
+    }
 }
 
 fn displayed_project(session: &SessionSummary) -> String {
@@ -5388,6 +5467,31 @@ fn session_activity(sessions: &[SessionSummary]) -> Vec<HomeChartPoint> {
         .collect()
 }
 
+/// The project filter doubles as the tag filter: `#tag` selects sessions carrying that
+/// user tag instead of a project.
+fn split_project_filter(value: &str) -> (Option<String>, Vec<String>) {
+    let value = value.trim();
+    if let Some(tag) = value.strip_prefix('#') {
+        return (
+            None,
+            crate::session_meta::normalize_tag(tag)
+                .into_iter()
+                .collect(),
+        );
+    }
+    ((!value.is_empty()).then(|| value.to_string()), Vec::new())
+}
+
+/// Tag entries for the project dropdowns, most used first.
+fn tag_filter_options(store: &AnalyticsStore) -> Vec<String> {
+    store
+        .query_tags()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(tag, _)| format!("#{tag}"))
+        .collect()
+}
+
 fn sessions_from_recent(
     index: &SearchIndex,
     source: Option<SourceFilter>,
@@ -5472,6 +5576,7 @@ fn session_matches_kind(filter: crate::analytics::SessionKindFilter, kind: Optio
 fn session_summary_from_row(row: SessionRow) -> SessionSummary {
     SessionSummary {
         best_record_id: None,
+        matched_in: None,
         best_record_source: None,
         machine: LOCAL_MACHINE_ID.to_string(),
         session_id: row.session_id,
@@ -5576,10 +5681,11 @@ fn collect_projects_from_analytics(
     grouping: ProjectGrouping,
 ) -> Result<Vec<String>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-    let projects = store.query_projects(source, grouping)?;
+    let mut projects = store.query_projects(source, grouping)?;
     if projects.is_empty() {
         anyhow::bail!("no analytics projects");
     }
+    projects.extend(tag_filter_options(&store));
     Ok(projects)
 }
 
@@ -5656,6 +5762,7 @@ fn add_record_to_session(
         .entry(record.session_id.clone())
         .or_insert(SessionSummary {
             best_record_id: Some(crate::retrieval::canonical_record_id(&record)),
+            matched_in: None,
             best_record_source: Some(record.source),
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: record.session_id.clone(),
@@ -5704,18 +5811,38 @@ fn add_located_record_to_session(
     let machine = located.machine;
     let score = located.score;
     let record = located.record;
+    // A rolled-up child hit is listed on its root session, which is what
+    // opening and resuming the row reach; the child stays named on the row.
+    let (session_id, source_path, matched_in, record_kind) = match located.rollup {
+        Some(rollup) => (
+            rollup.session_id,
+            rollup.source_path,
+            Some(MatchedChild {
+                session_id: record.session_id.clone(),
+                kind: rollup.matched_kind,
+            }),
+            None,
+        ),
+        None => (
+            record.session_id.clone(),
+            record.source_path.clone(),
+            None,
+            record.links.conversation_kind.clone(),
+        ),
+    };
     let key = format!(
         "{}\0{}\0{}\0{}",
         machine,
         record.source.storage_label(),
-        record.session_id,
-        record.source_path
+        session_id,
+        source_path
     );
     let entry = sessions.entry(key).or_insert(SessionSummary {
         best_record_id: Some(crate::retrieval::canonical_record_id(&record)),
+        matched_in: matched_in.clone(),
         best_record_source: Some(record.source),
         machine,
-        session_id: record.session_id.clone(),
+        session_id,
         project: record.project.clone(),
         source: record.source,
         last_ts: record.ts,
@@ -5723,31 +5850,29 @@ fn add_located_record_to_session(
         top_score: score,
         title: String::new(),
         snippet: crate::cli::match_preview(&record.text, matchers, 160),
-        source_path: record.source_path.clone(),
-        source_dir: parent_dir(&record.source_path),
+        source_path: source_path.clone(),
+        source_dir: parent_dir(&source_path),
         label: None,
-        conversation_kind: record.links.conversation_kind.clone(),
+        conversation_kind: record_kind.clone(),
     });
     entry.hit_count += 1;
     // Prefer an explicit "main": sidechain/compaction lines inside a primary
     // session must not determine the grouped kind (mirrors the analytics
     // accumulator).
-    let main_claim = record.links.conversation_kind.as_deref() == Some("main");
-    if (entry.conversation_kind.is_none() || main_claim) && record.links.conversation_kind.is_some()
-    {
-        entry.conversation_kind = record.links.conversation_kind.clone();
+    let main_claim = record_kind.as_deref() == Some("main");
+    if (entry.conversation_kind.is_none() || main_claim) && record_kind.is_some() {
+        entry.conversation_kind = record_kind;
     }
     entry.last_ts = entry.last_ts.max(record.ts);
     if score >= entry.top_score {
         entry.top_score = score;
         entry.best_record_id = Some(crate::retrieval::canonical_record_id(&record));
         entry.best_record_source = Some(record.source);
+        entry.matched_in = matched_in;
         let snippet = crate::cli::match_preview(&record.text, matchers, 160);
         if !snippet.is_empty() {
             entry.snippet = snippet;
         }
-        entry.source_path = record.source_path;
-        entry.source_dir = parent_dir(&entry.source_path);
     }
 }
 
@@ -5832,8 +5957,11 @@ pub(crate) fn evaluate_search(
         let id = session
             .best_record_id
             .ok_or_else(|| anyhow::anyhow!("TUI search result has no representative record"))?;
+        let record_session = session
+            .matched_in
+            .map_or(session.session_id, |child| child.session_id);
         let selector = crate::retrieval::ContextSelector::record_id(id)
-            .with_scope(Some(session.session_id), session.best_record_source);
+            .with_scope(Some(record_session), session.best_record_source);
         let record = if session.machine == LOCAL_MACHINE_ID {
             crate::retrieval::resolve_record(&index, &selector)?
         } else {
@@ -5843,6 +5971,7 @@ pub(crate) fn evaluate_search(
             machine: session.machine,
             score: session.top_score,
             record,
+            rollup: None,
         });
         snippets.push(session.snippet);
     }
@@ -5855,7 +5984,9 @@ fn run_search_request(
     index: &SearchIndex,
     request: SearchRequest,
 ) -> SearchRequestResult {
-    if !request.query.is_empty() {
+    let (project, tags) = split_project_filter(&request.project);
+    // Tags live only in the assignment store; the shared search path scopes them.
+    if !request.query.is_empty() || !tags.is_empty() {
         let result = crate::search::collect(
             paths,
             config,
@@ -5863,7 +5994,7 @@ fn run_search_request(
             std::slice::from_ref(&request.query),
             &SearchSpec {
                 query: request.query.clone(),
-                project: (!request.project.is_empty()).then(|| request.project.clone()),
+                project,
                 role: None,
                 tool: None,
                 session_id: None,
@@ -5879,6 +6010,7 @@ fn run_search_request(
                 min_score: None,
                 project_grouping: Some(request.grouping),
                 text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
+                tags,
             },
             &crate::search::Selection::conversations(RESULT_LIMIT, request.kind),
             false,
@@ -5895,7 +6027,7 @@ fn run_search_request(
             .collect();
         return Ok((sessions, result.failures));
     }
-    let project = (!request.project.is_empty()).then_some(request.project.as_str());
+    let project = project.as_deref();
     if !config.machines.is_empty() {
         let federated = federated_recent(
             paths,
@@ -6042,6 +6174,12 @@ fn build_detail_lines_from_records(
     if !session.snippet.is_empty() {
         let snippet = strip_ansi_and_controls(&session.snippet);
         lines.push(PreviewLine::Text(format!("top hit: {snippet}")));
+    }
+    if let Some(child) = &session.matched_in {
+        lines.push(PreviewLine::Text(format!(
+            "matched in {} {}",
+            child.kind, child.session_id
+        )));
     }
     lines.push(PreviewLine::Empty);
 
@@ -7536,6 +7674,7 @@ mod tests {
         .expect("write transcript");
         let session = SessionSummary {
             best_record_id: None,
+            matched_in: None,
             best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
@@ -7729,6 +7868,48 @@ mod tests {
     }
 
     #[test]
+    fn rolled_up_hits_list_the_root_session_and_name_the_child() {
+        let matchers = crate::cli::build_matchers("widget").unwrap();
+        let mut child = record("assistant", "fix the flaky widget");
+        child.session_id = "agent-a".to_string();
+        child.source_path = "agent-a.jsonl".to_string();
+        child.links.conversation_kind = Some("subagent".to_string());
+        let child_id = crate::retrieval::canonical_record_id(&child);
+        let mut sessions = HashMap::new();
+        add_located_record_to_session(
+            &mut sessions,
+            crate::machine::LocatedRecord {
+                machine: "remote".to_string(),
+                score: 1.0,
+                record: child,
+                rollup: Some(crate::search::SessionRollup {
+                    session_id: "parent".to_string(),
+                    source_path: "parent.jsonl".to_string(),
+                    matched_kind: "subagent".to_string(),
+                }),
+            },
+            &matchers,
+        );
+        let summary = sessions.values().next().unwrap();
+        assert_eq!(
+            (summary.session_id.as_str(), summary.source_path.as_str()),
+            ("parent", "parent.jsonl")
+        );
+        assert_eq!(
+            summary.conversation_kind, None,
+            "no [sub] badge on the root"
+        );
+        assert_eq!(summary.best_record_id.as_deref(), Some(child_id.as_str()));
+        assert_eq!(
+            summary.matched_in,
+            Some(MatchedChild {
+                session_id: "agent-a".to_string(),
+                kind: "subagent".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn grouped_search_previews_keep_late_matches_visible() {
         let theme = Theme::new();
         let matchers = crate::cli::build_matchers("fireduck").unwrap();
@@ -7750,6 +7931,7 @@ mod tests {
                             machine: "remote".to_string(),
                             score,
                             record: hit,
+                            rollup: None,
                         },
                         &matchers,
                     );
@@ -8048,6 +8230,7 @@ mod tests {
     fn recent_session_row_shows_title_instead_of_uuid() {
         let session = SessionSummary {
             best_record_id: None,
+            matched_in: None,
             best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "01a00000-0000-0000-0000-000000000000".to_string(),
@@ -8085,6 +8268,7 @@ mod tests {
 
         let session = SessionSummary {
             best_record_id: None,
+            matched_in: None,
             best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
@@ -8121,6 +8305,7 @@ mod tests {
         let (_tmp, mut app) = test_app();
         app.results.push(SessionSummary {
             best_record_id: None,
+            matched_in: None,
             best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
@@ -8276,6 +8461,7 @@ mod tests {
             request_id: 3,
             sessions: vec![SessionSummary {
                 best_record_id: None,
+                matched_in: None,
                 best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "session".to_string(),
@@ -8465,6 +8651,7 @@ mod tests {
         let sessions = vec![
             SessionSummary {
                 best_record_id: None,
+                matched_in: None,
                 best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "shared".into(),
@@ -8482,6 +8669,7 @@ mod tests {
             },
             SessionSummary {
                 best_record_id: None,
+                matched_in: None,
                 best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "shared".into(),
@@ -8499,6 +8687,7 @@ mod tests {
             },
             SessionSummary {
                 best_record_id: None,
+                matched_in: None,
                 best_record_source: None,
                 machine: "mini".into(),
                 session_id: "shared".into(),

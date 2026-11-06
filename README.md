@@ -120,6 +120,7 @@ See [source discovery and memory retrieval](docs/search.md) and
 | [MCP server](docs/mcp.md) | Give agents structured search and transcript retrieval tools |
 | [Search skill](#agent-integration) | Teach agents to use the Memex CLI for source-backed recall |
 | [herdr plugin](docs/herdr.md) | Browse and resume sessions from a herdr pane |
+| [Rex module](docs/rex.md) | Browse and resume sessions from a Rex pane |
 
 The interfaces share Memex's data, but expose different workflows. The native app
 READMEs describe their capabilities and platform requirements.
@@ -168,6 +169,16 @@ memex show --record-id RECORD_ID --machine local
 Search results identify the session, source, and machine so you can retrieve the
 original records. Transcript reads are bounded by default and return continuation
 information for longer content.
+
+Assign sessions to projects or tag them; both survive reindexing and rebuilds:
+
+```bash
+memex session set-project SESSION_ID ProjectA
+memex session tag add SESSION_ID tooling
+memex sessions --tag tooling
+```
+
+See [projects and tags](docs/projects.md).
 
 For semantic or hybrid search, first generate local embeddings:
 
@@ -284,11 +295,13 @@ destination can reproduce the original session's behavior.
 | [Installation and updates](docs/installation.md) | Package managers, source builds, Nix, skill updates, daemon upgrade migration |
 | [Indexing, search, and reading](docs/search.md) | Sources, memories, filters, formats, record budgets, pagination |
 | [Configuration and embeddings](docs/configuration.md) | Config file, models, execution providers, exclusions, resume templates |
+| [Projects and tags](docs/projects.md) | Project assignments, tags, inheritance, storage |
 | [Background indexing and Web UI](docs/daemon.md) | Services, browser authentication, index cleanup |
 | [Multiple machines](docs/machines.md) | SSH setup, remote reads, batch retrieval |
 | [MCP server](docs/mcp.md) | Transports, authentication, client setup, retrieval tools |
 | [Token usage](docs/usage.md) | Counters, pricing, cache estimates, Hermes coverage |
 | [herdr integration](docs/herdr.md) | Installation, actions, key bindings |
+| [Rex integration](docs/rex.md) | Installation, actions, key bindings |
 | [Developer profiling](docs/profiling.md) | Index/search traces and flamegraphs |
 
 ## Personal fork

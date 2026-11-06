@@ -315,12 +315,13 @@ pub(super) fn parse_bob_task(
     ) {
         Ok(parsed) => parsed,
         // A changed task is scheduled for a delete-first replay. Skipping it now would
-        // publish the deletion without its replacement, so the refresh fails instead and
-        // the indexed records survive until the database reads again. A brand-new task
-        // has nothing to lose and simply waits for the next refresh.
+        // publish the deletion without its replacement, so the task fails instead: the
+        // refresh isolates it without deleting anything, and the indexed records survive
+        // until the database reads again. A brand-new task has nothing to lose and simply
+        // waits for the next refresh.
         Err(error) if task.delete_first() && is_not_found(&error) => {
             return Err(anyhow!(
-                "Bob task {} became unreadable during its replay; refresh aborted to keep its indexed records ({error:#})",
+                "Bob task {} became unreadable during its replay; its indexed records are kept ({error:#})",
                 task.path.display()
             ));
         }
@@ -487,6 +488,7 @@ fn finish_parsed_source(
 }
 pub(super) fn parse_opencode_file(
     task: &FileTask,
+    include_reasoning: bool,
     tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
@@ -502,6 +504,7 @@ pub(super) fn parse_opencode_file(
             legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
+        include_reasoning,
         opencode_session_links,
         next_doc_id,
         |record| {
@@ -941,13 +944,21 @@ pub(super) struct ParserContext<'a> {
     pub progress: &'a Arc<Progress>,
     pub session_ids: &'a HashSet<String>,
     pub opencode_links: &'a HashMap<String, crate::sources::opencode::SessionLinks>,
+    pub pinned: &'a HashSet<PathBuf>,
 }
 
 impl ParserContext<'_> {
-    pub fn parse(&self, tasks: &[FileTask], skipped: &AtomicUsize) -> Result<()> {
+    /// Parse every task. A task that fails or panics is isolated and returned unless it is
+    /// pinned, in which case its error fails the whole parse.
+    pub fn parse(
+        &self,
+        tasks: &[FileTask],
+        skipped: &AtomicUsize,
+    ) -> Result<Vec<failures::ParseFailure>> {
+        let isolated = Mutex::new(Vec::new());
         let parse = |task: &FileTask| {
             crate::profiling::span!("ingest.parse_file");
-            let result = match task.source {
+            let result = catch_parser_panic(|| match task.source {
                 SourceKind::Claude => parse_claude_file(
                     task,
                     self.options.include_reasoning,
@@ -979,6 +990,7 @@ impl ParserContext<'_> {
                 }
                 SourceKind::Opencode => parse_opencode_file(
                     task,
+                    self.options.include_reasoning,
                     self.records,
                     self.updates,
                     self.next_id,
@@ -1110,16 +1122,40 @@ impl ParserContext<'_> {
                     self.next_id,
                     self.progress,
                 ),
-            };
-            finish_file_task(task, self.progress, skipped, result)
+            });
+            match finish_file_task(task, self.progress, skipped, result) {
+                Err(error) if !self.pinned.contains(&task.path) => {
+                    self.progress.add_files_done(task.source, 1);
+                    isolated
+                        .lock()
+                        .unwrap()
+                        .push(failures::ParseFailure::new(task, &error));
+                    Ok(())
+                }
+                result => result,
+            }
         };
         if tasks.len() <= 1 {
-            tasks.iter().try_for_each(parse)
+            tasks.iter().try_for_each(parse)?;
         } else {
             self.pool
-                .install(|| tasks.par_iter().with_max_len(1).try_for_each(parse))
+                .install(|| tasks.par_iter().with_max_len(1).try_for_each(parse))?;
         }
+        Ok(isolated.into_inner().unwrap())
     }
+}
+
+/// Turn a parser panic into an error, so one malformed transcript cannot unwind through the
+/// parser pool and abort the refresh.
+pub(super) fn catch_parser_panic(parse: impl FnOnce() -> Result<()>) -> Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(parse)).unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        Err(anyhow!("parser panicked: {message}"))
+    })
 }
 
 pub(super) fn finish_file_task(
@@ -1132,8 +1168,9 @@ pub(super) fn finish_file_task(
         Ok(()) => Ok(()),
         Err(error) if is_not_found(&error) && task.claude_agent_copies.is_empty() => {
             // Active agent clients may rotate or delete a transcript after discovery. A
-            // standalone file can be skipped; a merged agent must retry the whole refresh
-            // so retiring its old projection never publishes only part of the history.
+            // standalone file can be skipped; a merged agent fails instead, and the refresh
+            // reruns with it deferred so its old projections are never retired for only part
+            // of the history.
             progress.add_files_done(task.source, 1);
             skipped.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -1174,6 +1211,8 @@ pub(super) struct RecordSender {
     sender: Sender<Record>,
     limits: IndexedToolContentLimits,
     diagnostics: Arc<Mutex<crate::sources::ParseDiagnostics>>,
+    redactor: Arc<crate::redact::Redactor>,
+    verdicts: Arc<crate::redact::ToolVerdicts>,
 }
 
 impl RecordSender {
@@ -1183,6 +1222,7 @@ impl RecordSender {
             sender,
             limits,
             Arc::new(Mutex::new(crate::sources::ParseDiagnostics::default())),
+            Arc::new(crate::redact::Redactor::disabled()),
         )
     }
 
@@ -1190,21 +1230,35 @@ impl RecordSender {
         sender: Sender<Record>,
         limits: IndexedToolContentLimits,
         diagnostics: Arc<Mutex<crate::sources::ParseDiagnostics>>,
+        redactor: Arc<crate::redact::Redactor>,
     ) -> Self {
         Self {
             sender,
             limits,
             diagnostics,
+            redactor,
+            verdicts: Arc::default(),
         }
     }
 
+    /// Withheld-output verdicts of tool calls whose results this ingest has not sent yet.
+    pub(super) fn verdicts(&self) -> Arc<crate::redact::ToolVerdicts> {
+        self.verdicts.clone()
+    }
+
     pub(super) fn send(&self, mut record: Record) -> Result<()> {
+        // Redact the whole field before clipping, so no secret survives split by the marker.
+        let redaction = self.redactor.redact_record(&mut record, &self.verdicts);
         let (input_truncated, output_truncated) =
             limit_record_tool_content(&mut record, self.limits);
-        if input_truncated || output_truncated {
+        if input_truncated || output_truncated || !redaction.is_empty() {
             let mut diagnostics = self.diagnostics.lock().unwrap();
             diagnostics.truncated_tool_inputs += u64::from(input_truncated);
             diagnostics.truncated_tool_outputs += u64::from(output_truncated);
+            diagnostics.redacted_secrets += redaction.secrets;
+            diagnostics.redaction_timeouts += redaction.timeouts;
+            diagnostics.withheld_tool_inputs += redaction.withheld_inputs;
+            diagnostics.withheld_tool_outputs += redaction.withheld_outputs;
         }
         self.sender.send(record)?;
         Ok(())
@@ -1441,6 +1495,9 @@ pub(super) fn execute_refresh(
         installed_opencode_states,
         opencode_database_state_changed,
         identities_changed,
+        selection: _,
+        deferred_paths: _,
+        pinned_paths,
     } = prepared;
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
@@ -1502,6 +1559,7 @@ pub(super) fn execute_refresh(
             // Discovery diagnostics (an unreadable database, say) matter most when
             // nothing else changed.
             diagnostics: opencode_diagnostics,
+            ..IngestReport::default()
         });
     }
 
@@ -1564,7 +1622,12 @@ pub(super) fn execute_refresh(
         raw_tx_record,
         options.tool_content_limits,
         shared_diagnostics.clone(),
+        options.redaction.clone(),
     );
+    let verdicts = tx_record.verdicts();
+    for task in &tasks {
+        verdicts.seed(&task.path.to_string_lossy(), &task.pending_tool_calls);
+    }
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
     let mut affected_paths = delete_paths.clone();
@@ -1602,6 +1665,7 @@ pub(super) fn execute_refresh(
         index_root: paths.index.clone(),
         input_bytes,
         defer_merges: options.defer_merges,
+        embedding_budget: options.embedding_budget,
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
             || embedding_recovery
@@ -1650,11 +1714,20 @@ pub(super) fn execute_refresh(
         progress: &progress,
         session_ids: &session_ids,
         opencode_links: &opencode_session_links,
+        pinned: &pinned_paths,
     };
     // Largest remaining inputs first: one big transcript must not become the parse tail.
     tasks.sort_by_key(|task| std::cmp::Reverse(task.size.saturating_sub(task.offset)));
-    let parser_result = parser.parse(&tasks, &parse_skipped);
+    let (parser_result, isolated) = match parser.parse(&tasks, &parse_skipped) {
+        Ok(isolated) => (Ok(()), isolated),
+        Err(error) => (Err(error), Vec::new()),
+    };
+    // Isolated failures cancel this attempt before anything is published; the caller retries
+    // without the failing files, so the remaining work here would be discarded anyway.
     let parser_result = parser_result.and_then(|_| {
+        if !isolated.is_empty() {
+            return Ok(());
+        }
         for database in &mut opencode_ready_databases {
             let path = database.path.to_string_lossy().to_string();
             let owned_session_ids = opencode_ready_owned_sessions
@@ -1685,7 +1758,10 @@ pub(super) fn execute_refresh(
         || recover_embeddings
         || reconcile_pending_vector_ids
         || next_doc_id.load(Ordering::SeqCst) != state.next_doc_id;
-    let pending_update_error = if needs_publication {
+    // A cancelled attempt mutates nothing, so it needs no publication intent; writing one would
+    // force the next refresh to replay every affected path from scratch.
+    let publish = parser_result.is_ok() && isolated.is_empty();
+    let pending_update_error = if needs_publication && publish {
         state
             .commit_intent(&pending_ingest)
             .context("prepare ingest publication intent")
@@ -1695,7 +1771,7 @@ pub(super) fn execute_refresh(
     };
     // Parsers have finished and dropped their sender, so this drains completely.
     let updates = rx_update.iter().collect::<Vec<_>>();
-    let decision = if parser_result.is_ok() && pending_update_error.is_none() {
+    let decision = if publish && pending_update_error.is_none() {
         WriterDecision::Commit {
             session_cwds: updates
                 .iter()
@@ -1728,6 +1804,9 @@ pub(super) fn execute_refresh(
         let writer_outcome =
             writer_result.context("index writer stopped before ingestion completed")?;
         parser_result?;
+        if !isolated.is_empty() {
+            return Err(failures::ParseFailures(isolated).into());
+        }
         if let Some(error) = pending_update_error {
             return Err(error);
         }
@@ -1756,7 +1835,8 @@ pub(super) fn execute_refresh(
 
         let mut diagnostics = shared_diagnostics.lock().unwrap().clone();
         let mut updated_files = HashMap::new();
-        for update in updates {
+        for mut update in updates {
+            verdicts.persist(&update.path, &mut update.state.pending_tool_calls);
             updated_files.insert(update.path.clone(), update.state.clone());
             diagnostics.merge(update.diagnostics);
         }
@@ -1778,6 +1858,7 @@ pub(super) fn execute_refresh(
             files_scanned,
             files_skipped: files_skipped + parse_skipped.load(Ordering::Relaxed),
             diagnostics,
+            ..IngestReport::default()
         })
     })();
     tail.finish_and_clear();
